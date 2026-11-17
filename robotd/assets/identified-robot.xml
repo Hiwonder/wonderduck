@@ -1,0 +1,359 @@
+<?xml version='1.0' encoding='utf-8'?>
+<mujoco model="biped_training">
+  <asset>
+    <mesh name="c_left_hip_support" file="left_hip_support.stl" />
+    <mesh name="c_left_shin_support" file="left_shin_support.stl" />
+    <mesh name="c_right_hip_support" file="right_hip_support.stl" />
+    <mesh name="c_right_shin_support" file="right_shin_support.stl" />
+    <mesh name="c_left_foot_upper" file="left_foot_upper.stl" />
+    <mesh name="c_right_full_foot_upper" file="right_full_foot_upper.stl" />
+    <mesh name="c_right_full_foot_plate" file="right_full_foot_plate.stl" />
+    <mesh name="c_left_foot_plate" file="left_foot_plate.stl" />
+    <mesh name="c_right_foot_plate" file="right_foot_plate.stl" />
+    <mesh name="c_battery_cell" file="p_trunk_base_06.obj" />
+    <mesh name="c_board_mount" file="p_trunk_base_09.obj" />
+    <mesh name="c_power_board" file="p_trunk_base_11.obj" />
+    <material name="body_yellow" rgba="1 0.819607843 0 1" />
+    <material name="body_deep_blue" rgba="0.062745098 0.211764706 0.407843137 1" />
+    <material name="body_black" rgba="0.055 0.06 0.065 1" specular="0.3" shininess="0.2" />
+    <mesh name="v_mouth_2" file="v_mouth_2.obj" />
+    <texture type="skybox" builtin="gradient" rgb1="0.73 0.77 0.79" rgb2="0.49 0.53 0.55" width="256" height="256" />
+    <mesh name="c_trunk_base__01" file="trunk_base__01.obj" />
+    <mesh name="c_trunk_base__02" file="trunk_base__02.obj" />
+    <mesh name="c_trunk_base__03" file="trunk_base__03.stl" />
+    <mesh name="c_trunk_base__04" file="trunk_base__04.stl" />
+    <mesh name="c_trunk_base__05" file="trunk_base__05.stl" />
+    <mesh name="c_trunk_base__06" file="trunk_base__06.stl" />
+    <mesh name="c_trunk_base__07" file="trunk_base__07.stl" />
+    <mesh name="c_left_hip_yaw__01" file="left_hip_yaw__01.obj" />
+    <mesh name="c_left_hip_yaw__02" file="left_hip_yaw__02.stl" />
+    <mesh name="c_left_hip_roll__01" file="left_hip_roll__01.stl" />
+    <mesh name="c_left_hip_roll__02" file="left_hip_roll__02.stl" />
+    <mesh name="c_left_hip_pitch__01" file="left_hip_pitch__01.obj" />
+    <mesh name="c_left_hip_pitch__02" file="left_hip_pitch__02.obj" />
+    <mesh name="c_left_hip_pitch__03" file="left_hip_pitch__03.stl" />
+    <mesh name="c_left_hip_pitch__04" file="left_hip_pitch__04.stl" />
+    <mesh name="c_left_hip_pitch__05" file="left_hip_pitch__05.stl" />
+    <mesh name="c_left_knee__01" file="left_knee__01.obj" />
+    <mesh name="c_left_knee__02" file="left_knee__02.stl" />
+    <mesh name="c_left_knee__03" file="left_knee__03.stl" />
+    <mesh name="c_left_ankle__01" file="left_ankle__01.stl" />
+    <mesh name="c_left_ankle__02" file="left_ankle__02.stl" />
+    <mesh name="c_right_hip_yaw__01" file="right_hip_yaw__01.obj" />
+    <mesh name="c_right_hip_yaw__02" file="right_hip_yaw__02.stl" />
+    <mesh name="c_right_hip_roll__01" file="right_hip_roll__01.stl" />
+    <mesh name="c_right_hip_roll__02" file="right_hip_roll__02.stl" />
+    <mesh name="c_right_hip_pitch__01" file="right_hip_pitch__01.obj" />
+    <mesh name="c_right_hip_pitch__02" file="right_hip_pitch__02.obj" />
+    <mesh name="c_right_hip_pitch__03" file="right_hip_pitch__03.stl" />
+    <mesh name="c_right_hip_pitch__04" file="right_hip_pitch__04.stl" />
+    <mesh name="c_right_hip_pitch__05" file="right_hip_pitch__05.stl" />
+    <mesh name="c_right_knee__01" file="right_knee__01.obj" />
+    <mesh name="c_right_knee__02" file="right_knee__02.stl" />
+    <mesh name="c_right_knee__03" file="right_knee__03.stl" />
+    <mesh name="c_right_ankle__01" file="right_ankle__01.stl" />
+    <mesh name="c_right_ankle__02" file="right_ankle__02.stl" />
+    <mesh name="c_head_pitch__01" file="head_pitch__01.obj" />
+    <mesh name="c_head_pitch__02" file="head_pitch__02.obj" />
+    <mesh name="c_head_pitch__03" file="head_pitch__03.stl" />
+    <mesh name="c_neck_pitch__01" file="neck_pitch__01.stl" />
+    <mesh name="c_head_roll__01" file="head_roll__01.stl" />
+    <mesh name="c_head_roll__02" file="head_roll__02.stl" />
+    <mesh name="c_head_roll__03" file="head_roll__03.stl" />
+    <mesh name="c_head_roll__04" file="head_roll__04.stl" />
+    <mesh name="c_mouth__01" file="mouth__01.stl" />
+    <material name="display_body_yellow" rgba="1 0.819607843 0 1" />
+    <material name="display_body_deep_blue" rgba="0.062745098 0.211764706 0.407843137 1" />
+    <material name="display_body_black" rgba="0.055 0.06 0.065 1" specular="0.3" shininess="0.2" />
+    <mesh name="p_trunk_base_01" file="p_trunk_base_01.obj" />
+    <mesh name="p_trunk_base_02" file="p_trunk_base_02.obj" />
+    <mesh name="p_trunk_base_03" file="p_trunk_base_03.obj" />
+    <mesh name="p_trunk_base_04" file="p_trunk_base_04.obj" />
+    <mesh name="p_trunk_base_05" file="p_trunk_base_05.obj" />
+    <mesh name="p_trunk_base_06" file="p_trunk_base_06.obj" />
+    <mesh name="p_trunk_base_07" file="p_trunk_base_07.obj" />
+    <mesh name="p_trunk_base_08" file="p_trunk_base_08.obj" />
+    <mesh name="p_trunk_base_09" file="p_trunk_base_09.obj" />
+    <mesh name="p_trunk_base_10" file="p_trunk_base_10.obj" />
+    <mesh name="p_trunk_base_11" file="p_trunk_base_11.obj" />
+    <mesh name="p_left_hip_yaw_01" file="p_left_hip_yaw_01.obj" />
+    <mesh name="p_left_hip_yaw_02" file="p_left_hip_yaw_02.obj" />
+    <mesh name="p_left_hip_yaw_03" file="p_left_hip_yaw_03.obj" />
+    <mesh name="p_left_hip_yaw_04" file="p_left_hip_yaw_04.obj" />
+    <mesh name="p_left_hip_roll_01" file="p_left_hip_roll_01.obj" />
+    <mesh name="p_left_hip_roll_02" file="p_left_hip_roll_02.obj" />
+    <mesh name="p_left_hip_pitch_01" file="p_left_hip_pitch_01.obj" />
+    <mesh name="p_left_hip_pitch_02" file="p_left_hip_pitch_02.obj" />
+    <mesh name="p_left_hip_pitch_03" file="p_left_hip_pitch_03.obj" />
+    <mesh name="p_left_hip_pitch_04" file="p_left_hip_pitch_04.obj" />
+    <mesh name="p_left_hip_pitch_05" file="p_left_hip_pitch_05.obj" />
+    <mesh name="p_left_knee_01" file="p_left_knee_01.obj" />
+    <mesh name="p_left_knee_02" file="p_left_knee_02.obj" />
+    <mesh name="p_left_knee_03" file="p_left_knee_03.obj" />
+    <mesh name="p_left_ankle_01" file="p_left_ankle_01.obj" />
+    <mesh name="p_left_ankle_02" file="p_left_ankle_02.obj" />
+    <mesh name="p_right_hip_yaw_01" file="p_right_hip_yaw_01.obj" />
+    <mesh name="p_right_hip_yaw_02" file="p_right_hip_yaw_02.obj" />
+    <mesh name="p_right_hip_yaw_03" file="p_right_hip_yaw_03.obj" />
+    <mesh name="p_right_hip_yaw_04" file="p_right_hip_yaw_04.obj" />
+    <mesh name="p_right_hip_roll_01" file="p_right_hip_roll_01.obj" />
+    <mesh name="p_right_hip_roll_02" file="p_right_hip_roll_02.obj" />
+    <mesh name="p_right_hip_pitch_01" file="p_right_hip_pitch_01.obj" />
+    <mesh name="p_right_hip_pitch_02" file="p_right_hip_pitch_02.obj" />
+    <mesh name="p_right_hip_pitch_03" file="p_right_hip_pitch_03.obj" />
+    <mesh name="p_right_hip_pitch_04" file="p_right_hip_pitch_04.obj" />
+    <mesh name="p_right_hip_pitch_05" file="p_right_hip_pitch_05.obj" />
+    <mesh name="p_right_knee_01" file="p_right_knee_01.obj" />
+    <mesh name="p_right_knee_02" file="p_right_knee_02.obj" />
+    <mesh name="p_right_knee_03" file="p_right_knee_03.obj" />
+    <mesh name="p_right_ankle_01" file="p_right_ankle_01.obj" />
+    <mesh name="p_right_ankle_02" file="p_right_ankle_02.obj" />
+    <mesh name="p_head_pitch_01" file="p_head_pitch_01.obj" />
+    <mesh name="p_head_pitch_02" file="p_head_pitch_02.obj" />
+    <mesh name="p_head_pitch_03" file="p_head_pitch_03.obj" />
+    <mesh name="p_neck_pitch_01" file="p_neck_pitch_01.obj" />
+    <mesh name="p_neck_pitch_02" file="p_neck_pitch_02.obj" />
+    <mesh name="p_neck_pitch_03" file="p_neck_pitch_03.obj" />
+    <mesh name="p_head_yaw_01" file="p_head_yaw_01.obj" />
+    <mesh name="p_head_yaw_02" file="p_head_yaw_02.obj" />
+    <mesh name="p_head_yaw_03" file="p_head_yaw_03.obj" />
+    <mesh name="p_head_yaw_04" file="p_head_yaw_04.obj" />
+    <mesh name="p_head_roll_01" file="p_head_roll_01.obj" />
+    <mesh name="p_head_roll_02" file="p_head_roll_02.obj" />
+    <mesh name="p_head_roll_03" file="p_head_roll_03.obj" />
+    <mesh name="p_head_roll_04" file="p_head_roll_04.obj" />
+    <mesh name="p_head_roll_05" file="p_head_roll_05.obj" />
+    <mesh name="p_head_roll_06" file="p_head_roll_06.obj" />
+    <mesh name="p_head_roll_07" file="p_head_roll_07.obj" />
+    <mesh name="p_head_roll_08" file="p_head_roll_08.obj" />
+    <mesh name="p_head_roll_09" file="p_head_roll_09.obj" />
+    <mesh name="p_head_roll_10" file="p_head_roll_10.obj" />
+    <mesh name="p_head_roll_11" file="p_head_roll_11.obj" />
+    <mesh name="p_head_roll_12" file="p_head_roll_12.obj" />
+    <mesh name="p_mouth_01" file="p_mouth_01.obj" />
+    <mesh name="p_mouth_02" file="p_mouth_02.obj" />
+  </asset>
+  <worldbody>
+    <body name="trunk_base" pos="0 0 0.111848115018488">
+      <inertial pos="-0.00857828286095 3.01431259138e-05 0.0207239368806" mass="0.0763" fullinertia="4.51044642402e-05 3.4477270822e-05 5.41809828665e-05 7.16567134378e-08 6.08728994031e-06 -5.60543045808e-08" />
+      <freejoint name="root_freejoint" />
+      <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="trunk_base_full_0_servo_collision" mesh="c_trunk_base__01" density="0" friction="1 0.005 0.0001" condim="3" />
+      <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="trunk_base_full_1_servo_collision" mesh="c_trunk_base__02" density="0" friction="1 0.005 0.0001" condim="3" />
+      <geom name="battery_cell_self_collision" type="mesh" mesh="c_battery_cell" group="3" contype="0" conaffinity="0" density="0" friction="1 0.005 0.0001" condim="3" />
+      <geom name="board_mount_self_collision" type="mesh" mesh="c_board_mount" group="3" contype="0" conaffinity="0" density="0" friction="1 0.005 0.0001" condim="3" />
+      <geom name="power_board_self_collision" type="mesh" mesh="c_power_board" group="3" contype="0" conaffinity="0" density="0" friction="1 0.005 0.0001" condim="3" />
+      <geom type="mesh" group="3" contype="2" conaffinity="2" rgba="0.7 0.72 0.73 0.3" name="trunk_base_self_collision_0" mesh="c_trunk_base__03" density="0" friction="1 0.005 0.0001" condim="3" />
+      <geom type="mesh" group="3" contype="2" conaffinity="2" rgba="0.7 0.72 0.73 0.3" name="trunk_base_self_collision_1" mesh="c_trunk_base__04" density="0" friction="1 0.005 0.0001" condim="3" />
+      <geom type="mesh" group="3" contype="2" conaffinity="2" rgba="0.7 0.72 0.73 0.3" name="trunk_base_self_collision_2" mesh="c_trunk_base__05" density="0" friction="1 0.005 0.0001" condim="3" />
+      <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="trunk_base_ground_collision" mesh="c_trunk_base__06" density="0" friction="1 0.005 0.0001" condim="3" />
+      <geom type="mesh" group="3" contype="2" conaffinity="2" rgba="0.7 0.72 0.73 0.3" name="trunk_base_self_collision_3" mesh="c_trunk_base__07" density="0" friction="1 0.005 0.0001" condim="3" />
+      <body name="imu" pos="-0.0342743208314 1.92804867531e-06 -0.003127230131" quat="0.707106781188 0 -0.707106781185 0">
+        <site name="imu" type="sphere" size="0.002" group="3" />
+      </body>
+      <body name="rear_module" pos="-0.0455853361077 0.000232206451533 0.00131213597452">
+        <inertial pos="-0.000198845315000001 5.5319810596e-05 -1.093872099e-05" mass="0.1309" fullinertia="7.01067080119e-05 6.14474091268e-05 2.70281000887e-05 -2.799409775e-07 -3.51488460241e-06 -1.48411801263e-07" />
+      </body>
+      <body name="left_hip_yaw" pos="0 0.017502488 -0.0005">
+        <inertial pos="-8.87185099718e-05 3.07072527512e-08 -0.014047108803" mass="0.02757" fullinertia="2.64856592464e-06 3.86865425834e-06 2.4180217277e-06 5.81621136815e-12 -6.5717941713e-08 5.50335022655e-12" />
+        <joint name="left_hip_yaw" type="hinge" axis="-0 -0 -1" range="-0.4537856055185257 0.5235987755982988" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+        <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_hip_yaw_full_0_servo_collision" mesh="c_left_hip_yaw__01" density="0" friction="1 0.005 0.0001" condim="3" />
+        <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_hip_yaw_full_1_collision" mesh="c_left_hip_yaw__02" density="0" friction="1 0.005 0.0001" condim="3" />
+        <body name="left_hip_roll" pos="0.000162453 0 -0.0118174">
+          <inertial pos="0.0052145582653 0.0196453361245 -1.36967665914e-06" mass="0.0096" fullinertia="2.16354760004e-06 2.38254420457e-06 4.02915346618e-06 -5.01679588724e-07 1.43320719703e-10 1.77059073425e-10" />
+          <joint name="left_hip_roll" type="hinge" axis="1 0 0" range="-0.69813170079773179 0.4537856055185257" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+          <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_hip_roll_ground_collision" mesh="c_left_hip_roll__01" density="0" friction="1 0.005 0.0001" condim="3" />
+          <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_hip_roll_full_1_collision" mesh="c_left_hip_roll__02" density="0" friction="1 0.005 0.0001" condim="3" />
+          <body name="left_hip_pitch" pos="0 0.037537648 0">
+            <inertial pos="-0.0219180051717 0.00303771193438 -0.00685073922336" mass="0.05732" fullinertia="1.28192137788e-05 2.08734220138e-05 2.12799943807e-05 9.73512356461e-08 -5.64306616465e-06 -1.93233732368e-07" />
+            <joint name="left_hip_pitch" type="hinge" axis="0 1 0" range="-1.9198621771937625 0.75049157835756175" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_hip_pitch_full_0_servo_collision" mesh="c_left_hip_pitch__01" density="0" friction="1 0.005 0.0001" condim="3" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_hip_pitch_full_1_servo_collision" mesh="c_left_hip_pitch__02" density="0" friction="1 0.005 0.0001" condim="3" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_hip_pitch_full_2_collision" mesh="c_left_hip_pitch__03" density="0" friction="1 0.005 0.0001" condim="3" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_hip_pitch_full_3_collision" mesh="c_left_hip_pitch__04" density="0" friction="1 0.005 0.0001" condim="3" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_hip_pitch_full_4_collision" mesh="c_left_hip_pitch__05" density="0" friction="1 0.005 0.0001" condim="3" />
+            <body name="left_knee" pos="-0.035782862 0.00281 -0.022004439">
+              <inertial pos="-2.82571776395e-08 -0.00710458242328 -0.0308163020424" mass="0.02954" fullinertia="5.95020554564e-06 4.25032599506e-06 3.49755145322e-06 5.41064513394e-12 -1.99716212158e-12 -3.47568182972e-07" />
+              <joint name="left_knee" type="hinge" axis="-0 -1 -0" range="-1.2217304763960306 1.2915436464758039" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+              <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_knee_full_0_servo_collision" mesh="c_left_knee__01" density="0" friction="1 0.005 0.0001" condim="3" />
+              <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_knee_full_1_collision" mesh="c_left_knee__02" density="0" friction="1 0.005 0.0001" condim="3" />
+              <geom type="mesh" group="3" contype="2" conaffinity="2" rgba="0.7 0.72 0.73 0.3" name="left_knee_self_collision_0" mesh="c_left_knee__03" density="0" friction="1 0.005 0.0001" condim="3" />
+              <body name="left_ankle" pos="0 -0.008010064 -0.042000005">
+                <inertial pos="0.00624114734908 -0.000727623720665 -0.0143207045695" mass="0.0212" fullinertia="5.68708874867e-06 5.8253676084e-06 9.78545037656e-06 2.67062027904e-08 2.14042032797e-07 -1.45786646498e-07" />
+                <joint name="left_ankle" type="hinge" axis="0 1 0" range="-1.44862327915529 1.22173047639603" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+                <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="left_ankle_full_1_collision" mesh="c_left_ankle__02" density="0" friction="1 0.005 0.0001" condim="3" />
+                <geom name="left_foot_upper_collision" type="mesh" mesh="c_left_foot_upper" group="3" contype="0" conaffinity="0" density="0" friction="1 0.005 0.0001" condim="3" />
+                <body name="left_foot" pos="-9.94759830064e-17 -2.84217094304e-17 -0.0239267395385" quat="0.9991067408 0.0422577861171 0 0">
+                  <site name="left_foot" type="sphere" size="0.002" pos="0 0 0" group="3" />
+                  <geom type="mesh" group="3" contype="1" conaffinity="3" rgba="0.7 0.72 0.73 0.3" name="left_foot_collision" mesh="c_left_ankle__01" density="0" friction="1 0.005 0.0001" condim="3" pos="9.94759830063519e-17 0.00202037575104459 0.0238412866005016" quat="0.9991067408 -0.0422577861171 -0 -0" priority="1" />
+                </body>
+                <geom name="visual_p_left_ankle_01" type="mesh" mesh="p_left_ankle_01" group="2" contype="0" conaffinity="0" material="display_body_yellow" pos="0 0 0" quat="1 0 0 0" density="0" />
+                <geom name="visual_p_left_ankle_02" type="mesh" mesh="p_left_ankle_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              </body>
+              <geom name="visual_p_left_knee_01" type="mesh" mesh="p_left_knee_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_left_knee_02" type="mesh" mesh="p_left_knee_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_left_knee_03" type="mesh" mesh="p_left_knee_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            </body>
+            <geom name="visual_p_left_hip_pitch_01" type="mesh" mesh="p_left_hip_pitch_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_left_hip_pitch_02" type="mesh" mesh="p_left_hip_pitch_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_left_hip_pitch_03" type="mesh" mesh="p_left_hip_pitch_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_left_hip_pitch_04" type="mesh" mesh="p_left_hip_pitch_04" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_left_hip_pitch_05" type="mesh" mesh="p_left_hip_pitch_05" group="2" contype="0" conaffinity="0" material="display_body_deep_blue" pos="0 0 0" quat="1 0 0 0" density="0" />
+          </body>
+          <geom name="visual_p_left_hip_roll_01" type="mesh" mesh="p_left_hip_roll_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+          <geom name="visual_p_left_hip_roll_02" type="mesh" mesh="p_left_hip_roll_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        </body>
+        <geom name="visual_p_left_hip_yaw_01" type="mesh" mesh="p_left_hip_yaw_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        <geom name="visual_p_left_hip_yaw_02" type="mesh" mesh="p_left_hip_yaw_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        <geom name="visual_p_left_hip_yaw_03" type="mesh" mesh="p_left_hip_yaw_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        <geom name="visual_p_left_hip_yaw_04" type="mesh" mesh="p_left_hip_yaw_04" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      </body>
+      <body name="head_pitch" pos="0.019989344 0 0.03966658">
+        <inertial pos="0.000234514343347 -0.000117917004061 0.0249564043536" mass="0.04418" fullinertia="2.0462665352e-05 1.80735782551e-05 3.90836432271e-06 2.83496071472e-09 -1.64491031511e-11 8.99033554193e-13" />
+        <joint name="neck_pitch" type="hinge" axis="-0 -1 -0" range="-2.2689280275926285 0.95993108859688125" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+        <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="head_pitch_full_0_servo_collision" mesh="c_head_pitch__01" density="0" friction="1 0.005 0.0001" condim="3" />
+        <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="head_pitch_full_1_servo_collision" mesh="c_head_pitch__02" density="0" friction="1 0.005 0.0001" condim="3" />
+        <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="head_pitch_full_2_collision" mesh="c_head_pitch__03" density="0" friction="1 0.005 0.0001" condim="3" />
+        <body name="neck_pitch" pos="0 0 0.049993328">
+          <inertial pos="-8.09419156637e-06 -0.000380935187347 0.0135978385982" mass="0.0062" fullinertia="7.55417196192e-07 3.57382788763e-07 8.09614252415e-07 9.29310780705e-17 3.33575524932e-15 -1.42259246508e-11" />
+          <joint name="head_pitch" type="hinge" axis="0 1 0" range="-1.5707963267948966 1.4486232791552935" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+          <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="neck_pitch_full_0_collision" mesh="c_neck_pitch__01" density="0" friction="1 0.005 0.0001" condim="3" />
+          <body name="head_yaw" pos="0 0 0.017581068">
+            <inertial pos="0.000615626964974 -0.00582899386581 0.0156106831618" mass="0.0271" fullinertia="3.33078968134e-06 3.40733362627e-06 2.51320195613e-06 -1.2605279527e-08 -1.34528764216e-07 2.20632420371e-07" />
+            <joint name="head_yaw" type="hinge" axis="0 0 1" range="-2.0943951023931953 2.0943951023931953" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+            <body name="head_roll" pos="0 0 0.015917104">
+              <inertial pos="0.0106259918532 0.000487204816374 0.0196869381318" mass="0.1929" fullinertia="0.000167765299692 0.000287101293885 0.000313279469848 7.16091967591e-07 -2.4228058199e-05 3.84265258747e-06" />
+              <joint name="head_roll" type="hinge" axis="-1 -0 -0" range="-0.29670597283903605 0.29670597283903605" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+              <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="head_roll_full_tof_collision" mesh="c_head_roll__01" density="0" friction="1 0.005 0.0001" condim="3" />
+              <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="head_bottom_ground_collision" mesh="c_head_roll__02" density="0" friction="1 0.005 0.0001" condim="3" />
+              <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="head_roll_ground_collision" mesh="c_head_roll__03" density="0" friction="1 0.005 0.0001" condim="3" />
+              <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="head_roll_full_face_collision" mesh="c_head_roll__04" density="0" friction="1 0.005 0.0001" condim="3" />
+              <site name="mouth_tip" pos="0.0633949995 -0.0004543715 -0.0106860505" size="0.002" group="3" />
+              <body name="mouth" pos="-9.99999997475e-10 -8.8743e-05 0.000187899">
+                <inertial pos="0.0313783623732 0.00288622991029 -0.0105795133558" mass="0.0123" fullinertia="1.18974665914e-05 6.79671214022e-06 1.72616285025e-05 1.26126945306e-06 1.6537904128e-06 -4.09527087742e-07" />
+                <geom name="mouth_visual_0" type="mesh" mesh="v_mouth_2" material="body_yellow" group="5" contype="0" conaffinity="0" density="0" rgba="0 0 0 0" />
+                <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="mouth_ground_collision" mesh="c_mouth__01" density="0" friction="1 0.005 0.0001" condim="3" />
+                <geom name="visual_p_mouth_01" type="mesh" mesh="p_mouth_01" group="2" contype="0" conaffinity="0" material="display_body_yellow" pos="0 0 0" quat="1 0 0 0" density="0" />
+                <geom name="visual_p_mouth_02" type="mesh" mesh="p_mouth_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              </body>
+              <body name="camera" pos="0.0605025470762 -8.87425725818e-05 0.0125754098033" />
+              <body name="tof" pos="0.0595681301868 -0.000466955611438 0.0481417528539" />
+              <geom name="visual_p_head_roll_01" type="mesh" mesh="p_head_roll_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_02" type="mesh" mesh="p_head_roll_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_03" type="mesh" mesh="p_head_roll_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_04" type="mesh" mesh="p_head_roll_04" group="2" contype="0" conaffinity="0" material="display_body_yellow" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_05" type="mesh" mesh="p_head_roll_05" group="2" contype="0" conaffinity="0" material="display_body_deep_blue" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_06" type="mesh" mesh="p_head_roll_06" group="2" contype="0" conaffinity="0" material="display_body_yellow" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_07" type="mesh" mesh="p_head_roll_07" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_08" type="mesh" mesh="p_head_roll_08" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_09" type="mesh" mesh="p_head_roll_09" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_10" type="mesh" mesh="p_head_roll_10" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_11" type="mesh" mesh="p_head_roll_11" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_head_roll_12" type="mesh" mesh="p_head_roll_12" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            </body>
+            <geom name="visual_p_head_yaw_01" type="mesh" mesh="p_head_yaw_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_head_yaw_02" type="mesh" mesh="p_head_yaw_02" group="2" contype="0" conaffinity="0" material="display_body_yellow" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_head_yaw_03" type="mesh" mesh="p_head_yaw_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_head_yaw_04" type="mesh" mesh="p_head_yaw_04" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+          </body>
+          <geom name="visual_p_neck_pitch_01" type="mesh" mesh="p_neck_pitch_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+          <geom name="visual_p_neck_pitch_02" type="mesh" mesh="p_neck_pitch_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+          <geom name="visual_p_neck_pitch_03" type="mesh" mesh="p_neck_pitch_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        </body>
+        <geom name="visual_p_head_pitch_01" type="mesh" mesh="p_head_pitch_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        <geom name="visual_p_head_pitch_02" type="mesh" mesh="p_head_pitch_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        <geom name="visual_p_head_pitch_03" type="mesh" mesh="p_head_pitch_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      </body>
+      <body name="right_hip_yaw" pos="0 -0.017497512 -0.0005">
+        <inertial pos="-8.87185099718e-05 -2.9721873787e-08 -0.0140471080354" mass="0.02757" fullinertia="2.64856592465e-06 3.86865425834e-06 2.4180217277e-06 -5.81909396091e-12 -6.57179417128e-08 -5.56696453511e-12" />
+        <joint name="right_hip_yaw" type="hinge" axis="-0 -0 -1" range="-0.5235987755982988 0.3490658503988659" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+        <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_hip_yaw_full_0_servo_collision" mesh="c_right_hip_yaw__01" density="0" friction="1 0.005 0.0001" condim="3" />
+        <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_hip_yaw_full_1_collision" mesh="c_right_hip_yaw__02" density="0" friction="1 0.005 0.0001" condim="3" />
+        <body name="right_hip_roll" pos="0.000162453 0 -0.0118174">
+          <inertial pos="0.0052145582653 -0.0196453351307 -1.36804735573e-06" mass="0.0096" fullinertia="2.16354760004e-06 2.38254420455e-06 4.0291534662e-06 5.01679588731e-07 1.43298714572e-10 -1.76986848328e-10" />
+          <joint name="right_hip_roll" type="hinge" axis="1 0 0" range="-0.4537856055185257 0.69813170079773179" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+          <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_hip_roll_ground_collision" mesh="c_right_hip_roll__01" density="0" friction="1 0.005 0.0001" condim="3" />
+          <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_hip_roll_full_1_collision" mesh="c_right_hip_roll__02" density="0" friction="1 0.005 0.0001" condim="3" />
+          <body name="right_hip_pitch" pos="0 -0.037537648 0">
+            <inertial pos="-0.0219180051717 -0.00304594607349 -0.00685073723759" mass="0.05732" fullinertia="1.28310259507e-05 2.0873421807e-05 2.12918067594e-05 -9.91868513676e-08 -5.64306626034e-06 1.95212227028e-07" />
+            <joint name="right_hip_pitch" type="hinge" axis="-0 -1 -0" range="-0.75049157835756175 1.9198621771937625" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_hip_pitch_full_0_servo_collision" mesh="c_right_hip_pitch__01" density="0" friction="1 0.005 0.0001" condim="3" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_hip_pitch_full_1_servo_collision" mesh="c_right_hip_pitch__02" density="0" friction="1 0.005 0.0001" condim="3" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_hip_pitch_full_2_collision" mesh="c_right_hip_pitch__03" density="0" friction="1 0.005 0.0001" condim="3" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_hip_pitch_full_3_collision" mesh="c_right_hip_pitch__04" density="0" friction="1 0.005 0.0001" condim="3" />
+            <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_hip_pitch_full_4_collision" mesh="c_right_hip_pitch__05" density="0" friction="1 0.005 0.0001" condim="3" />
+            <body name="right_knee" pos="-0.035782862 -0.00281 -0.022004439">
+              <inertial pos="-2.82571776609e-08 0.00710458118959 -0.0308162998166" mass="0.02954" fullinertia="5.95020554562e-06 4.25032602554e-06 3.49755142273e-06 -5.41064521984e-12 -1.99716189762e-12 3.47568149945e-07" />
+              <joint name="right_knee" type="hinge" axis="0 1 0" range="-1.2915436464758039 1.2217304763960306" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+              <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_knee_full_0_servo_collision" mesh="c_right_knee__01" density="0" friction="1 0.005 0.0001" condim="3" />
+              <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_knee_full_1_collision" mesh="c_right_knee__02" density="0" friction="1 0.005 0.0001" condim="3" />
+              <geom type="mesh" group="3" contype="2" conaffinity="2" rgba="0.7 0.72 0.73 0.3" name="right_knee_self_collision_0" mesh="c_right_knee__03" density="0" friction="1 0.005 0.0001" condim="3" />
+              <body name="right_ankle" pos="0 0.008009991 -0.042000005">
+                <inertial pos="0.00624114400298 0.000141368529569 -0.0140921121494" mass="0.0212" fullinertia="5.67890477298e-06 5.82133951632e-06 9.78129230923e-06 -2.10226072032e-08 2.12249190263e-07 1.57294398314e-07" />
+                <joint name="right_ankle" type="hinge" axis="-0 -1 -0" range="-1.2217304764 1.44862327916" limited="true" armature="0.000646120906221" damping="0.00342827127947" frictionloss="0.0132018233334" />
+                <geom type="mesh" group="3" contype="0" conaffinity="0" rgba="0.7 0.72 0.73 0.3" name="right_ankle_full_1_collision" mesh="c_right_ankle__02" density="0" friction="1 0.005 0.0001" condim="3" />
+                <geom name="right_foot_upper_collision" type="mesh" mesh="c_right_full_foot_upper" group="3" contype="0" conaffinity="0" density="0" friction="1 0.005 0.0001" condim="3" />
+                <body name="right_foot" pos="0 2.84217094304e-17 -0.0239267332801" quat="0.9991067408 -0.0422577861171 0 0">
+                  <site name="right_foot" type="sphere" size="0.002" pos="0 0 0" group="3" />
+                  <geom type="mesh" group="3" contype="1" conaffinity="3" rgba="0.7 0.72 0.73 0.3" name="right_foot_collision" mesh="c_right_ankle__01" density="0" friction="1 0.005 0.0001" condim="3" pos="0 -0.00202037522258481 0.0238412803644531" quat="0.9991067408 0.0422577861171 -0 -0" priority="1" />
+                </body>
+                <geom name="visual_p_right_ankle_01" type="mesh" mesh="p_right_ankle_01" group="2" contype="0" conaffinity="0" material="display_body_yellow" pos="0 0 0" quat="1 0 0 0" density="0" />
+                <geom name="visual_p_right_ankle_02" type="mesh" mesh="p_right_ankle_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              </body>
+              <geom name="visual_p_right_knee_01" type="mesh" mesh="p_right_knee_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_right_knee_02" type="mesh" mesh="p_right_knee_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+              <geom name="visual_p_right_knee_03" type="mesh" mesh="p_right_knee_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            </body>
+            <geom name="visual_p_right_hip_pitch_01" type="mesh" mesh="p_right_hip_pitch_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_right_hip_pitch_02" type="mesh" mesh="p_right_hip_pitch_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_right_hip_pitch_03" type="mesh" mesh="p_right_hip_pitch_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_right_hip_pitch_04" type="mesh" mesh="p_right_hip_pitch_04" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+            <geom name="visual_p_right_hip_pitch_05" type="mesh" mesh="p_right_hip_pitch_05" group="2" contype="0" conaffinity="0" material="display_body_deep_blue" pos="0 0 0" quat="1 0 0 0" density="0" />
+          </body>
+          <geom name="visual_p_right_hip_roll_01" type="mesh" mesh="p_right_hip_roll_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+          <geom name="visual_p_right_hip_roll_02" type="mesh" mesh="p_right_hip_roll_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        </body>
+        <geom name="visual_p_right_hip_yaw_01" type="mesh" mesh="p_right_hip_yaw_01" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        <geom name="visual_p_right_hip_yaw_02" type="mesh" mesh="p_right_hip_yaw_02" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        <geom name="visual_p_right_hip_yaw_03" type="mesh" mesh="p_right_hip_yaw_03" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+        <geom name="visual_p_right_hip_yaw_04" type="mesh" mesh="p_right_hip_yaw_04" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      </body>
+      <geom name="visual_p_trunk_base_01" type="mesh" mesh="p_trunk_base_01" group="2" contype="0" conaffinity="0" material="display_body_yellow" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_02" type="mesh" mesh="p_trunk_base_02" group="2" contype="0" conaffinity="0" material="display_body_deep_blue" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_03" type="mesh" mesh="p_trunk_base_03" group="2" contype="0" conaffinity="0" material="display_body_deep_blue" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_04" type="mesh" mesh="p_trunk_base_04" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_05" type="mesh" mesh="p_trunk_base_05" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_06" type="mesh" mesh="p_trunk_base_06" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_07" type="mesh" mesh="p_trunk_base_07" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_08" type="mesh" mesh="p_trunk_base_08" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_09" type="mesh" mesh="p_trunk_base_09" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_10" type="mesh" mesh="p_trunk_base_10" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+      <geom name="visual_p_trunk_base_11" type="mesh" mesh="p_trunk_base_11" group="2" contype="0" conaffinity="0" material="display_body_black" pos="0 0 0" quat="1 0 0 0" density="0" />
+    </body>
+  </worldbody>
+  <compiler angle="radian" meshdir="../meshes" autolimits="true" inertiafromgeom="false" fusestatic="false" />
+  <option timestep="0.005" integrator="implicitfast" />
+  <actuator>
+    <position name="left_hip_yaw" joint="left_hip_yaw" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="left_hip_roll" joint="left_hip_roll" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="left_hip_pitch" joint="left_hip_pitch" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="left_knee" joint="left_knee" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="left_ankle" joint="left_ankle" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="neck_pitch" joint="neck_pitch" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="head_pitch" joint="head_pitch" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="head_yaw" joint="head_yaw" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="head_roll" joint="head_roll" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="right_hip_yaw" joint="right_hip_yaw" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="right_hip_roll" joint="right_hip_roll" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="right_hip_pitch" joint="right_hip_pitch" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="right_knee" joint="right_knee" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+    <position name="right_ankle" joint="right_ankle" kp="50" ctrlrange="-10 10" forcerange="-1.22359296086 1.22359296086" />
+  </actuator>
+  <sensor>
+    <framequat name="orientation" objtype="site" objname="imu" />
+    <gyro name="angular-velocity" site="imu" />
+    <gyro name="imu_ang_vel" site="imu" />
+    <velocimeter name="imu_lin_vel" site="imu" />
+    <accelerometer name="imu_accel" site="imu" />
+    <subtreeangmom name="root_angmom" body="trunk_base" />
+  </sensor>
+</mujoco>

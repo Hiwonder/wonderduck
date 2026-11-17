@@ -1,0 +1,46 @@
+#!/usr/bin/python3
+"""Remove copied BlueZ adapter state once, before Bluetooth starts."""
+
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+
+
+ROOT = Path("/var/lib/bluetooth")
+MARKER = Path("/var/lib/wonderduck/bluetooth-reset-pending")
+ADAPTER = re.compile(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\Z", re.IGNORECASE)
+
+
+def sync_directory(directory):
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def clear_pairings(root, marker):
+    # Refuse to follow a substituted Bluetooth root. Only real adapter
+    # directories are removed; unrelated entries and symlinks are left alone.
+    if root.is_symlink():
+        raise RuntimeError("Bluetooth state directory is a symlink")
+    if root.exists():
+        if not root.is_dir():
+            raise RuntimeError("Bluetooth state path is not a directory")
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if ADAPTER.fullmatch(entry.name) and entry.is_dir(follow_symlinks=False):
+                    shutil.rmtree(entry.path)
+        sync_directory(root)
+    marker.unlink()
+    sync_directory(marker.parent)
+
+
+if __name__ == "__main__":
+    try:
+        clear_pairings(ROOT, MARKER)
+    except (OSError, RuntimeError) as error:
+        print("Bluetooth first-boot reset failed: {}".format(error), file=sys.stderr)
+        sys.exit(1)

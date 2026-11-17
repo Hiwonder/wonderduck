@@ -1,0 +1,16 @@
+/dts-v1/;
+/plugin/;
+
+/* Sensor I2C5 M0 on header pins 29/31. */
+/ {
+    compatible = "rockchip,rk3566";
+    fragment@0 {
+        target = <&i2c5>;
+        __overlay__ {
+            status = "okay";
+            clock-frequency = <100000>;
+            pinctrl-names = "default";
+            pinctrl-0 = <&i2c5m0_xfer>;
+        };
+    };
+};

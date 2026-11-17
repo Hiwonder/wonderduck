@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "policies": [
+    {
+      "file": "sitstand.onnx",
+      "name": "sitstand",
+      "kind": "scripted",
+      "command": {"encoding": "posture_flag", "sit": 1.0, "stand": 0.0},
+      "unwind_s": 1.0
+    }
+  ]
+}

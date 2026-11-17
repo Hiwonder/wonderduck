@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+: "${DEVNAME:?usbmount device is missing}"
+
+# fstab and existing mounts are owned by the system, not by usbmount.
+if findmnt --noheadings --source "$DEVNAME" >/dev/null ||
+   findmnt --fstab --evaluate --noheadings --source "$DEVNAME" >/dev/null; then
+    exit 0
+fi
+
+exec "$@"

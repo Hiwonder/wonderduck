@@ -1,0 +1,3 @@
+#!/bin/sh
+printf ' * Documentation: https://www.hiwonder.com/\n'
+printf ' * Management:    https://github.com/Hiwonder/wonderduck\n\n'

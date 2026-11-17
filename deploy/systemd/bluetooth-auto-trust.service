@@ -1,0 +1,13 @@
+[Unit]
+Description=Automatically trust connected Bluetooth devices
+Wants=bluetooth.service
+After=bluetooth.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/libexec/robot-bluetooth-auto-trust.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

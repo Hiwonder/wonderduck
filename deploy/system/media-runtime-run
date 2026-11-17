@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+export LD_LIBRARY_PATH="$root/lib"
+export GST_PLUGIN_SYSTEM_PATH_1_0="$root/lib/gstreamer-1.0"
+export GST_PLUGIN_PATH_1_0="$root/lib/gstreamer-1.0"
+export GST_PLUGIN_SCANNER_1_0="$root/libexec/gstreamer-1.0/gst-plugin-scanner"
+mkdir -p "$root/cache/$(id -u)"
+export GST_REGISTRY_1_0="$root/cache/$(id -u)/registry.bin"
+[ "${1:-}" = mediad ] || { echo 'Usage: run mediad [args...]' >&2; exit 2; }
+shift
+exec "$root/bin/mediad" "$@"

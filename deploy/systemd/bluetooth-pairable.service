@@ -1,0 +1,17 @@
+[Unit]
+Description=Enable Bluetooth pairing and incoming connections
+After=bluetooth.service
+BindsTo=bluetooth.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 PairableTimeout u 0
+ExecStart=/usr/bin/busctl set-property org.bluez /org/bluez/hci0 org.bluez.Adapter1 Pairable b true
+ExecStart=/usr/bin/script -q -e -c "/usr/bin/btmgmt -i 0 connectable on" /dev/null
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=bluetooth.service

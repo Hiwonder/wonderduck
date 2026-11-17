@@ -1,0 +1,89 @@
+/dts-v1/;
+/plugin/;
+
+/* LubanCat Zero: BCLK=11, WCLK=15, DIN=29, DOUT=26 (physical pins).
+ * The codec has its own 12 MHz oscillator; never drive that MCLK net.
+ */
+/ {
+    compatible = "rockchip,rk3566";
+
+    fragment@0 {
+        target = <&i2s1_8ch>;
+        __overlay__ {
+            status = "okay";
+            /* Both directions use TX BCLK/LRCK; RX clock pins are unwired. */
+            rockchip,clk-trcm = <1>;
+            pinctrl-names = "default";
+            pinctrl-0 = <&i2s1m0_sclktx &i2s1m0_lrcktx
+                         &i2s1m0_sdo0 &i2s1m0_sdi0>;
+        };
+    };
+
+    fragment@1 {
+        target-path = "/";
+        __overlay__ {
+            audio_mclk: audio-mclk {
+                compatible = "fixed-clock";
+                #clock-cells = <0>;
+                clock-frequency = <12000000>;
+            };
+            audio_3v3: audio-supply-3v3 {
+                compatible = "regulator-fixed";
+                regulator-name = "audio-3v3";
+                regulator-min-microvolt = <3300000>;
+                regulator-max-microvolt = <3300000>;
+                regulator-always-on;
+            };
+            audio_1v5: audio-supply-1v5 {
+                compatible = "regulator-fixed";
+                regulator-name = "audio-1v5";
+                regulator-min-microvolt = <1500000>;
+                regulator-max-microvolt = <1500000>;
+                regulator-always-on;
+            };
+        };
+    };
+
+    fragment@2 {
+        target = <&i2c3>;
+        __overlay__ {
+            #address-cells = <1>;
+            #size-cells = <0>;
+            audio_codec: codec@18 {
+                compatible = "ti,tlv320aic3104";
+                reg = <0x18>;
+                #sound-dai-cells = <0>;
+                clocks = <&audio_mclk>;
+                clock-names = "mclk";
+                IOVDD-supply = <&audio_3v3>;
+                DVDD-supply = <&audio_1v5>;
+                AVDD-supply = <&audio_3v3>;
+                DRVDD-supply = <&audio_3v3>;
+                /* 1.35 V output common mode with the board's 1.5 V core. */
+                ai3x-ocmv = <0>;
+                status = "okay";
+            };
+        };
+    };
+
+    fragment@3 {
+        target-path = "/";
+        __overlay__ {
+            sound-audio {
+                compatible = "simple-audio-card";
+                simple-audio-card,name = "aic3104";
+                simple-audio-card,format = "i2s";
+                simple-audio-card,bitclock-master = <&audio_cpu>;
+                simple-audio-card,frame-master = <&audio_cpu>;
+                audio_cpu: simple-audio-card,cpu {
+                    sound-dai = <&i2s1_8ch>;
+                    system-clock-frequency = <12288000>;
+                };
+                simple-audio-card,codec {
+                    sound-dai = <&audio_codec>;
+                    system-clock-frequency = <12000000>;
+                };
+            };
+        };
+    };
+};

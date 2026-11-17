@@ -1,0 +1,74 @@
+# Any level, not just the root: running cargo inside a member directory creates a
+# nested one (updater/target), and `/target` would not match it.
+target/
+.runtime-install.lock
+.runtime-release.json
+.runtime-transaction-*/
+
+# ── never commit signing material ────────────────────────────────────────────
+#
+# `cargo xtask keygen` refuses to write keys inside the repo, so these patterns are
+# belt-and-braces for keys arriving some other way — copied in by hand, dropped by a
+# script, left behind by a test. A committed signing key cannot be un-leaked by
+# deleting the file: it stays in history, and every robot that trusts it must be
+# considered compromised.
+*.key
+*.pem
+secret*
+!*.pub
+
+# Release output. Contains artifacts and signatures; regenerate rather than commit.
+/dist
+/staged
+
+# Playground and scratch state (see updater/examples/playground.rs).
+/verify
+
+# Local simulation/training checkouts. They are pinned and documented in
+# docs/development/environment-setup.md, but are independent repositories.
+/microduck_rl/
+/mjlab/
+/bam/
+
+# Python bytecode from the demo Space, which is source rather than a build here.
+__pycache__/
+
+# Local agent instructions are provided by the workspace, not source code.
+/AGENTS.md
+
+# A venv beside a Space's source, for running one locally. `uv venv` writes its own `.gitignore`
+# holding `*` so it self-ignores; this is for the person who reaches for `python -m venv`, which
+# does not, and it is the same accident `__pycache__` above was added for.
+.venv/
+
+# Downloaded training policies and their generated export/diagnostic records.
+/policies/*.onnx
+/policies/*.export.json
+/policies/*.download.json
+/policies/*.receipt.json
+/policies/*.csv
+
+# Runtime data and private settings in the installed source root.
+/media-runtime-candidate/
+/onnxruntime-linux-*/
+/model-current/
+/model-defaults/
+/model-history/
+/models/
+/calibrations/
+/deploy/calibration/
+/deploy/imu-pose-standing.json
+/exports/
+/records/
+/venv/
+/bin/
+/logs/
+/downloads/
+/diagnostics/
+/experiments/
+/staging/
+/policies_bk/
+/policies_velocity_office_imu_ok/
+/policies/*
+/pet-detect/models/*.onnx
+/*.onnx

@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+export LC_ALL=C
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+marker=/var/lib/wonderduck/root-expanded
+root=$(findmnt -n -o SOURCE /)
+root=$(readlink -f "$root")
+[ -b "$root" ] || { echo "Root is not a block device: $root" >&2; exit 1; }
+name=${root##*/}
+sys=/sys/class/block/$name
+[ -r "$sys/partition" ] || { echo "Root is not a partition: $root" >&2; exit 1; }
+number=$(cat "$sys/partition")
+parent=$(lsblk -ndo PKNAME "$root")
+[ -n "$parent" ] || { echo "Cannot identify root disk" >&2; exit 1; }
+disk=/dev/$parent
+[ "$(blkid -s TYPE -o value "$root")" = ext4 ] || { echo "Root filesystem is not ext4" >&2; exit 1; }
+[ "$(blkid -s PTTYPE -o value "$disk")" = gpt ] || { echo "Root disk is not GPT" >&2; exit 1; }
+start=$(cat "$sys/start")
+for entry in /sys/class/block/"$parent"/"$parent"*; do
+    [ -r "$entry/partition" ] || continue
+    other_start=$(cat "$entry/start")
+    if [ "$other_start" -gt "$start" ]; then
+        echo "Root is not the last partition; refusing to resize" >&2
+        exit 1
+    fi
+done
+
+# Fix the GPT backup header and usable range before answering resize prompts.
+printf 'Fix\n' | parted ---pretend-input-tty "$disk" print >/dev/null
+last=$(sgdisk -E "$disk")
+current_size=$(cat "$sys/size")
+current_end=$((start + current_size - 1))
+if [ "$((last - current_end))" -gt 2048 ]; then
+    # GNU parted 3.3 asks for confirmation before the end position on a mounted partition.
+    printf 'Yes\n100%%\n' | parted ---pretend-input-tty "$disk" resizepart "$number" 100%
+    # Update only the root partition in the running kernel. If this fails,
+    # leave the marker absent so the next boot can complete the resize.
+    partx -u --nr "$number" "$disk"
+fi
+expected=$(parted -m -s "$disk" unit s print | awk -F: -v n="$number" '$1 == n {gsub(/s/, "", $4); print $4}')
+[ -n "$expected" ] || { echo "Cannot read new root partition size" >&2; exit 1; }
+actual=$(blockdev --getsz "$root")
+[ "$actual" -ge "$expected" ] || { echo "Kernel still sees the old partition size; retry on next boot" >&2; exit 1; }
+resize2fs "$root"
+mkdir -p "${marker%/*}"
+touch "$marker"
+echo "Root partition and filesystem expanded successfully"

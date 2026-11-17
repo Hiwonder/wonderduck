@@ -1,0 +1,15 @@
+[Unit]
+Description=Wi-Fi provisioning and hotspot recovery
+Wants=NetworkManager.service
+After=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/robot/wifi-manager/wifi_manager.py
+Restart=on-failure
+RestartSec=5
+StateDirectory=wifi-manager
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

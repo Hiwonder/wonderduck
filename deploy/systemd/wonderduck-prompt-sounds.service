@@ -1,0 +1,16 @@
+[Unit]
+Description=WonderDuck startup and low-battery sounds
+After=local-fs.target sound.target alsa-restore.service aic3104-init.service
+
+[Service]
+Type=simple
+User=root
+Group=robot
+ExecStart=/usr/bin/python3 /home/wonderduck/wonderduck/scripts/prompt-sounds.py
+Restart=on-failure
+RestartSec=2s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

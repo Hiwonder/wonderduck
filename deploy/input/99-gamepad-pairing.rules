@@ -1,0 +1,2 @@
+# BlueZ sixaxis matches this USB descriptor name exactly.
+SUBSYSTEM=="hid", ENV{HID_ID}=="0003:0000054C:00000268", ENV{HID_NAME}=="PS3 Controller", ENV{HID_NAME}="Sony PLAYSTATION(R)3 Controller"
