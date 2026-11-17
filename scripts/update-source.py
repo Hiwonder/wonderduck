@@ -168,7 +168,7 @@ def update(root, version, channel='main'):
         raise ValueError('请在设备的 WonderDuck 仓库目录中执行')
 
     _, main_url, studio_url = official_source(output(root, 'remote', 'get-url', 'origin'))
-    tag = 'runtime-v' + version
+    tag = 'v' + version
     fetch_head = Path(output(root, 'rev-parse', '--git-path', 'FETCH_HEAD'))
     if not fetch_head.is_absolute():
         fetch_head = root / fetch_head

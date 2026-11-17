@@ -52,9 +52,9 @@ CAMERA_SCRIPT = Path('scripts/run-web-camera.sh')
 CAMERA_LAUNCHER = Path('target/release/camera-launch')
 CAMERA_LINK_TARGET = '../../scripts/run-web-camera.sh'
 MEDIA_RUN_SOURCE = Path('deploy/system/media-runtime-run')
-ARCHIVE_NAME = 'runtime-aarch64.tar.gz'
-MANIFEST_NAME = 'runtime-manifest.json'
-SIGNATURE_NAME = 'runtime-manifest.json.sig'
+ARCHIVE_NAME = 'aarch64.tar.gz'
+MANIFEST_NAME = 'manifest.json'
+SIGNATURE_NAME = 'manifest.json.sig'
 MAX_ARCHIVE = 1024 * 1024 * 1024
 ROBOTD = 'target/release/robotd'
 PADD = 'target/release/padd'
@@ -236,7 +236,7 @@ def package(args):
             tar.add(str(payload), arcname='payload', recursive=True)
     manifest = {
         'schema': 1,
-        'tag': 'runtime-v' + args.version,
+        'tag': 'v' + args.version,
         'version': args.version,
         'architecture': 'aarch64',
         'source_revision': main_revision,
@@ -256,7 +256,7 @@ def package(args):
     print('发布包：{}（{} 字节）'.format(archive, manifest['size']))
     print('源码：{}，Studio：{}'.format(main_revision, studio_revision))
     print('SHA-256：' + manifest['sha256'])
-    print('GitHub Release title: WonderDuck v' + args.version)
+    print('GitHub Release title: v' + args.version)
     print('GitHub Release type: ' + ('pre-release' if development else 'release'))
 
 
@@ -268,7 +268,7 @@ def validate_manifest(data, tag):
     development_release(data['version'])
     version(data['min_hardware_version'])
     version(data['min_image_version'])
-    if data['tag'] != tag or tag != 'runtime-v' + data['version']:
+    if data['tag'] != tag or tag != 'v' + data['version']:
         raise ValueError('发布标签与版本不一致')
     if data['architecture'] != 'aarch64' or data['archive'] != ARCHIVE_NAME:
         raise ValueError('不支持的运行包架构或文件名')
@@ -1048,7 +1048,7 @@ def sync_prompt_service():
 
 
 def install(args):
-    tag = 'runtime-v' + args.version
+    tag = 'v' + args.version
     channel = getattr(args, 'channel', 'main')
     if channel == 'main':
         version(args.version)

@@ -35,7 +35,7 @@ esac
 sudo systemctl stop robotd
 git remote set-url origin "$repository"
 git fetch --no-tags --no-recurse-submodules origin "refs/heads/main:refs/remotes/origin/main"
-git fetch --no-tags --no-recurse-submodules origin "refs/tags/runtime-v${release_version}"
+git fetch --no-tags --no-recurse-submodules origin "refs/tags/v${release_version}"
 git merge-base --is-ancestor FETCH_HEAD refs/remotes/origin/main
 git show "FETCH_HEAD:scripts/update-source.py" | python3 - "$release_version"
 python3 scripts/runtime_release.py install --version "$release_version"
