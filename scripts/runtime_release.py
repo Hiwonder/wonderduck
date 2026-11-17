@@ -141,7 +141,7 @@ def require_release_branch(repo, revision, branch):
     official_source(git(repo, 'remote', 'get-url', 'origin'))
     try:
         git(repo, 'fetch', '--no-tags', '--no-recurse-submodules', '--append', 'origin',
-            'refs/heads/{0}:refs/remotes/origin/{0}'.format(branch))
+            '+refs/heads/{0}:refs/remotes/origin/{0}'.format(branch))
     except subprocess.CalledProcessError as error:
         raise ValueError('无法获取官方 {} 分支'.format(branch)) from error
     result = subprocess.run(['git', '-C', str(repo), 'merge-base', '--is-ancestor', revision,

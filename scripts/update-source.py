@@ -120,7 +120,7 @@ def require_release_branch(repo, revision, branch):
         raise ValueError('发布分支无效')
     # Preserve the already-validated release tag in FETCH_HEAD on older Git versions.
     git(repo, 'fetch', '--no-tags', '--no-recurse-submodules', '--append', 'origin',
-        'refs/heads/{0}:refs/remotes/origin/{0}'.format(branch))
+        '+refs/heads/{0}:refs/remotes/origin/{0}'.format(branch))
     if git(repo, 'merge-base', '--is-ancestor', revision,
            'refs/remotes/origin/' + branch, required=False).returncode:
         raise ValueError('该发布版本不属于官方 {} 分支，更新未执行'.format(branch))
