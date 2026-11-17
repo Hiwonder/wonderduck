@@ -1,4 +1,4 @@
 [submodule "extensions/wonderduck_studio"]
 	path = extensions/wonderduck_studio
-	url = https://github.com/Hiwonder/wonderduck_studio.git
+	url = ../wonderduck_studio.git
 	branch = main

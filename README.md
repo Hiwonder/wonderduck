@@ -2,11 +2,18 @@
 
 English | [简体中文](README_zh.md)
 
-WonderDuck provides robot control software and [WonderDuck Studio](https://github.com/Hiwonder/wonderduck_studio). It is based on [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck).
+WonderDuck provides robot control software and WonderDuck Studio ([GitHub](https://github.com/Hiwonder/wonderduck_studio) | [Gitee](https://gitee.com/hiwonder_official/wonderduck_studio)). It is based on [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck).
 
 ## Update and deployment
 
-For a device with a configured system image, select **Rest** in the web interface and wait for it to finish. Find the version on the [releases page](https://github.com/Hiwonder/wonderduck/releases), replace `0.1.0` below with that version, and run these commands on the device:
+On a device with a configured system image, select **Rest** and wait for it to finish. Choose a source:
+
+```bash
+repository=https://github.com/Hiwonder/wonderduck.git  # GitHub
+# repository=https://gitee.com/hiwonder_official/wonderduck.git  # Gitee
+```
+
+Find the version on [GitHub Releases](https://github.com/Hiwonder/wonderduck/releases) or [Gitee Releases](https://gitee.com/hiwonder_official/wonderduck/releases), replace `0.1.0` below, and run:
 
 ```bash
 (
@@ -14,10 +21,14 @@ set -e
 set -o pipefail
 cd /home/wonderduck/wonderduck
 release_version=0.1.0
+case "$repository" in
+  https://github.com/Hiwonder/wonderduck.git|https://gitee.com/hiwonder_official/wonderduck.git) ;;
+  *) echo "Select a source above"; exit 1 ;;
+esac
 sudo systemctl stop robotd
-git remote set-url origin https://github.com/Hiwonder/wonderduck.git
-git fetch --no-tags origin "refs/heads/main:refs/remotes/origin/main"
-git fetch --no-tags origin "refs/tags/runtime-v${release_version}"
+git remote set-url origin "$repository"
+git fetch --no-tags --no-recurse-submodules origin "refs/heads/main:refs/remotes/origin/main"
+git fetch --no-tags --no-recurse-submodules origin "refs/tags/runtime-v${release_version}"
 git merge-base --is-ancestor FETCH_HEAD refs/remotes/origin/main
 git show "FETCH_HEAD:scripts/update-source.py" | python3 - "$release_version"
 python3 scripts/runtime_release.py install --version "$release_version"

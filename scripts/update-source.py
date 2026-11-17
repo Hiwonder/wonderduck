@@ -14,6 +14,8 @@ import tempfile
 STUDIO = 'extensions/wonderduck_studio'
 MAIN_URL = 'https://github.com/Hiwonder/wonderduck.git'
 STUDIO_URL = 'https://github.com/Hiwonder/wonderduck_studio.git'
+GITEE_MAIN_URL = 'https://gitee.com/hiwonder_official/wonderduck.git'
+GITEE_STUDIO_URL = 'https://gitee.com/hiwonder_official/wonderduck_studio.git'
 MAIN_DATA = (
     'model-current', 'model-defaults', 'model-history', 'models', 'policies',
     'calibrations', 'records', 'actions', 'action-groups', 'exports',
@@ -40,6 +42,15 @@ def git(repo, *arguments, required=True):
 
 def output(repo, *arguments):
     return git(repo, *arguments).stdout.decode('utf-8').strip()
+
+
+def official_source(remote):
+    for name, main, studio in (('github', MAIN_URL, STUDIO_URL),
+                               ('gitee', GITEE_MAIN_URL, GITEE_STUDIO_URL)):
+        addresses = {main, main[:-4]} if main.endswith('.git') else {main}
+        if remote in addresses:
+            return name, main, studio
+    raise ValueError('WonderDuck 仓库地址无效')
 
 
 def protected(name, studio):
@@ -88,19 +99,27 @@ def clean(repo, description, ignore_submodules=False):
 
 def check_fetch_head(content, tag, url):
     lines = content.splitlines()
-    fields = lines[0].split('\t', 2) if len(lines) == 1 else []
-    # Git may omit the .git suffix when describing a fetched GitHub tag.
+    fields = lines[0].split('\t', 2) if lines else []
+    # Git may omit the .git suffix when describing a fetched tag.
     addresses = {url, url[:-4]} if url.endswith('.git') else {url}
     descriptions = {"tag '" + tag + "' of " + address for address in addresses}
     if len(fields) != 3 or not REVISION.fullmatch(fields[0]) or fields[1] or fields[2] not in descriptions:
         raise ValueError('请先从官方仓库获取指定版本')
+    # The branch verification below appends its own fetch to FETCH_HEAD. Allow
+    # those entries on retry, while keeping the requested tag as the first entry.
+    branch_descriptions = {"branch '" + branch + "' of " + address
+                           for branch in ('main', 'develop') for address in addresses}
+    for line in lines[1:]:
+        entry = line.split('\t', 2)
+        if len(entry) != 3 or not REVISION.fullmatch(entry[0]) or entry[1] or entry[2] not in branch_descriptions:
+            raise ValueError('请先从官方仓库获取指定版本')
 
 
 def require_release_branch(repo, revision, branch):
     if branch not in ('main', 'develop'):
         raise ValueError('发布分支无效')
     # Preserve the already-validated release tag in FETCH_HEAD on older Git versions.
-    git(repo, 'fetch', '--no-tags', '--append', 'origin',
+    git(repo, 'fetch', '--no-tags', '--no-recurse-submodules', '--append', 'origin',
         'refs/heads/{0}:refs/remotes/origin/{0}'.format(branch))
     if git(repo, 'merge-base', '--is-ancestor', revision,
            'refs/remotes/origin/' + branch, required=False).returncode:
@@ -115,7 +134,7 @@ def ensure_revision(repo, revision, url):
     if not REVISION.fullmatch(revision):
         raise ValueError('Studio 版本无效')
     if git(repo, 'cat-file', '-e', revision + '^{commit}', required=False).returncode:
-        git(repo, 'fetch', '--no-tags', '--', url, revision)
+        git(repo, 'fetch', '--no-tags', '--no-recurse-submodules', '--', url, revision)
     if output(repo, 'rev-parse', '--verify', revision + '^{commit}') != revision:
         raise ValueError('Studio 版本无效')
 
@@ -148,13 +167,12 @@ def update(root, version, channel='main'):
     if Path(output(root, 'rev-parse', '--show-toplevel')).resolve() != root:
         raise ValueError('请在设备的 WonderDuck 仓库目录中执行')
 
-    if output(root, 'remote', 'get-url', 'origin') != MAIN_URL:
-        raise ValueError('WonderDuck 仓库地址无效')
+    _, main_url, studio_url = official_source(output(root, 'remote', 'get-url', 'origin'))
     tag = 'runtime-v' + version
     fetch_head = Path(output(root, 'rev-parse', '--git-path', 'FETCH_HEAD'))
     if not fetch_head.is_absolute():
         fetch_head = root / fetch_head
-    check_fetch_head(fetch_head.read_text(encoding='utf-8'), tag, MAIN_URL)
+    check_fetch_head(fetch_head.read_text(encoding='utf-8'), tag, main_url)
     revision = output(root, 'rev-parse', '--verify', 'FETCH_HEAD^{commit}')
     if not REVISION.fullmatch(revision):
         raise ValueError('发布版本无效')
@@ -171,9 +189,9 @@ def update(root, version, channel='main'):
     studio_revision = studio[2]
     declared_path = output(root, 'config', '--blob', revision + ':.gitmodules', '--get',
                            'submodule.' + STUDIO + '.path')
-    url = output(root, 'config', '--blob', revision + ':.gitmodules', '--get',
-                 'submodule.' + STUDIO + '.url')
-    if declared_path != STUDIO or url != STUDIO_URL:
+    declared_url = output(root, 'config', '--blob', revision + ':.gitmodules', '--get',
+                          'submodule.' + STUDIO + '.url')
+    if declared_path != STUDIO or declared_url not in ('../wonderduck_studio.git', STUDIO_URL, GITEE_STUDIO_URL):
         raise ValueError('发布版本的 Studio 地址无效')
 
     studio_path, initialized = studio_repository(root)
@@ -185,7 +203,7 @@ def update(root, version, channel='main'):
             raise ValueError('Studio 源码状态不完整，请先检查')
         else:
             studio_current = {}
-        ensure_revision(studio_path, studio_revision, url)
+        ensure_revision(studio_path, studio_revision, studio_url)
         studio_target = tree(studio_path, studio_revision, studio=True)
         protect_existing_data(studio_path, studio_current, studio_target, studio=True)
     else:
@@ -193,7 +211,7 @@ def update(root, version, channel='main'):
         with tempfile.TemporaryDirectory(prefix='wonderduck-studio-check-') as directory:
             temporary = Path(directory)
             git(temporary, 'init', '--bare', '--quiet')
-            ensure_revision(temporary, studio_revision, url)
+            ensure_revision(temporary, studio_revision, studio_url)
             studio_target = tree(temporary, studio_revision, studio=True)
             protect_existing_data(studio_path, {}, studio_target, studio=True)
 
@@ -201,7 +219,7 @@ def update(root, version, channel='main'):
     # If either checkout fails, report it and leave the user files in place.
     git(root, 'checkout', '--detach', '--no-overwrite-ignore', revision)
     git(root, 'submodule', 'init', '--', STUDIO)
-    git(root, 'submodule', 'sync', '--', STUDIO)
+    git(root, 'config', '--local', 'submodule.' + STUDIO + '.url', studio_url)
     if not initialized:
         # Recheck after the main checkout in case the directory changed.
         _, appeared = studio_repository(root)
@@ -211,8 +229,11 @@ def update(root, version, channel='main'):
         # protected even if a user creates a file during initialization.
         studio_path.mkdir(parents=True, exist_ok=True)
         git(studio_path, 'init', '--quiet')
-        git(studio_path, 'remote', 'add', 'origin', url)
-        ensure_revision(studio_path, studio_revision, url)
+        git(studio_path, 'remote', 'add', 'origin', studio_url)
+        ensure_revision(studio_path, studio_revision, studio_url)
+    else:
+        remote = git(studio_path, 'remote', 'get-url', 'origin', required=False)
+        git(studio_path, 'remote', 'set-url' if remote.returncode == 0 else 'add', 'origin', studio_url)
     git(studio_path, 'checkout', '--detach', '--no-overwrite-ignore', studio_revision)
     if output(root, 'rev-parse', 'HEAD') != revision or output(studio_path, 'rev-parse', 'HEAD') != studio_revision:
         raise ValueError('源码版本切换未完成，请检查后重试')

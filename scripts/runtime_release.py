@@ -23,6 +23,8 @@ from urllib.request import urlopen
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_BASE = 'https://github.com/Hiwonder/wonderduck/releases/download'
 MAIN_URL = 'https://github.com/Hiwonder/wonderduck.git'
+GITEE_BASE = 'https://gitee.com/hiwonder_official/wonderduck/releases/download'
+GITEE_MAIN_URL = 'https://gitee.com/hiwonder_official/wonderduck.git'
 PUBLIC_KEY = Path('deploy/system/runtime-release.pub')
 DEVICE_VERSION = Path('/etc/robot/device-version.json')
 ROBOT_LOCK = Path('/run/robotd.sock.lock')
@@ -118,13 +120,27 @@ def git(repo, *args):
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout.strip()
 
 
+def official_source(remote):
+    for name, repository, base in (('github', MAIN_URL, DEFAULT_BASE),
+                                   ('gitee', GITEE_MAIN_URL, GITEE_BASE)):
+        addresses = {repository, repository[:-4]} if repository.endswith('.git') else {repository}
+        if remote in addresses:
+            return name, base
+    raise ValueError('WonderDuck 仓库地址无效')
+
+
+def release_download_base(repo, override=None):
+    if override:
+        return override
+    return official_source(git(repo, 'remote', 'get-url', 'origin'))[1]
+
+
 def require_release_branch(repo, revision, branch):
     if branch not in ('main', 'develop'):
         raise ValueError('发布分支无效')
-    if git(repo, 'remote', 'get-url', 'origin') != MAIN_URL:
-        raise ValueError('WonderDuck 仓库地址无效')
+    official_source(git(repo, 'remote', 'get-url', 'origin'))
     try:
-        git(repo, 'fetch', '--no-tags', '--append', 'origin',
+        git(repo, 'fetch', '--no-tags', '--no-recurse-submodules', '--append', 'origin',
             'refs/heads/{0}:refs/remotes/origin/{0}'.format(branch))
     except subprocess.CalledProcessError as error:
         raise ValueError('无法获取官方 {} 分支'.format(branch)) from error
@@ -1065,7 +1081,8 @@ def install(args):
         try:
             stage = Path(tempfile.mkdtemp(prefix=TRANSACTION_PREFIX, dir=str(root)))
             write_journal(stage, state)
-            base = args.base_url.rstrip('/') + '/' + quote(tag, safe='') + '/'
+            source_base = release_download_base(root, args.base_url)
+            base = source_base.rstrip('/') + '/' + quote(tag, safe='') + '/'
             manifest_path, signature_path = stage / MANIFEST_NAME, stage / SIGNATURE_NAME
             download(base + MANIFEST_NAME, manifest_path, 64 * 1024)
             download(base + SIGNATURE_NAME, signature_path, 4096)
@@ -1157,7 +1174,7 @@ def main():
     apply = commands.add_parser('install', help='下载并安装指定发布版本')
     apply.add_argument('--version', required=True)
     apply.add_argument('--repo', type=Path, default=ROOT)
-    apply.add_argument('--base-url', default=DEFAULT_BASE)
+    apply.add_argument('--base-url', help='Override the release download base URL')
     apply.add_argument('--channel', choices=('main', 'develop'), default='main')
     args = parser.parse_args()
     try:
