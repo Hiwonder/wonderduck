@@ -2162,6 +2162,23 @@ fn spawn_control_thread(
                 let mut retry_at = Instant::now();
                 while !state.shutdown.load(Ordering::Acquire) && !state.stopping.load(Ordering::Acquire) {
                     #[cfg(target_os = "linux")]
+                    if service_startup_emergency(&state, &intents, || {
+                        if let Some(io) = status_io.as_mut() { status_only.close(io, &state)?; }
+                        let mut io = match status_io.take() {
+                            Some(io) => io,
+                            None => open_backend(&bus, imu_source, imu_last).map_err(|error| error.to_string())?,
+                        };
+                        io.recover_device_bus().map_err(|error| error.to_string())?;
+                        status_bus::complete_recovery(&state.status_journal).map_err(|error| error.to_string())?;
+                        state.status_bus_fault.store(false, Ordering::Release);
+                        state.homed.store(false, Ordering::Release);
+                        Ok(())
+                    }) {
+                        if !state.status_bus_fault.load(Ordering::Acquire) { break; }
+                        std::thread::sleep(period);
+                        continue;
+                    }
+                    #[cfg(target_os = "linux")]
                     if status_only_requested(&state) {
                         if state.devices_tx.receiver_count() > 0 && Instant::now() >= retry_at {
                             if status_io.is_none() {
@@ -2816,7 +2833,14 @@ async fn open_bus_waiting(
                 status_only.close(opened, state)?;
             }
             if state.status_bus_fault.load(Ordering::Acquire) {
-                return Err("设备状态回复未确认，串口尚未恢复".into());
+                if io.is_none() {
+                    io = Some(open_backend(bus, imu_source, imu_last).map_err(|error| error.to_string())?);
+                }
+                io.as_mut().expect("bus opened").recover_device_bus().map_err(|error| error.to_string())?;
+                status_bus::complete_recovery(&state.status_journal).map_err(|error| error.to_string())?;
+                state.status_bus_fault.store(false, Ordering::Release);
+                state.homed.store(false, Ordering::Release);
+                return Ok(());
             }
             if io.is_none() {
                 io = Some(open_backend(bus, imu_source, imu_last).map_err(|error| error.to_string())?);
@@ -3836,7 +3860,11 @@ async fn adopt_startup_pose<T: RobotIo>(
         if service_startup_emergency(state, intents, || {
             status_only.close(safety, state)?;
             if state.status_bus_fault.load(Ordering::Acquire) {
-                return Err("设备状态回复未确认，串口尚未恢复".into());
+                safety.recover_device_bus().map_err(|error| error.to_string())?;
+                status_bus::complete_recovery(&state.status_journal).map_err(|error| error.to_string())?;
+                state.status_bus_fault.store(false, Ordering::Release);
+                state.homed.store(false, Ordering::Release);
+                return Ok(());
             }
             if !verified_torque_release {
                 return Err("该舵机总线不支持卸力回读，结果未确认".into());
@@ -4855,7 +4883,18 @@ async fn control_loop<T: RobotIo>(
         read_timing.begin_tick(tick_start);
 
         if state.status_bus_fault.load(Ordering::Acquire) {
-            if status_only_requested(&state) && !state.stopping.load(Ordering::Acquire) {
+            let mut requested_recovery = None;
+            service_startup_emergency(&state, &intents, || {
+                let result = status_only.close(&mut safety, &state)
+                    .and_then(|()| safety.recover_device_bus().map_err(|error| error.to_string()))
+                    .and_then(|()| status_bus::complete_recovery(&state.status_journal)
+                        .map_err(|error| error.to_string()));
+                requested_recovery = Some(result.clone());
+                result
+            });
+            if requested_recovery.is_none() && status_only_requested(&state)
+                && !state.stopping.load(Ordering::Acquire)
+            {
                 intents.set_enabled(false);
                 if safety.supports_individual_device_observation() {
                     status_only.sample(&mut safety, &state, period, false);
@@ -4869,10 +4908,14 @@ async fn control_loop<T: RobotIo>(
             }
             publish_status_fault(&state, safety.sample_device_observation(tick_start));
             let phase = state.human_control.lock().maintenance_phase();
-            if tick_start >= next_status_recovery && phase != Some(human_control::MaintenancePhase::Active) {
+            let recovered = if let Some(result) = requested_recovery {
+                Some(result)
+            } else if tick_start >= next_status_recovery && phase != Some(human_control::MaintenancePhase::Active) {
                 intents.set_enabled(false);
-                let recovered = safety.recover_device_bus().map_err(|error| error.to_string())
-                    .and_then(|()| status_bus::complete_recovery(&state.status_journal).map_err(|error| error.to_string()));
+                Some(safety.recover_device_bus().map_err(|error| error.to_string())
+                    .and_then(|()| status_bus::complete_recovery(&state.status_journal).map_err(|error| error.to_string())))
+            } else { None };
+            if let Some(recovered) = recovered {
                 match recovered {
                     Ok(()) => {
                         let mut guard = state.human_control.lock();
@@ -9247,8 +9290,7 @@ async fn handle_session(
             let blocked = call.as_ref().is_ok_and(|call| {
                 (is_motion_intent(call) && !matches!(call, proto::Call::RobotStop
                     | proto::Call::RobotSound(_) | proto::Call::RobotSoundClip(_)))
-                    || matches!(call, proto::Call::RobotLowVoltageRearm | proto::Call::RobotEmergencyRelax
-                        | proto::Call::RobotApplyModel(_))
+                    || matches!(call, proto::Call::RobotLowVoltageRearm | proto::Call::RobotApplyModel(_))
                     || matches!(call, proto::Call::RobotMaintenance(params)
                         if !matches!(params.action, proto::MaintenanceAction::Status | proto::MaintenanceAction::Release))
                     || matches!(call, proto::Call::RobotHumanControl(params)

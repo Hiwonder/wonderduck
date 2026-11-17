@@ -20,6 +20,34 @@ pub struct CalibrationRestoreAttempts {
 }
 
 impl HxIo {
+    /// Recheck or restore MCU calibration only after the bus is recovered.
+    /// The attempt record survives retries so an uncertain flash write is not
+    /// repeated automatically. Torque remains disabled until this succeeds.
+    pub(super) fn prepare_recovered_imu(&mut self) -> Result<()> {
+        if !self.recovery_imu_pending { return Ok(()); }
+        if Instant::now() < self.recovery_imu_retry_at {
+            return Err(IoError::Bus("MCU calibration recovery is pending".into()));
+        }
+        self.recovery_imu_retry_at = Instant::now() + Duration::from_secs(2);
+        let port = self.port_path.clone();
+        let use_accel = self.imu.acceleration_enabled();
+        let mut attempts = std::mem::take(&mut self.recovery_calibration_attempts);
+        let result = self.restore_missing_persistent_calibration(&port, use_accel, &mut attempts)
+            .and_then(|()| {
+                if use_accel { self.load_fixed_accel_calibration(&port)?; }
+                self.load_fixed_gyro_calibration(&port)?;
+                self.report_accel_calibration()?;
+                self.configure_accel_calibration(use_accel)
+            });
+        self.recovery_calibration_attempts = attempts;
+        if result.is_ok() {
+            self.recovery_imu_pending = false;
+            self.imu.invalidate_host();
+            tracing::info!("MCU calibration verified after bus recovery");
+        }
+        result
+    }
+
     pub fn restore_missing_persistent_calibration(
         &mut self,
         port: &str,

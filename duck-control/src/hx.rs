@@ -182,6 +182,11 @@ pub struct HxIo {
     observation: Option<observations::ObservationScan>,
     /// Never issue a subsequent bus instruction after an unconfirmed status read.
     status_unconfirmed: bool,
+    /// A recovered bus has released torque, but MCU calibration must be
+    /// checked again before any later request can enable motion.
+    recovery_imu_pending: bool,
+    recovery_imu_retry_at: Instant,
+    recovery_calibration_attempts: CalibrationRestoreAttempts,
     slow: Option<SlowSensors>,
     /// Recovery probes cannot send any actuator or configuration write.
     read_only: bool,
@@ -212,6 +217,9 @@ impl HxIo {
             diagnostics: DiagnosticCache::default(),
             observation: None,
             status_unconfirmed: false,
+            recovery_imu_pending: false,
+            recovery_imu_retry_at: Instant::now(),
+            recovery_calibration_attempts: CalibrationRestoreAttempts::default(),
             slow: None,
             read_only: false,
             torque_enabled: None,
@@ -469,6 +477,9 @@ impl HxIo {
     }
 
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
+        if on && self.recovery_imu_pending {
+            return Err(IoError::Bus("MCU calibration must be verified before enabling torque".into()));
+        }
         // A failed multi-servo operation may have changed only some joints.
         self.torque_enabled = None;
         self.set_torque_ids(&HX_BUS_JOINT_IDS, on)?;
@@ -1078,11 +1089,14 @@ impl RobotIo for HxIo {
             }
             self.port = Some(open_serial(&self.port_path)?);
             self.torque_enabled = None;
-            if self.imu.source().shared_bus() && self.imu.source() != ImuSource::Id200Host {
-                if let Err(error) = self.report_accel_calibration() {
-                    self.port.take();
-                    return Err(error);
-                }
+            if self.imu.source().shared_bus() && self.imu.source() != ImuSource::Id200Host
+                && let Err(error) = self.report_accel_calibration()
+            {
+                // A missing MCU calibration must not strand the maintenance
+                // lease. Keep motion locked and restore it after the handoff.
+                tracing::warn!(%error, "MCU calibration needs verification after maintenance");
+                self.recovery_imu_pending = true;
+                self.recovery_imu_retry_at = Instant::now();
             }
             self.motion_restore_pending = true;
         }
@@ -1158,12 +1172,12 @@ impl RobotIo for HxIo {
             self.port = Some(open_serial(&self.port_path)?);
             self.torque_enabled = None;
             self.set_torque(false)?;
-            if self.imu.source().shared_bus() && self.imu.source() != ImuSource::Id200Host {
-                self.report_accel_calibration()?;
-                let port = self.port_path.clone();
-                if self.imu.acceleration_enabled() { self.load_fixed_accel_calibration(&port)?; }
-                self.load_fixed_gyro_calibration(&port)?;
-            }
+            // Bus recovery is complete once every servo confirms torque off.
+            // Calibration is a separate prerequisite for later motion; making
+            // it part of this result prevents a blank MCU from being restored.
+            self.recovery_imu_pending = self.imu.source().shared_bus()
+                && self.imu.source() != ImuSource::Id200Host;
+            self.recovery_imu_retry_at = Instant::now();
             self.motion_restore_pending = true;
             Ok(())
         })();
@@ -1180,6 +1194,9 @@ impl RobotIo for HxIo {
     }
 
     fn write(&mut self, targets: &JointTargets) -> Result<()> {
+        if self.recovery_imu_pending {
+            return Err(IoError::Bus("MCU calibration must be verified before writing targets".into()));
+        }
         if self.torque_enabled == Some(false) {
             return Ok(());
         }
@@ -1266,7 +1283,7 @@ impl RobotIo for HxIo {
     }
 
     fn imu_ready(&self) -> bool {
-        self.imu.ready()
+        !self.recovery_imu_pending && self.imu.ready()
     }
 
     fn restart_imu_stream(&mut self) {

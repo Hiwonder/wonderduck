@@ -42,6 +42,7 @@ impl HxIo {
     }
 
     pub(super) fn read_sensors(&mut self, deadline: Option<Instant>) -> Result<Sensors> {
+        self.prepare_recovered_imu()?;
         self.begin_control_observation();
         let result = self.read_sensors_inner(deadline);
         self.finish_control_observation(&result);
