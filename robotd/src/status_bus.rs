@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-/// A physical bus transaction survives daemon and OS restarts until it is confirmed.
+/// Preserve an interrupted status transaction until the bus has been resynchronized.
 /// Simulations use a socket-adjacent file and must never block a physical robot.
 pub(crate) fn journal_path(socket: &Path, physical: bool) -> std::path::PathBuf {
     if physical {
@@ -21,12 +21,9 @@ pub(crate) fn pending(path: &Path) -> io::Result<bool> {
     }
 }
 
-pub(crate) fn recover_inflight(_path: &Path, _port: &str) -> io::Result<()> {
-    // With no transaction ID or documented maximum response delay, silence
-    // cannot establish whether a device may still reply. The old reader may
-    // also have consumed part of that reply before it disconnected. Keep the
-    // bus parked even if someone removes the file while the process is running.
-    Err(io::Error::other("unconfirmed status reply; motor bus remains locked"))
+pub(crate) fn recover_inflight(path: &Path, port: &str) -> io::Result<()> {
+    duck_control::hx::drain_status_input(port).map_err(io::Error::other)?;
+    complete_recovery(path)
 }
 
 fn boot_id() -> io::Result<String> {
@@ -77,5 +74,14 @@ pub(crate) fn begin_session(path: &Path) -> io::Result<()> {
 
 pub(crate) fn complete(path: &Path) -> io::Result<()> {
     std::fs::remove_file(path)?;
+    std::fs::File::open(path.parent().ok_or_else(|| io::Error::other("missing journal parent"))?)?.sync_all()
+}
+
+pub(crate) fn complete_recovery(path: &Path) -> io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
     std::fs::File::open(path.parent().ok_or_else(|| io::Error::other("missing journal parent"))?)?.sync_all()
 }

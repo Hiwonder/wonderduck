@@ -302,6 +302,12 @@ pub trait RobotIo {
     fn set_individual_device_observation(&mut self, _active: bool) {}
     fn supports_individual_device_observation(&self) -> bool { false }
     fn quarantine_device_bus(&mut self) {}
+    /// True only while all joints are known to have been released.
+    fn torque_release_verified(&self) -> bool { false }
+    /// Reopen a quarantined status bus after draining delayed input.
+    fn recover_device_bus(&mut self) -> Result<()> {
+        Err(IoError::Bus("status bus recovery is unsupported".into()))
+    }
     /// Start or refresh a device-status subscription.
     fn begin_device_observation(&mut self, _generation: u64) {}
     /// Stop preparing device observations when the last subscriber leaves.

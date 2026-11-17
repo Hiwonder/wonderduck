@@ -1,7 +1,4 @@
-//! Device status derived from the primary control transaction.
-//!
-//! The status subscriber never sends another packet on the half-duplex motor bus.
-//! Each valid reply is retained even when another device makes the control read fail.
+//! Device observations from control reads or an exclusive individual status scan.
 
 use super::*;
 use crate::io::{DeviceObservation, ImuObservation, ServoObservation};
@@ -66,17 +63,17 @@ impl HxIo {
             for servo in &mut scan.latest.servos {
                 *servo = ServoObservation { id: servo.id, ..Default::default() };
             }
+            scan.latest.imu = ImuObservation::default();
         }
     }
 
     /// A status reply is accepted only as the exact matching complete frame.
     /// Unlike the regular stream parser, this never skips damaged or extra bytes.
-    fn read_status_one(&mut self, id: u8) -> Result<StatusFrame> {
-        const LENGTH: u8 = 71;
+    fn read_status_one(&mut self, id: u8, address: u8, length: u8) -> Result<Option<StatusFrame>> {
         if self.status_unconfirmed {
             return Err(IoError::Bus("status reply unconfirmed; motor bus is quarantined".into()));
         }
-        let request = read_request(id, 0, LENGTH)?;
+        let request = read_request(id, address, length)?;
         self.status_unconfirmed = true;
         // Do not discard unexpected bytes: they may belong to an earlier transaction.
         if self.port_mut()?.bytes_to_read().map_err(io_error)? != 0 {
@@ -85,7 +82,7 @@ impl HxIo {
         self.port_mut()?.set_timeout(READ_TIMEOUT).map_err(io_error)?;
         self.port_mut()?.write_all(&request).map_err(|e| IoError::Bus(format!("status read transmission: {e}")))?;
         let started = Instant::now();
-        let mut bytes = Vec::with_capacity(usize::from(LENGTH) + 6);
+        let mut bytes = Vec::with_capacity(usize::from(length) + 6);
         let mut chunk = [0u8; 128];
         while started.elapsed() < READ_TIMEOUT {
             let left = READ_TIMEOUT.saturating_sub(started.elapsed());
@@ -99,25 +96,86 @@ impl HxIo {
             if (bytes.len() >= 1 && bytes[0] != 0xff)
                 || (bytes.len() >= 2 && bytes[1] != 0xff)
                 || (bytes.len() >= 3 && bytes[2] != id)
-                || (bytes.len() >= 4 && bytes[3] != LENGTH + 2)
+                || (bytes.len() >= 4 && bytes[3] != length + 2 && bytes[3] != 2)
             {
                 return Err(IoError::Bus("status frame header or length mismatch".into()));
             }
-            let total = usize::from(LENGTH) + 6;
+            if bytes.len() < 4 { continue; }
+            let error_reply = bytes[3] == 2;
+            if error_reply && bytes.len() >= 5 && bytes[4] == 0 {
+                return Err(IoError::Bus("status frame has no payload or error".into()));
+            }
+            let total = usize::from(bytes[3]) + 4;
             if bytes.len() > total { return Err(IoError::Bus("extra bytes after status frame".into())); }
             if bytes.len() == total {
                 if bytes[2..].iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) != 0xff
-                    || bytes[5 + 5] != id
+                    || (!error_reply && address == 0 && length == 71 && bytes[5 + 5] != id)
                     || self.port_mut()?.bytes_to_read().map_err(io_error)? != 0
                 {
                     return Err(IoError::Bus("invalid or unexpected status frame".into()));
                 }
                 self.port_mut()?.set_timeout(READ_TIMEOUT).map_err(io_error)?;
                 self.status_unconfirmed = false;
-                return Ok(StatusFrame { id, error: bytes[4], data: bytes[5..total-1].to_vec() });
+                return Ok(Some(StatusFrame { id, error: bytes[4], data: bytes[5..total-1].to_vec() }));
             }
         }
-        Err(IoError::Bus(format!("status read ID {id} timed out; reply is unconfirmed")))
+        if !bytes.is_empty() {
+            return Err(IoError::Bus(format!("status read ID {id} timed out with an incomplete frame")));
+        }
+        // A missing device must not hide every other device. While the status
+        // session still exclusively owns the port, wait for a bounded quiet
+        // interval and validate any late reply before starting the next read.
+        self.drain_timed_out_status(id, length)?;
+        self.port_mut()?.set_timeout(READ_TIMEOUT).map_err(io_error)?;
+        self.status_unconfirmed = false;
+        Ok(None)
+    }
+
+    fn drain_timed_out_status(&mut self, id: u8, length: u8) -> Result<()> {
+        const QUIET: Duration = Duration::from_millis(500);
+        const LIMIT: Duration = Duration::from_secs(3);
+        let started = Instant::now();
+        let mut last_data = started;
+        let mut late = Vec::new();
+        let mut chunk = [0u8; 128];
+        loop {
+            let now = Instant::now();
+            if now.duration_since(started) >= LIMIT {
+                return Err(IoError::Bus("status bus remains noisy after timeout".into()));
+            }
+            let available = self.port_mut()?.bytes_to_read().map_err(io_error)?;
+            if available > 0 {
+                let limit = usize::try_from(available).unwrap_or(usize::MAX).min(chunk.len());
+                let count = self.port_mut()?.read(&mut chunk[..limit])
+                    .map_err(|error| IoError::Bus(format!("status drain read: {error}")))?;
+                if count == 0 {
+                    return Err(IoError::Bus("status serial connection closed during drain".into()));
+                }
+                late.extend_from_slice(&chunk[..count]);
+                last_data = Instant::now();
+                if late.len() > usize::from(length) + 6
+                    || (late.len() >= 1 && late[0] != 0xff)
+                    || (late.len() >= 2 && late[1] != 0xff)
+                    || (late.len() >= 3 && late[2] != id)
+                    || (late.len() >= 4 && late[3] != length + 2 && late[3] != 2)
+                {
+                    return Err(IoError::Bus("unexpected frame during status drain".into()));
+                }
+            } else if now.duration_since(last_data) >= QUIET {
+                if !late.is_empty() {
+                    if late.len() < 6 || late.len() != usize::from(late[3]) + 4
+                        || (late[3] == 2 && late[4] == 0)
+                        || late[2..].iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) != 0xff
+                        || (length == 71 && late[3] != 2 && late[10] != id)
+                    {
+                        return Err(IoError::Bus("invalid or incomplete late status frame".into()));
+                    }
+                }
+                return Ok(());
+            } else {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
     pub(super) fn sample_one_observation(&mut self, deadline: Instant) -> Result<Option<DeviceObservation>> {
@@ -129,12 +187,24 @@ impl HxIo {
         scan.enabled = true;
         if !scan.individual { return Ok(Some(scan.latest.clone())); }
         let joint = scan.next_joint;
+        if joint == JOINT_IDS.len() {
+            return self.sample_one_imu();
+        }
         let id = JOINT_IDS[joint];
-        let result = self.read_status_one(id);
+        let result = self.read_status_one(id, 0, 71);
         let stamp = duck_ipc_proto::clock::monotonic_ns();
         let scan = self.observation.as_mut().expect("status scan exists");
         match result {
-            Ok(frame) => {
+            Ok(Some(frame)) => {
+                if frame.data.is_empty() {
+                    scan.latest.servos[joint] = ServoObservation {
+                        id, observed_t_ns: Some(stamp), valid: false,
+                        error: Some(format!("舵机返回错误 0x{:02X}", frame.error)),
+                        ..Default::default()
+                    };
+                    scan.next_joint = joint + 1;
+                    return Ok(Some(scan.latest.clone()));
+                }
                 let b = &frame.data;
                 let raw = u16::from_le_bytes([b[56], b[57]]);
                 let raw = signed_magnitude(raw, 15).clamp(0, 4095) as u16;
@@ -152,13 +222,87 @@ impl HxIo {
                         minimum_starting_torque: u16::from_le_bytes([b[24], b[25]]),
                     }), configuration_error: None,
                 };
-                scan.next_joint = (joint + 1) % JOINT_IDS.len();
+                scan.next_joint = joint + 1;
+                Ok(Some(scan.latest.clone()))
+            }
+            Ok(None) => {
+                scan.latest.servos[joint] = ServoObservation {
+                    id, observed_t_ns: Some(stamp), valid: false,
+                    error: Some("读取超时".into()), ..Default::default()
+                };
+                scan.next_joint = joint + 1;
                 Ok(Some(scan.latest.clone()))
             }
             Err(error) => {
                 scan.latest.servos[joint] = ServoObservation {
                     id, observed_t_ns: Some(stamp), valid: false, error: Some(error.to_string()),
                     ..Default::default()
+                };
+                Err(error)
+            }
+        }
+    }
+
+    fn sample_one_imu(&mut self) -> Result<Option<DeviceObservation>> {
+        let source = self.imu.source();
+        if source == ImuSource::I2c {
+            let result = self.imu.start().and_then(|()| self.imu.sample(None, duck_ipc_proto::clock::monotonic_ns()));
+            let stamp = duck_ipc_proto::clock::monotonic_ns();
+            let scan = self.observation.as_mut().expect("status scan exists");
+            scan.next_joint = 0;
+            match result {
+                Ok((imu, timing, _)) => Self::store_control_imu(&mut scan.latest.imu, imu, timing.acquired_t_ns),
+                Err(error) => scan.latest.imu = ImuObservation {
+                    observed_t_ns: Some(stamp), error: Some(error.to_string()), ..Default::default()
+                },
+            }
+            return Ok(Some(scan.latest.clone()));
+        }
+        if source == ImuSource::Id200Host {
+            let scan = self.observation.as_mut().expect("status scan exists");
+            scan.next_joint = 0;
+            scan.latest.imu = ImuObservation {
+                observed_t_ns: Some(duck_ipc_proto::clock::monotonic_ns()),
+                error: Some("主机融合 IMU 暂不支持独立状态读取".into()),
+                ..Default::default()
+            };
+            return Ok(Some(scan.latest.clone()));
+        }
+        let id = self.imu_device_id();
+        let result = self.read_status_one(id, PRESENT_POSITION, PRESENT_POSITION_LEN);
+        let stamp = duck_ipc_proto::clock::monotonic_ns();
+        let scan = self.observation.as_mut().expect("status scan exists");
+        match result {
+            Ok(Some(frame)) => {
+                scan.next_joint = 0;
+                let imu = if frame.data.is_empty() {
+                    Err(format!("IMU 返回错误 0x{:02X}", frame.error))
+                } else if frame.error != 0 {
+                    Err(format!("IMU 状态错误 0x{:02X}", frame.error))
+                } else if frame.data[11] & 0x80 != 0 {
+                    Err("MCU IMU not ready or invalid quaternion".to_owned())
+                } else {
+                    let block: &[u8; 12] = frame.data.as_slice().try_into().expect("validated IMU length");
+                    scan.imu_decoder.decode_packed(block).map_err(str::to_owned)
+                };
+                match imu {
+                    Ok(imu) => Self::store_control_imu(&mut scan.latest.imu, imu, stamp),
+                    Err(error) => scan.latest.imu = ImuObservation {
+                        observed_t_ns: Some(stamp), error: Some(error), ..Default::default()
+                    },
+                }
+                Ok(Some(scan.latest.clone()))
+            }
+            Ok(None) => {
+                scan.next_joint = 0;
+                scan.latest.imu = ImuObservation {
+                    observed_t_ns: Some(stamp), error: Some("读取超时".into()), ..Default::default()
+                };
+                Ok(Some(scan.latest.clone()))
+            }
+            Err(error) => {
+                scan.latest.imu = ImuObservation {
+                    observed_t_ns: Some(stamp), error: Some(error.to_string()), ..Default::default()
                 };
                 Err(error)
             }

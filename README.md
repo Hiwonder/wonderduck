@@ -49,20 +49,4 @@ Studio provides control over the local network. Connect the robot to a trusted n
 
 ## Recover from a device status read failure
 
-If an unconfirmed serial error occurs while reading device status, the robot stops using the servo bus. Stop `robotd` and do not start it or any other program that accesses the servo serial port during recovery. Run:
-
-```bash
-sudo systemctl stop robotd &&
-sudo python3 /home/wonderduck/wonderduck/scripts/recover-status-bus.py prepare &&
-sudo poweroff
-```
-
-After shutdown, disconnect the battery, charger, USB, and all other power sources so that the board, servos, and MCU are completely powered off. Reconnect power and start the device. Restarting the board alone is not sufficient. Then run:
-
-```bash
-sudo systemctl stop robotd &&
-sudo python3 /home/wonderduck/wonderduck/scripts/recover-status-bus.py recover &&
-sudo systemctl start robotd
-```
-
-Enter `POWER-CYCLED` only after confirming that all devices were fully powered off and restarted. If recovery fails, keep the service stopped and follow the reported instructions before retrying.
+If a device status read encounters a serial fault, motion control is disabled while the robot attempts to restore communication and verify each servo is released. If the fault persists, check the servo and MCU connections and power, then reopen the device status page. Contact support if recovery still fails.

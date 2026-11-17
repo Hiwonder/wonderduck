@@ -4,13 +4,22 @@ use crate::gyro_gains::{ADDRESS, STATUS_LENGTH, GainState, GyroGains};
 
 impl HxIo {
     pub(super) fn restore_gyro_gains(&mut self, id: u8, desired: Option<&GyroGains>) -> Result<()> {
+        self.restore_gyro_gains_inner(id, desired, false)
+    }
+
+    /// A blank MCU may be provisioned from a valid host backup from another device.
+    pub(super) fn restore_missing_gyro_gains(&mut self, id: u8, desired: Option<&GyroGains>) -> Result<()> {
+        self.restore_gyro_gains_inner(id, desired, true)
+    }
+
+    fn restore_gyro_gains_inner(&mut self, id: u8, desired: Option<&GyroGains>, allow_other_device: bool) -> Result<()> {
         let mut state = GainState::decode(&self.read_register_block(id, ADDRESS, STATUS_LENGTH)?)?;
         if !state.supported || state.busy {
             return Err(IoError::Bus("gyro gain capability unavailable or operation already in progress".into()));
         }
         if let Some(calibration) = desired {
             calibration.validate()?;
-            if calibration.device_uid != state.device_uid {
+            if !allow_other_device && calibration.device_uid != state.device_uid {
                 return Err(IoError::Bus("gyro gain backup belongs to a different IMU".into()));
             }
         }

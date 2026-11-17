@@ -38,14 +38,17 @@ impl EmergencyRelax {
         Some(std::mem::take(&mut pending.waiters))
     }
 
-    /// Complete the taken batch. The caller holds the human-control lock so another
-    /// request cannot race the decision to release the admission gate.
+    /// Complete the taken batch. Return true while the admission gate must stay
+    /// closed: another request is pending or this release was not verified.
+    /// The caller holds the human-control lock so another request cannot race
+    /// the decision to release the gate. Dropped waiters do not cancel a release.
     pub(crate) fn complete(&self, waiters: Vec<Completion>, result: Result<(), String>) -> bool {
         let pending = self.pending.lock().expect("emergency release mutex poisoned");
+        let verified = result.is_ok();
         for waiter in waiters {
             let _ = waiter.send(result.clone());
         }
-        pending.requested
+        pending.requested || !verified
     }
 
 

@@ -32,6 +32,7 @@ use imu_source::ImuReader;
 pub use imu_source::ImuSource;
 pub use calibration_recovery::CalibrationRestoreAttempts;
 
+
 use crate::io::{
     ImuStale, IoError, JointTargets, ReadFeedback, Result, RobotIo, Sensors, SentGoals,
     ServoFeedback, SlowSensors,
@@ -468,6 +469,8 @@ impl HxIo {
     }
 
     pub fn set_torque(&mut self, on: bool) -> Result<()> {
+        // A failed multi-servo operation may have changed only some joints.
+        self.torque_enabled = None;
         self.set_torque_ids(&HX_BUS_JOINT_IDS, on)?;
         self.torque_enabled = Some(on);
         Ok(())
@@ -1124,6 +1127,37 @@ impl RobotIo for HxIo {
     fn supports_individual_device_observation(&self) -> bool { true }
 
     fn quarantine_device_bus(&mut self) { self.status_unconfirmed = true; }
+
+    fn torque_release_verified(&self) -> bool {
+        !self.status_unconfirmed && self.port.is_some() && self.torque_enabled == Some(false)
+    }
+
+    fn recover_device_bus(&mut self) -> Result<()> {
+        self.port.take();
+        self.observation = None;
+        self.status_unconfirmed = true;
+        drain_status_input(&self.port_path)?;
+        self.status_unconfirmed = false;
+        let result = (|| {
+            // Do not make torque release depend on the MCU being reachable. The
+            // normal maintenance handoff reports IMU calibration immediately;
+            // after a bus fault that report can fail even though the servos still
+            // accept an individually verified release.
+            self.port = Some(open_serial(&self.port_path)?);
+            self.torque_enabled = None;
+            self.set_torque(false)?;
+            if self.imu.source().shared_bus() && self.imu.source() != ImuSource::Id200Host {
+                self.report_accel_calibration()?;
+                let port = self.port_path.clone();
+                if self.imu.acceleration_enabled() { self.load_fixed_accel_calibration(&port)?; }
+                self.load_fixed_gyro_calibration(&port)?;
+            }
+            self.motion_restore_pending = true;
+            Ok(())
+        })();
+        if result.is_err() { self.status_unconfirmed = true; }
+        result
+    }
 
     fn begin_device_observation(&mut self, generation: u64) {
         self.begin_observation(generation);

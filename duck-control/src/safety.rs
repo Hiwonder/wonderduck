@@ -210,6 +210,16 @@ impl<T: RobotIo> Safety<T> {
 
     pub fn quarantine_device_bus(&mut self) { self.io.quarantine_device_bus(); }
 
+    pub fn torque_release_verified(&self) -> bool { self.io.torque_release_verified() }
+
+    pub fn recover_device_bus(&mut self) -> Result<(), IoError> {
+        self.io.recover_device_bus()?;
+        self.gain = None;
+        self.position_p_gain = None;
+        self.io.restart_imu_stream();
+        Ok(())
+    }
+
     pub fn begin_device_observation(&mut self, generation: u64) {
         self.io.begin_device_observation(generation);
     }

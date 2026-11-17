@@ -175,7 +175,8 @@ impl<'a> Guard<'a> {
         self.result(true, None)
     }
 
-    /// Prevent control and bus handoff while a verified release is in flight.
+    /// Prevent control and bus handoff until release has been verified.
+    /// An unverified attempt keeps this gate closed; a later request may retry.
     pub(crate) fn begin_emergency_release(&mut self) -> Result<(), &'static str> {
         if self.state.maintenance.is_some() {
             return Err("maintenance_active");
@@ -189,12 +190,21 @@ impl<'a> Guard<'a> {
         self.state.emergency_release = false;
     }
 
+    /// Includes both an in-flight release and a failed, unverified release.
     pub(crate) fn emergency_release_active(&self) -> bool {
         self.state.emergency_release
     }
 
     pub(crate) fn maintenance_phase(&self) -> Option<MaintenancePhase> {
         self.state.maintenance.as_ref().map(|maintenance| maintenance.phase)
+    }
+
+    /// Whether this connected session holds the active ordinary maintenance lease.
+    pub(crate) fn holds_active_maintenance(&self, session: &Session) -> bool {
+        session.connected && self.state.maintenance.as_ref().is_some_and(|maintenance|
+            maintenance.connection_id == session.id
+                && maintenance.phase == MaintenancePhase::Active
+                && !maintenance.status_reads)
     }
 
     pub(crate) fn status_stop_requested(&self) -> bool {

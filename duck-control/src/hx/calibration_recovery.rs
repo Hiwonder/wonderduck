@@ -65,8 +65,7 @@ impl HxIo {
             ));
         }
 
-        // Check both backups and the gain identity before writing either one. A missing
-        // or invalid backup must not prevent restoring the other valid calibration.
+        // A missing or invalid backup must not prevent restoring the other valid calibration.
         let mut backup_error = None;
         let accel = if need_accel {
             match FixedAccelCalibration::load(accel_path, port) {
@@ -101,11 +100,6 @@ impl HxIo {
                 ));
             }
             match &gyro.gyro_gains {
-                Some(gains) if gains.device_uid != state.device_uid => {
-                    return Err(IoError::Bus(
-                        "gyro gain backup belongs to a different IMU".into(),
-                    ));
-                }
                 None if state.installed => {
                     return Err(IoError::Bus(
                         "gyro backup lacks the MCU's active gain calibration".into(),
@@ -152,7 +146,7 @@ impl HxIo {
             }
             attempts.gyro = true;
             attempts.blocked = true;
-            self.restore_gyro_gains(id, gyro.gyro_gains.as_ref())?;
+            self.restore_missing_gyro_gains(id, gyro.gyro_gains.as_ref())?;
             let desired = gyro.wire_configuration();
             let mut params = vec![122];
             params.extend_from_slice(&desired);
@@ -173,12 +167,7 @@ impl HxIo {
             }
             let state =
                 GainState::decode(&self.read_register_block(id, GAIN_ADDRESS, GAIN_LENGTH)?)?;
-            if !state.matches(gyro.gyro_gains.as_ref())
-                || gyro
-                    .gyro_gains
-                    .as_ref()
-                    .is_some_and(|gains| gains.device_uid != state.device_uid)
-            {
+            if !state.matches(gyro.gyro_gains.as_ref()) {
                 return Err(IoError::Bus("MCU gyro gains readback mismatch".into()));
             }
             let deadline = Instant::now() + Duration::from_secs(5);

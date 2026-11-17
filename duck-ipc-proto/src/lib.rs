@@ -2177,6 +2177,8 @@ pub enum MaintenanceAction {
     StatusReadComplete,
     /// A timeout is not confirmation and must leave the read pending.
     StatusReadTimeout,
+    /// The exclusive maintenance owner is about to change a servo's motion or torque.
+    InvalidateRest,
     Release,
     Status,
 }

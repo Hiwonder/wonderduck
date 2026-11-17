@@ -49,20 +49,4 @@ Studio 提供局域网控制功能；使用时请将机器人接入可信网络�
 
 ## 恢复状态读取故障
 
-如设备状态读取发生未确认的串口故障，机器人会停止使用舵机总线。请先停止 `robotd`，并在恢复期间不要启动任何 `robotd` 实例或其他直接访问舵机串口的程序。然后执行：
-
-```bash
-sudo systemctl stop robotd &&
-sudo python3 /home/wonderduck/wonderduck/scripts/recover-status-bus.py prepare &&
-sudo poweroff
-```
-
-设备关机后，断开电池、充电器、USB 和其他所有电源，使主板、舵机及 MCU 全部断电，再重新接通并开机。单独重启主板不能代替完全断电。开机后执行：
-
-```bash
-sudo systemctl stop robotd &&
-sudo python3 /home/wonderduck/wonderduck/scripts/recover-status-bus.py recover &&
-sudo systemctl start robotd
-```
-
-`recover` 会要求在终端输入 `POWER-CYCLED`，仅在确认所有设备均已完全断电重开后输入。如果恢复失败，请保持服务停止，检查提示后重新操作。
+设备状态读取发生串口故障时，机器人会关闭运动控制，尝试恢复通信并逐个确认舵机卸力。如果故障持续，请检查舵机和 MCU 的连接及供电，再重新打开设备状态页；仍无法恢复时请联系技术支持。
