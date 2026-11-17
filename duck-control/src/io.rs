@@ -301,6 +301,11 @@ pub trait RobotIo {
     }
     fn set_individual_device_observation(&mut self, _active: bool) {}
     fn supports_individual_device_observation(&self) -> bool { false }
+    /// Drain late input before a read-only status session. This never releases
+    /// or enables a joint and does not clear the daemon's durable fault marker.
+    fn prepare_individual_device_observation(&mut self) -> Result<()> {
+        Err(IoError::Bus("individual status reads are unsupported".into()))
+    }
     fn quarantine_device_bus(&mut self) {}
     /// True only while all joints are known to have been released.
     fn torque_release_verified(&self) -> bool { false }

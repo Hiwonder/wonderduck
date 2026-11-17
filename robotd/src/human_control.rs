@@ -63,6 +63,7 @@ struct State {
     emergency_release: bool,
     manual_blockers: HashSet<u64>,
     status_blockers: HashSet<u64>,
+    maintenance_transition_blockers: HashSet<u64>,
     status_journal: std::path::PathBuf,
 }
 
@@ -172,6 +173,26 @@ impl<'a> Guard<'a> {
             return self.result(false, Some(reason));
         }
         self.state.status_blockers.remove(&session.id);
+        self.result(true, None)
+    }
+
+    pub(crate) fn maintenance_transition_blocked(&self) -> bool {
+        !self.state.maintenance_transition_blockers.is_empty()
+    }
+
+    pub(crate) fn block_maintenance_transition(&mut self, session: &Session) -> HumanControlResult {
+        if let Err(reason) = self.registered(session, HumanControlSource::Web) {
+            return self.result(false, Some(reason));
+        }
+        self.state.maintenance_transition_blockers.insert(session.id);
+        self.result(true, None)
+    }
+
+    pub(crate) fn unblock_maintenance_transition(&mut self, session: &Session) -> HumanControlResult {
+        if let Err(reason) = self.registered(session, HumanControlSource::Web) {
+            return self.result(false, Some(reason));
+        }
+        self.state.maintenance_transition_blockers.remove(&session.id);
         self.result(true, None)
     }
 
@@ -532,6 +553,7 @@ impl<'a> Guard<'a> {
     pub(crate) fn disconnect(&mut self, session: &mut Session) -> bool {
         self.state.manual_blockers.remove(&session.id);
         self.state.status_blockers.remove(&session.id);
+        self.state.maintenance_transition_blockers.remove(&session.id);
         let was_owner = self.access(session) == Access::Owner;
         if let Some(maintenance) = self.state.maintenance.as_mut()
             && maintenance.connection_id == session.id

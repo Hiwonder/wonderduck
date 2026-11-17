@@ -963,7 +963,12 @@ fn open_serial(path: &str) -> Result<Box<dyn SerialPort>> {
 /// sending any further instruction. This is a bounded recovery, not a guarantee
 /// against a device whose undocumented response delay exceeds the quiet window.
 pub fn drain_status_input(path: &str) -> Result<()> {
-    let port = open_serial(path)?;
+    let mut port = open_serial(path)?;
+    drain_status_port(port.as_mut())
+}
+
+/// Keep the existing exclusive port lock while draining late responses.
+fn drain_status_port(port: &mut dyn SerialPort) -> Result<()> {
     let started = Instant::now();
     let mut quiet_since = started;
     let mut discarded = 0u64;
@@ -1125,6 +1130,13 @@ impl RobotIo for HxIo {
     }
 
     fn supports_individual_device_observation(&self) -> bool { true }
+
+    fn prepare_individual_device_observation(&mut self) -> Result<()> {
+        self.status_unconfirmed = true;
+        drain_status_port(self.port_mut()?)?;
+        self.status_unconfirmed = false;
+        Ok(())
+    }
 
     fn quarantine_device_bus(&mut self) { self.status_unconfirmed = true; }
 

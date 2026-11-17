@@ -2155,8 +2155,44 @@ fn spawn_control_thread(
                 // Drain late replies, then individually release and verify the
                 // servos before clearing the durable marker or starting control.
                 intents.set_enabled(false);
+                #[cfg(target_os = "linux")]
+                let mut status_io: Option<BusIo> = None;
+                #[cfg(target_os = "linux")]
+                let mut status_only = ReadOnlyStatusSession::default();
+                let mut retry_at = Instant::now();
                 while !state.shutdown.load(Ordering::Acquire) && !state.stopping.load(Ordering::Acquire) {
+                    #[cfg(target_os = "linux")]
+                    if status_only_requested(&state) {
+                        if state.devices_tx.receiver_count() > 0 && Instant::now() >= retry_at {
+                            if status_io.is_none() {
+                                match open_backend(&bus, imu_source, imu_last) {
+                                    Ok(io) => status_io = Some(io),
+                                    Err(error) => {
+                                        tracing::warn!(%error, "cannot open startup status bus");
+                                        retry_at = Instant::now() + Duration::from_secs(2);
+                                    }
+                                }
+                            }
+                            if let Some(io) = status_io.as_mut() {
+                                if io.supports_individual_device_observation() {
+                                    status_only.sample(io, &state, period, false);
+                                } else {
+                                    publish_status_fault(&state, None);
+                                }
+                            }
+                        }
+                        std::thread::sleep(period);
+                        continue;
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some(mut io) = status_io.take() {
+                        let _ = status_only.close(&mut io, &state);
+                    }
                     publish_status_fault(&state, None);
+                    if Instant::now() < retry_at {
+                        std::thread::sleep(period);
+                        continue;
+                    }
                     #[cfg(target_os = "linux")]
                     let recovered = open_backend(&bus, imu_source, imu_last)
                         .and_then(|mut io| io.recover_device_bus())
@@ -2175,7 +2211,8 @@ fn spawn_control_thread(
                         }
                         Err(error) => tracing::warn!(%error, "startup status bus recovery failed; retrying"),
                     }
-                    std::thread::sleep(Duration::from_secs(2));
+                    retry_at = Instant::now() + Duration::from_secs(2);
+                    std::thread::sleep(period);
                 }
                 if state.status_bus_fault.load(Ordering::Acquire) { return; }
             }
@@ -2243,7 +2280,7 @@ fn spawn_control_thread(
             runtime.block_on(async move {
                 #[cfg(target_os = "linux")]
                 if bus.protocol == BusProtocol::Hx && state.low_voltage_lock.requires_rearm()
-                    && !wait_for_low_voltage_recovery(&bus, &state, &intents).await
+                    && !wait_for_low_voltage_recovery(&bus, &state, &intents, imu_source, imu_last).await
                 {
                     // Keep publishing an unconfirmed-bus fault for viewers that
                     // subscribe after preflight has already failed.
@@ -2308,11 +2345,19 @@ fn minimum_recovery_voltage(blocks: &[Vec<u8>]) -> Option<f64> {
 /// One durable marker covers the entire preflight; an unanswered transaction
 /// must never be retried or forgotten merely because the line is quiet.
 #[cfg(target_os = "linux")]
-async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, intents: &Intents) -> bool {
+async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, intents: &Intents,
+    imu_source: ImuSource, imu_last: bool) -> bool {
     let mut io = loop {
         if state.stopping.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) { return false; }
         match duck_control::hx::HxIo::open_read_only(&bus.port) {
-            Ok(io) => break io,
+            Ok(mut io) => {
+                io.set_imu_source(imu_source);
+                if let Err(error) = io.set_imu_last(imu_last) {
+                    tracing::warn!(%error, "cannot configure read-only voltage preflight IMU");
+                    return false;
+                }
+                break io;
+            }
             Err(error) => {
                 tracing::warn!(%error, "cannot open read-only voltage preflight bus");
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2326,8 +2371,14 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
         return false;
     }
     let mut admitted = false;
+    let mut status_only = ReadOnlyStatusSession::default();
     loop {
         if state.stopping.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
+            if let Err(error) = status_only.close(&mut io, state) {
+                tracing::error!(%error, "cannot close voltage preflight status session");
+                state.status_bus_fault.store(true, Ordering::Release);
+                return false;
+            }
             // The last request was completely answered. No next request was sent.
             if let Err(error) = status_bus::complete(&state.status_journal) {
                 tracing::error!(%error, "cannot complete voltage preflight journal");
@@ -2337,6 +2388,19 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
             if state.exit_sit.load(Ordering::Acquire) != 0 {
                 state.exit_sit.store(EXIT_SIT_DONE, Ordering::Release);
             }
+            return false;
+        }
+        if status_only_requested(state) {
+            // Preflight is read-only and has its own durable marker. Suspend
+            // its synchronous sample while the status page owns the bus.
+            status_only.sample(&mut io, state, Duration::from_millis(20), true);
+            if state.status_bus_fault.load(Ordering::Acquire) { return false; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
+        if let Err(error) = status_only.close(&mut io, state) {
+            tracing::error!(%error, "cannot close voltage preflight status session");
+            state.status_bus_fault.store(true, Ordering::Release);
             return false;
         }
         let sample = match io.diagnostic_read_state_blocks(&duck_control::model::JOINT_IDS) {
@@ -2544,6 +2608,13 @@ impl RobotIo for BusIo {
         }
     }
 
+    fn prepare_individual_device_observation(&mut self) -> duck_control::io::Result<()> {
+        match self {
+            Self::Dynamixel(io) => io.prepare_individual_device_observation(),
+            Self::Hx(io) => io.prepare_individual_device_observation(),
+        }
+    }
+
     fn quarantine_device_bus(&mut self) {
         match self {
             Self::Dynamixel(io) => io.quarantine_device_bus(),
@@ -2714,10 +2785,17 @@ async fn open_bus_waiting(
     let mut maintenance_error = None;
     let mut observing = false;
     let mut device_schedule = telemetry::DeviceSchedule::default();
+    let mut status_only = ReadOnlyStatusSession::default();
     let mut calibration_restore = duck_control::hx::CalibrationRestoreAttempts::default();
     let sample_period = Duration::from_micros(state.period_us);
 
     while !state.shutdown.load(Ordering::Relaxed) {
+        let status_requested = status_only_requested(state);
+        if !status_requested && let Some(opened) = io.as_mut()
+            && let Err(error) = status_only.close(opened, state)
+        {
+            tracing::error!(%error, "cannot close startup status session");
+        }
         if service_startup_maintenance(state, &mut maintenance_parked, &mut maintenance_error, |release| {
             match io.as_mut() {
                 Some(io) if !release && state.stopping.load(Ordering::Acquire) => {
@@ -2734,6 +2812,12 @@ async fn open_bus_waiting(
         }
 
         if service_startup_emergency(state, intents, || {
+            if let Some(opened) = io.as_mut() {
+                status_only.close(opened, state)?;
+            }
+            if state.status_bus_fault.load(Ordering::Acquire) {
+                return Err("设备状态回复未确认，串口尚未恢复".into());
+            }
             if io.is_none() {
                 io = Some(open_backend(bus, imu_source, imu_last).map_err(|error| error.to_string())?);
             }
@@ -2747,8 +2831,71 @@ async fn open_bus_waiting(
         }
 
         if state.stopping.load(Ordering::Acquire) {
+            if let Some(opened) = io.as_mut() { let _ = status_only.close(opened, state); }
             finish_startup_bus(io.take(), bus, state, imu_source, imu_last);
             return None;
+        }
+
+        if status_requested {
+            // Once the page guard is held, finish the current transaction and
+            // stop every startup sync check, even before a subscriber arrives.
+            intents.set_enabled(false);
+            if state.devices_tx.receiver_count() > 0 && Instant::now() >= next_check {
+                if io.is_none() {
+                    match open_backend(bus, imu_source, imu_last) {
+                        Ok(opened) => io = Some(opened),
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot open startup status bus");
+                            next_check = Instant::now() + STARTUP_RETRY_INTERVAL;
+                        }
+                    }
+                }
+                if let Some(opened) = io.as_mut() {
+                    if opened.supports_individual_device_observation() {
+                        status_only.sample(opened, state, sample_period, false);
+                    } else {
+                        publish_status_fault(state, None);
+                    }
+                }
+            }
+            tokio::time::sleep(sample_period).await;
+            continue;
+        }
+
+        if state.status_bus_fault.load(Ordering::Acquire) {
+            // Only a verified release may clear the durable fault. Do not run
+            // startup register checks while recovering an ambiguous reply.
+            intents.set_enabled(false);
+            if Instant::now() >= next_check {
+                let recovered = match io.take() {
+                    Some(mut opened) => opened.recover_device_bus(),
+                    None => open_backend(bus, imu_source, imu_last)
+                        .and_then(|mut opened| opened.recover_device_bus()),
+                }.map_err(|error| error.to_string())
+                    .and_then(|()| status_bus::complete_recovery(&state.status_journal).map_err(|error| error.to_string()));
+                match recovered {
+                    Ok(()) => {
+                        state.startup_release_verified.store(true, Ordering::Release);
+                        state.status_bus_fault.store(false, Ordering::Release);
+                        state.homed.store(false, Ordering::Release);
+                        next_check = Instant::now();
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "startup status bus recovery failed; retrying");
+                        next_check = Instant::now() + Duration::from_secs(2);
+                    }
+                }
+            }
+            publish_status_fault(state, None);
+            tokio::time::sleep(sample_period).await;
+            continue;
+        }
+
+        let emergency_active = state.human_control.lock().emergency_release_active();
+        if emergency_active {
+            // A failed emergency release stays latched until a verified retry.
+            tokio::time::sleep(sample_period).await;
+            continue;
         }
 
         let requested = state.devices_tx.receiver_count() > 0;
@@ -2815,6 +2962,7 @@ async fn open_bus_waiting(
     }
 
     if state.stopping.load(Ordering::Acquire) {
+        if let Some(opened) = io.as_mut() { let _ = status_only.close(opened, state); }
         if maintenance_parked {
             if state.release_torque_on_exit.load(Ordering::Acquire) {
                 tracing::error!("shutdown torque off not attempted: motor bus is still owned by maintenance");
@@ -2831,7 +2979,11 @@ fn finish_startup_bus(
     io: Option<BusIo>, bus: &params::Bus, state: &RobotState,
     imu_source: ImuSource, imu_last: bool,
 ) {
-    if state.release_torque_on_exit.load(Ordering::Acquire) {
+    let locked = state.status_bus_fault.load(Ordering::Acquire)
+        || state.human_control.lock().emergency_release_active();
+    if locked {
+        tracing::error!("shutdown bus write skipped: motor status or torque release is unconfirmed");
+    } else if state.release_torque_on_exit.load(Ordering::Acquire) {
         let result = match io {
             Some(mut io) => io.set_torque(false),
             None => open_backend(bus, imu_source, imu_last).and_then(|mut io| io.set_torque(false)),
@@ -3429,6 +3581,143 @@ fn sample_waiting_bus<T: RobotIo>(
     });
 }
 
+/// Access used by the status-only path while startup or emergency release is
+/// blocked. The path never requests a control read or writes to an actuator.
+trait StatusObservationBus {
+    fn prepare_status(&mut self) -> duck_control::io::Result<()>;
+    fn set_status_individual(&mut self, active: bool);
+    fn begin_status(&mut self, generation: u64);
+    fn sample_status(&mut self, deadline: Instant) -> duck_control::io::Result<Option<proto::DeviceObservation>>;
+    fn quarantine_status(&mut self);
+}
+
+impl<T: RobotIo> StatusObservationBus for Safety<T> {
+    fn prepare_status(&mut self) -> duck_control::io::Result<()> { self.prepare_individual_device_observation() }
+    fn set_status_individual(&mut self, active: bool) { self.set_individual_device_observation(active); }
+    fn begin_status(&mut self, generation: u64) { self.begin_device_observation(generation); }
+    fn sample_status(&mut self, deadline: Instant) -> duck_control::io::Result<Option<proto::DeviceObservation>> {
+        self.sample_individual_device_observation(deadline)
+    }
+    fn quarantine_status(&mut self) { self.quarantine_device_bus(); }
+}
+
+#[cfg(target_os = "linux")]
+impl StatusObservationBus for BusIo {
+    fn prepare_status(&mut self) -> duck_control::io::Result<()> { self.prepare_individual_device_observation() }
+    fn set_status_individual(&mut self, active: bool) { self.set_individual_device_observation(active); }
+    fn begin_status(&mut self, generation: u64) { self.begin_device_observation(generation); }
+    fn sample_status(&mut self, deadline: Instant) -> duck_control::io::Result<Option<proto::DeviceObservation>> {
+        self.sample_individual_device_observation(deadline)
+    }
+    fn quarantine_status(&mut self) { self.quarantine_device_bus(); }
+}
+
+#[cfg(target_os = "linux")]
+impl StatusObservationBus for duck_control::hx::HxIo {
+    fn prepare_status(&mut self) -> duck_control::io::Result<()> { self.prepare_individual_device_observation() }
+    fn set_status_individual(&mut self, active: bool) { self.set_individual_device_observation(active); }
+    fn begin_status(&mut self, generation: u64) { self.begin_device_observation(generation); }
+    fn sample_status(&mut self, deadline: Instant) -> duck_control::io::Result<Option<proto::DeviceObservation>> {
+        self.sample_individual_device_observation(deadline)
+    }
+    fn quarantine_status(&mut self) { self.quarantine_device_bus(); }
+}
+
+struct ReadOnlyStatusSession {
+    active: bool,
+    owns_marker: bool,
+    retry_after: Instant,
+    schedule: telemetry::DeviceSchedule,
+}
+
+impl Default for ReadOnlyStatusSession {
+    fn default() -> Self {
+        Self { active: false, owns_marker: false, retry_after: Instant::now(),
+            schedule: telemetry::DeviceSchedule::default() }
+    }
+}
+
+impl ReadOnlyStatusSession {
+    /// `existing_marker_owned` is used only by voltage preflight, whose journal
+    /// already protects its own read-only session and must not be removed here.
+    fn sample<B: StatusObservationBus>(&mut self, io: &mut B, state: &RobotState,
+        period: Duration, existing_marker_owned: bool)
+    {
+        if state.devices_tx.receiver_count() == 0 || Instant::now() < self.retry_after { return; }
+        let result = self.sample_inner(io, state, period, existing_marker_owned);
+        if let Err(error) = result {
+            tracing::error!(%error, "individual status read unconfirmed; motor bus remains locked");
+            io.set_status_individual(false);
+            io.quarantine_status();
+            self.active = false;
+            self.owns_marker = false;
+            self.schedule.reset();
+            self.retry_after = Instant::now() + Duration::from_secs(2);
+            state.status_bus_fault.store(true, Ordering::Release);
+            publish_status_fault(state, None);
+        }
+    }
+
+    fn sample_inner<B: StatusObservationBus>(&mut self, io: &mut B, state: &RobotState,
+        period: Duration, existing_marker_owned: bool) -> Result<(), String>
+    {
+        if !self.active {
+            let pending = status_bus::pending(&state.status_journal).map_err(|error| error.to_string())?;
+            if pending {
+                if !existing_marker_owned && !state.status_bus_fault.load(Ordering::Acquire) {
+                    state.status_bus_fault.store(true, Ordering::Release);
+                }
+                self.owns_marker = false;
+            } else {
+                status_bus::begin_session(&state.status_journal).map_err(|error| error.to_string())?;
+                self.owns_marker = !state.status_bus_fault.load(Ordering::Acquire);
+            }
+            // Wait for late replies while still holding the same exclusive port.
+            // A pre-existing fault and its marker remain until torque is verified.
+            io.prepare_status().map_err(|error| error.to_string())?;
+            io.set_status_individual(true);
+            io.begin_status(state.device_configuration_generation.load(Ordering::Acquire));
+            self.active = true;
+        }
+        let interval = state.device_subscriptions.period(period).min(Duration::from_millis(150));
+        if self.schedule.due(Instant::now(), proto::clock::monotonic_ns(), interval)
+            && let Some(observation) = io.sample_status(Instant::now() + period.max(Duration::from_millis(3)))
+                .map_err(|error| error.to_string())?
+        {
+            self.schedule.observe(&observation);
+            if state.status_bus_fault.load(Ordering::Acquire) {
+                publish_status_fault(state, Some(observation));
+            } else {
+                publish_device_observation(state, Some(observation));
+            }
+        }
+        Ok(())
+    }
+
+    fn close<B: StatusObservationBus>(&mut self, io: &mut B, state: &RobotState) -> Result<(), String> {
+        if !self.active { return Ok(()); }
+        io.set_status_individual(false);
+        self.active = false;
+        self.schedule.reset();
+        if self.owns_marker && !state.status_bus_fault.load(Ordering::Acquire) {
+            if let Err(error) = status_bus::complete(&state.status_journal) {
+                io.quarantine_status();
+                state.status_bus_fault.store(true, Ordering::Release);
+                self.owns_marker = false;
+                return Err(error.to_string());
+            }
+        }
+        self.owns_marker = false;
+        Ok(())
+    }
+}
+
+fn status_only_requested(state: &RobotState) -> bool {
+    let guard = state.human_control.lock();
+    (guard.status_blocked() || guard.maintenance_transition_blocked())
+        && guard.maintenance_phase().is_none()
+}
+
 /// Honour maintenance handoff while startup is still waiting for a complete device set.
 fn service_startup_maintenance(
     state: &RobotState,
@@ -3526,8 +3815,14 @@ async fn adopt_startup_pose<T: RobotIo>(
     let mut maintenance_parked = false;
     let mut maintenance_error = None;
     let mut device_schedule = telemetry::DeviceSchedule::default();
+    let mut status_only = ReadOnlyStatusSession::default();
+    let mut fault_retry_at = Instant::now();
 
     while !state.shutdown.load(Ordering::Relaxed) {
+        let status_requested = status_only_requested(state);
+        if !status_requested && let Err(error) = status_only.close(safety, state) {
+            tracing::error!(%error, "cannot close startup status session");
+        }
         if service_startup_maintenance(state, &mut maintenance_parked, &mut maintenance_error, |release| {
             if !release && state.stopping.load(Ordering::Acquire) {
                 safety.maintenance_reclaim_for_shutdown()
@@ -3539,6 +3834,10 @@ async fn adopt_startup_pose<T: RobotIo>(
             continue;
         }
         if service_startup_emergency(state, intents, || {
+            status_only.close(safety, state)?;
+            if state.status_bus_fault.load(Ordering::Acquire) {
+                return Err("设备状态回复未确认，串口尚未恢复".into());
+            }
             if !verified_torque_release {
                 return Err("该舵机总线不支持卸力回读，结果未确认".into());
             }
@@ -3547,8 +3846,45 @@ async fn adopt_startup_pose<T: RobotIo>(
             continue;
         }
         if state.stopping.load(Ordering::Acquire) {
+            let _ = status_only.close(safety, state);
             finish_startup_exit(safety, state).await;
             return None;
+        }
+        if status_requested {
+            intents.set_enabled(false);
+            if safety.supports_individual_device_observation() {
+                status_only.sample(safety, state, period, false);
+            } else {
+                publish_status_fault(state, None);
+            }
+            tokio::time::sleep(period).await;
+            continue;
+        }
+        if state.status_bus_fault.load(Ordering::Acquire) {
+            intents.set_enabled(false);
+            if Instant::now() >= fault_retry_at {
+                let recovered = safety.recover_device_bus().map_err(|error| error.to_string())
+                    .and_then(|()| status_bus::complete_recovery(&state.status_journal).map_err(|error| error.to_string()));
+                match recovered {
+                    Ok(()) => {
+                        state.startup_release_verified.store(true, Ordering::Release);
+                        state.status_bus_fault.store(false, Ordering::Release);
+                        state.homed.store(false, Ordering::Release);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "startup status bus recovery failed; retrying");
+                        fault_retry_at = Instant::now() + Duration::from_secs(2);
+                    }
+                }
+            }
+            publish_status_fault(state, None);
+            tokio::time::sleep(period).await;
+            continue;
+        }
+        let emergency_active = state.human_control.lock().emergency_release_active();
+        if emergency_active {
+            tokio::time::sleep(period).await;
+            continue;
         }
         let read = safety.read();
         match read {
@@ -3580,6 +3916,11 @@ async fn adopt_startup_pose<T: RobotIo>(
                 }
                 let retry_at = Instant::now() + STARTUP_RETRY_INTERVAL;
                 while Instant::now() < retry_at && !state.shutdown.load(Ordering::Relaxed) {
+                    if status_only_requested(state) || state.status_bus_fault.load(Ordering::Acquire)
+                        || state.human_control.lock().emergency_release_active()
+                    {
+                        break;
+                    }
                     if service_startup_maintenance(state, &mut maintenance_parked, &mut maintenance_error, |release| {
                         if !release && state.stopping.load(Ordering::Acquire) {
                             safety.maintenance_reclaim_for_shutdown()
@@ -3617,6 +3958,7 @@ async fn adopt_startup_pose<T: RobotIo>(
     }
 
     if state.stopping.load(Ordering::Acquire) {
+        let _ = status_only.close(safety, state);
         if maintenance_parked {
             if state.release_torque_on_exit.load(Ordering::Acquire) {
                 tracing::error!("shutdown torque off not attempted: motor bus is still owned by maintenance");
@@ -3629,7 +3971,11 @@ async fn adopt_startup_pose<T: RobotIo>(
 }
 
 async fn finish_startup_exit<T: RobotIo>(safety: &mut Safety<T>, state: &RobotState) {
-    if state.release_torque_on_exit.load(Ordering::Acquire) {
+    let locked = state.status_bus_fault.load(Ordering::Acquire)
+        || state.human_control.lock().emergency_release_active();
+    if locked {
+        tracing::error!("shutdown bus write skipped: motor status or torque release is unconfirmed");
+    } else if state.release_torque_on_exit.load(Ordering::Acquire) {
         let released = finish_exit(safety, false, state.exit_head_timing).await.is_ok();
         state.exit_release_verified.store(released && state.bus_timeout_supported, Ordering::Release);
     }
@@ -4498,6 +4844,7 @@ async fn control_loop<T: RobotIo>(
     let mut status_page_was_ready = false;
     let mut status_pose_latched = false;
     let mut next_status_recovery = Instant::now();
+    let mut status_only = ReadOnlyStatusSession::default();
     // The startup pose read precedes blocking model/audio initialization. Begin
     // the host estimator's continuous stream here; runtime gap checks stay strict.
     safety.restart_imu_stream();
@@ -4508,6 +4855,18 @@ async fn control_loop<T: RobotIo>(
         read_timing.begin_tick(tick_start);
 
         if state.status_bus_fault.load(Ordering::Acquire) {
+            if status_only_requested(&state) && !state.stopping.load(Ordering::Acquire) {
+                intents.set_enabled(false);
+                if safety.supports_individual_device_observation() {
+                    status_only.sample(&mut safety, &state, period, false);
+                } else {
+                    publish_status_fault(&state, None);
+                }
+                continue;
+            }
+            if let Err(error) = status_only.close(&mut safety, &state) {
+                tracing::error!(%error, "cannot close faulted status session");
+            }
             publish_status_fault(&state, safety.sample_device_observation(tick_start));
             let phase = state.human_control.lock().maintenance_phase();
             if tick_start >= next_status_recovery && phase != Some(human_control::MaintenancePhase::Active) {
@@ -4563,6 +4922,13 @@ async fn control_loop<T: RobotIo>(
             }
         };
         if let Some(waiters) = emergency {
+            if let Err(error) = status_only.close(&mut safety, &state) {
+                let mut guard = state.human_control.lock();
+                if !state.emergency_relax.complete(waiters, Err(format!("串口交接未确认：{error}"))) {
+                    guard.finish_emergency_release();
+                }
+                continue;
+            }
             if status_session_open {
                 safety.set_individual_device_observation(false);
                 if let Err(error) = status_bus::complete(&state.status_journal) {
@@ -4615,15 +4981,28 @@ async fn control_loop<T: RobotIo>(
             // Do not use an earlier snapshot or write a target in the release tick.
             continue;
         }
-        if state.human_control.lock().emergency_release_active() {
+        let emergency_active = state.human_control.lock().emergency_release_active();
+        if emergency_active {
             // A failed release stays locked until an explicit retry succeeds.
-            // Do not resume background reads or actuator writes in the meantime.
+            // The status page may still inspect the exclusively owned bus one
+            // device at a time; no normal read or actuator write is permitted.
+            intents.set_enabled(false);
+            if status_only_requested(&state) && !state.stopping.load(Ordering::Acquire) {
+                if safety.supports_individual_device_observation() {
+                    status_only.sample(&mut safety, &state, period, false);
+                } else {
+                    publish_status_fault(&state, None);
+                }
+            } else if let Err(error) = status_only.close(&mut safety, &state) {
+                tracing::error!(%error, "cannot close emergency status session");
+            }
             continue;
         }
 
         let (maintenance, maintenance_stop_requested, status_page_active) = {
             let guard = state.human_control.lock();
-            (guard.maintenance_phase(), guard.status_stop_requested(), guard.status_blocked())
+            (guard.maintenance_phase(), guard.status_stop_requested(),
+                guard.status_blocked() || guard.maintenance_transition_blocked())
         };
         let status_stop_requested = maintenance_stop_requested || status_page_active;
         // A maintenance page must not command a fallen robot to stand up. If a
@@ -7966,8 +8345,16 @@ async fn control_loop<T: RobotIo>(
         state.managed_models.finish(&request.operation, "failed", Some("控制服务已停止".into()));
     }
     read_timing.report();
-    if state.status_bus_fault.load(Ordering::Acquire) {
-        tracing::error!("control loop stops without bus writes; status reply remains unconfirmed");
+    if let Err(error) = status_only.close(&mut safety, &state) {
+        tracing::error!(%error, "cannot close read-only status session on shutdown");
+    }
+    if state.status_bus_fault.load(Ordering::Acquire)
+        || state.human_control.lock().emergency_release_active()
+    {
+        tracing::error!("control loop stops without bus writes; status or torque release remains unconfirmed");
+        if state.exit_sit.load(Ordering::Acquire) != 0 {
+            state.exit_sit.store(EXIT_SIT_DONE, Ordering::Release);
+        }
         return;
     }
     if status_session_open {
@@ -8840,6 +9227,22 @@ async fn handle_session(
 
         let call = request.as_call();
 
+        let transition_blocked = state.human_control.lock().maintenance_transition_blocked();
+        if transition_blocked && call.as_ref().is_ok_and(|call| {
+            (is_motion_intent(call) && !matches!(call, proto::Call::RobotStop
+                | proto::Call::RobotShutdown | proto::Call::RobotSound(_) | proto::Call::RobotSoundClip(_)))
+                || matches!(call, proto::Call::RobotLowVoltageRearm | proto::Call::RobotApplyModel(_))
+                || matches!(call, proto::Call::RobotHumanControl(params)
+                    if params.action == proto::HumanControlAction::PersonFollowHome)
+        }) {
+            if let Some(id) = request.id.clone() {
+                let response = proto::Response::err(Some(id), proto::Error::new(
+                    proto::code::INVALID_REQUEST, "维护页面正在接管，运动控制不可用"));
+                write_line(&mut write_half, &response).await?;
+            }
+            continue;
+        }
+
         if state.status_bus_fault.load(Ordering::Acquire) {
             let blocked = call.as_ref().is_ok_and(|call| {
                 (is_motion_intent(call) && !matches!(call, proto::Call::RobotStop
@@ -8867,7 +9270,7 @@ async fn handle_session(
                     let mut guard = state.human_control.lock();
                     if guard.access(session) != human_control::Access::Owner {
                         proto::IntentResult::refused("需要新的控制权才能启动")
-                    } else if guard.manual_blocked() || guard.status_blocked() {
+                    } else if guard.manual_blocked() || guard.status_blocked() || guard.maintenance_transition_blocked() {
                         proto::IntentResult::refused("当前页面禁止手动启动")
                     } else if !state.startup_voltage_ready.load(Ordering::Acquire) {
                         proto::IntentResult::refused("电压尚未恢复或采样不可用")
@@ -8984,7 +9387,7 @@ async fn handle_session(
                     proto::MotionTrackingAction::Start => {
                         let snapshot = intents.snapshot();
                         let reason = if !web { Some("网页控制连接未注册") }
-                            else if guard.status_blocked() { Some("设备状态页面禁止运动") }
+                            else if guard.status_blocked() || guard.maintenance_transition_blocked() { Some("维护页面禁止运动") }
                             else if !params.valid() { Some("目标或头部 PID 参数无效") }
                             else if intents.maze_active() { Some("迷宫模式正在运行") }
                             else if intents.coordinated_tracking_active() { Some("联合追踪正在运行") }
@@ -9043,7 +9446,7 @@ async fn handle_session(
                     proto::MotionTrackingAction::Start => {
                         let snapshot = intents.snapshot();
                         let reason = if !web { Some("网页控制连接未注册") }
-                            else if guard.status_blocked() { Some("设备状态页面禁止运动") }
+                            else if guard.status_blocked() || guard.maintenance_transition_blocked() { Some("维护页面禁止运动") }
                             else if !params.valid() { Some("目标或追踪参数无效") }
                             else if intents.maze_active() { Some("迷宫模式正在运行") }
                             else if intents.coordinated_tracking_active() { Some("联合追踪正在运行") }
@@ -9104,7 +9507,7 @@ async fn handle_session(
                     proto::MotionTrackingAction::Start => {
                         let snapshot = intents.snapshot();
                         let reason = if !web { Some("网页控制连接未注册") }
-                            else if guard.status_blocked() { Some("设备状态页面禁止运动") }
+                            else if guard.status_blocked() || guard.maintenance_transition_blocked() { Some("维护页面禁止运动") }
                             else if !params.valid() { Some("目标、相机或联合追踪参数无效") }
                             else if coordinated_tracking::geometry().is_err() { Some("公共头部运动学模型不可用") }
                             else if intents.maze_active() { Some("迷宫模式正在运行") }
@@ -9186,7 +9589,7 @@ async fn handle_session(
                     proto::MotionTrackingAction::Start => {
                         let snapshot = intents.snapshot();
                         let reason = if !web { Some("网页控制连接未注册") }
-                            else if guard.status_blocked() { Some("设备状态页面禁止运动") }
+                            else if guard.status_blocked() || guard.maintenance_transition_blocked() { Some("维护页面禁止运动") }
                             else if !params.valid() { Some("迷宫参数无效") }
                             else if intents.motion_tracking_active() || intents.head_tracking_active()
                                 || intents.coordinated_tracking_active() { Some("视觉追踪正在运行") }
@@ -9281,6 +9684,19 @@ async fn handle_session(
                             result
                         },
                         Action::UnblockStatus => guard.unblock_status(session),
+                        Action::BlockMaintenanceTransition => {
+                            let result = guard.block_maintenance_transition(session);
+                            if result.accepted {
+                                guard.emergency_stop();
+                                intents.cancel_head_tracking();
+                                intents.cancel_motion_tracking();
+                                intents.cancel_coordinated_tracking();
+                                intents.cancel_maze();
+                                intents.stop_for_maintenance();
+                            }
+                            result
+                        },
+                        Action::UnblockMaintenanceTransition => guard.unblock_maintenance_transition(session),
                         Action::Acquire | Action::AcquireIfFree if (intents.head_tracking_active() || intents.motion_tracking_active()
                             || intents.coordinated_tracking_active() || intents.maze_active())
                             && guard.access(session) != human_control::Access::Owner =>
@@ -9355,7 +9771,7 @@ async fn handle_session(
                         Action::PersonFollowHome => {
                             if !state.startup_voltage_ready.load(Ordering::Acquire) || state.low_voltage_lock.requires_rearm() {
                                 proto::HumanControlResult { accepted: false, owner: None, reason: Some("低电压保护中，请充电后手动启动".into()) }
-                            } else if guard.status_blocked() {
+                            } else if guard.status_blocked() || guard.maintenance_transition_blocked() {
                                 proto::HumanControlResult { accepted: false, owner: None, reason: Some("设备状态页面禁止运动".into()) }
                             } else if session.source() != Some(proto::HumanControlSource::Web)
                                 || (guard.has_owner() && guard.access(session) != human_control::Access::Owner)
@@ -9425,7 +9841,7 @@ async fn handle_session(
                     clear_human_intents(&intents);
                     intents.request_confirmed_shutdown();
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::accepted()))
-                } else if guard.status_blocked() {
+                } else if guard.status_blocked() || guard.maintenance_transition_blocked() {
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::refused("设备状态页面禁止运动")))
                 } else if intents.motion_tracking_active() || intents.coordinated_tracking_active() || intents.maze_active() {
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::refused("autonomous control owns the robot")))

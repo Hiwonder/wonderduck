@@ -2144,6 +2144,10 @@ pub enum HumanControlAction {
     BlockStatus,
     /// Release this connection's device-status movement guard.
     UnblockStatus,
+    /// Keep motion blocked while a page hands status ownership to maintenance.
+    BlockMaintenanceTransition,
+    /// Release this connection's maintenance transition guard.
+    UnblockMaintenanceTransition,
     /// Stop either coordinated tracking mode and return ID 31 to physical Home while retaining
     /// the web lease. The wire name predates target tracking's use of this action.
     PersonFollowHome,

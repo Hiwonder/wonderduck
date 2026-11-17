@@ -204,6 +204,10 @@ impl<T: RobotIo> Safety<T> {
         self.io.set_individual_device_observation(active);
     }
 
+    pub fn prepare_individual_device_observation(&mut self) -> Result<(), IoError> {
+        self.io.prepare_individual_device_observation()
+    }
+
     pub fn supports_individual_device_observation(&self) -> bool {
         self.io.supports_individual_device_observation()
     }
