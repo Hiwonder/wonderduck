@@ -8,9 +8,16 @@ WonderDuck provides robot control software and WonderDuck Studio ([GitHub](https
 
 On a device with a configured system image, select **Rest** and wait for it to finish. Choose a source:
 
+GitHub:
+
 ```bash
-repository=https://github.com/Hiwonder/wonderduck.git  # GitHub
-# repository=https://gitee.com/hiwonder_official/wonderduck.git  # Gitee
+repository=https://github.com/Hiwonder/wonderduck.git
+```
+
+Gitee:
+
+```bash
+repository=https://gitee.com/hiwonder_official/wonderduck.git
 ```
 
 Find the version on [GitHub Releases](https://github.com/Hiwonder/wonderduck/releases) or [Gitee Releases](https://gitee.com/hiwonder_official/wonderduck/releases), replace `0.1.0` below, and run:

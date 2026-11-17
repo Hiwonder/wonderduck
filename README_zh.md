@@ -8,9 +8,16 @@ WonderDuck 提供机器人控制程序和 WonderDuck Studio（[GitHub](https://g
 
 适用于已烧录并完成配置的设备镜像。先在网页点击“休息”并等待完成，然后选择一个来源：
 
+GitHub：
+
 ```bash
-repository=https://github.com/Hiwonder/wonderduck.git  # GitHub
-# repository=https://gitee.com/hiwonder_official/wonderduck.git  # Gitee
+repository=https://github.com/Hiwonder/wonderduck.git
+```
+
+Gitee：
+
+```bash
+repository=https://gitee.com/hiwonder_official/wonderduck.git
 ```
 
 在 [GitHub 发布页](https://github.com/Hiwonder/wonderduck/releases)或 [Gitee 发布页](https://gitee.com/hiwonder_official/wonderduck/releases)查看版本，将下面的 `0.1.0` 换成实际版本号并执行：
