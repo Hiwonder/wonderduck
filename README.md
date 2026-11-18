@@ -6,42 +6,21 @@ WonderDuck provides robot control software and WonderDuck Studio ([GitHub](https
 
 ## Update and deployment
 
-On a device with a configured system image, select **Rest** and wait for it to finish. Choose a source:
+On a device with a configured system image, select **Rest** and wait for it to finish. Run either command in the device terminal:
 
 GitHub:
 
 ```bash
-repository=https://github.com/Hiwonder/wonderduck.git
+python3 <(curl -fsSL --connect-timeout 10 https://raw.githubusercontent.com/Hiwonder/wonderduck/main/scripts/update.py) --lang en
 ```
 
 Gitee:
 
 ```bash
-repository=https://gitee.com/hiwonder_official/wonderduck.git
+python3 <(curl -fsSL --connect-timeout 10 https://gitee.com/hiwonder_official/wonderduck/raw/main/scripts/update.py) --lang en
 ```
 
-Find the version on [GitHub Releases](https://github.com/Hiwonder/wonderduck/releases) or [Gitee Releases](https://gitee.com/hiwonder_official/wonderduck/releases), replace `0.1.0` below, and run:
-
-```bash
-(
-set -e
-set -o pipefail
-cd /home/wonderduck/wonderduck
-release_version=0.1.0
-case "$repository" in
-  https://github.com/Hiwonder/wonderduck.git|https://gitee.com/hiwonder_official/wonderduck.git) ;;
-  *) echo "Select a source above"; exit 1 ;;
-esac
-sudo systemctl stop robotd
-git remote set-url origin "$repository"
-git fetch --no-tags --no-recurse-submodules origin "+refs/heads/main:refs/remotes/origin/main"
-git fetch --no-tags --no-recurse-submodules origin "refs/tags/v${release_version}"
-git merge-base --is-ancestor FETCH_HEAD refs/remotes/origin/main
-git show "FETCH_HEAD:scripts/update-source.py" | python3 - "$release_version"
-python3 scripts/runtime_release.py install --version "$release_version"
-sudo systemctl start robotd
-)
-```
+Choose the update source when prompted. Enter a version, or press Enter to install the latest stable release.
 
 Installation updates the startup configuration and preserves device calibration, models, and action groups. If a local file conflicts with the new version, the update stops and keeps the original file. Resolve the conflict and run the commands again.
 

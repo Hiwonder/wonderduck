@@ -6,42 +6,21 @@ WonderDuck 提供机器人控制程序和 WonderDuck Studio（[GitHub](https://g
 
 ## 更新与部署
 
-适用于已烧录并完成配置的设备镜像。先在网页点击“休息”并等待完成，然后选择一个来源：
+适用于已烧录并完成配置的设备镜像。先在网页点击“休息”并等待完成，然后在设备终端运行任一命令：
 
 GitHub：
 
 ```bash
-repository=https://github.com/Hiwonder/wonderduck.git
+python3 <(curl -fsSL --connect-timeout 10 https://raw.githubusercontent.com/Hiwonder/wonderduck/main/scripts/update.py) --lang zh
 ```
 
 Gitee：
 
 ```bash
-repository=https://gitee.com/hiwonder_official/wonderduck.git
+python3 <(curl -fsSL --connect-timeout 10 https://gitee.com/hiwonder_official/wonderduck/raw/main/scripts/update.py) --lang zh
 ```
 
-在 [GitHub 发布页](https://github.com/Hiwonder/wonderduck/releases)或 [Gitee 发布页](https://gitee.com/hiwonder_official/wonderduck/releases)查看版本，将下面的 `0.1.0` 换成实际版本号并执行：
-
-```bash
-(
-set -e
-set -o pipefail
-cd /home/wonderduck/wonderduck
-release_version=0.1.0
-case "$repository" in
-  https://github.com/Hiwonder/wonderduck.git|https://gitee.com/hiwonder_official/wonderduck.git) ;;
-  *) echo "请先选择上面的来源"; exit 1 ;;
-esac
-sudo systemctl stop robotd
-git remote set-url origin "$repository"
-git fetch --no-tags --no-recurse-submodules origin "+refs/heads/main:refs/remotes/origin/main"
-git fetch --no-tags --no-recurse-submodules origin "refs/tags/v${release_version}"
-git merge-base --is-ancestor FETCH_HEAD refs/remotes/origin/main
-git show "FETCH_HEAD:scripts/update-source.py" | python3 - "$release_version"
-python3 scripts/runtime_release.py install --version "$release_version"
-sudo systemctl start robotd
-)
-```
+按提示选择更新来源并输入版本号；版本号直接按回车会自动选择最新正式版。
 
 安装时会覆盖开机启动配置，保留设备标定、模型和动作组。如果本地文件与新版本冲突，更新会停止并提示，原文件会保留。处理问题后可重新执行更新命令。
 

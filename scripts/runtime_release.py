@@ -34,6 +34,8 @@ SYSTEMD_SOURCE = Path('deploy/systemd/robotd.service.d/source.conf')
 SYSTEMD_DROPIN = Path('/etc/systemd/system/robotd.service.d/source.conf')
 PADD_SOURCE = Path('deploy/systemd/padd.service.d/source.conf')
 PADD_DROPIN = Path('/etc/systemd/system/padd.service.d/source.conf')
+WEBPADD_SOURCE = Path('deploy/systemd/webpadd.service.d/recording.conf')
+WEBPADD_DROPIN = Path('/etc/systemd/system/webpadd.service.d/recording.conf')
 PROMPT_SERVICE_SOURCE = Path('deploy/systemd/wonderduck-prompt-sounds.service')
 PROMPT_SERVICE_TARGET = Path('/etc/systemd/system/wonderduck-prompt-sounds.service')
 LOGIN_HELP_SOURCE = Path('deploy/system/10-help-text')
@@ -1006,7 +1008,7 @@ def write_system_file(target, content, mode):
         'import os,sys,tempfile\n'
         'from pathlib import Path\n'
         'target=Path(sys.argv[1]); parent=target.parent\n'
-        'names=("source.conf","skip-mounted.conf","robot-bluetooth-auto-trust.py",'
+        'names=("source.conf","recording.conf","skip-mounted.conf","robot-bluetooth-auto-trust.py",'
         '"bluetooth_sixaxis.py","usbmount-if-needed","wonderduck-prompt-sounds.service",'
         '"10-help-text","00-header")\n'
         'if not target.is_absolute() or target.name not in names: sys.exit(2)\n'
@@ -1097,6 +1099,7 @@ def install(args):
                        (USBMOUNT_DROPIN_SOURCE, USBMOUNT_DROPIN_TARGET, 0o644),
                        (SYSTEMD_SOURCE, SYSTEMD_DROPIN, 0o644),
                        (PADD_SOURCE, PADD_DROPIN, 0o644),
+                       (WEBPADD_SOURCE, WEBPADD_DROPIN, 0o644),
                        (PROMPT_SERVICE_SOURCE, PROMPT_SERVICE_TARGET, 0o644),
                        (LOGIN_HEADER_SOURCE, LOGIN_HEADER_TARGET, 0o755),
                        (LOGIN_HELP_SOURCE, LOGIN_HELP_TARGET, 0o755))
