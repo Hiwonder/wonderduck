@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::{HX_BUS_JOINT_IDS, HxIo, IoError, ReadFailureReason, Result};
+use super::{ACCELERATION, HX_BUS_JOINT_IDS, HxIo, IoError, ReadFailureReason, Result, drain_status_port};
 
 const TEMPERATURE_LIMIT: u8 = 13;
 const POSITION_PID: u8 = 21;
@@ -9,6 +9,8 @@ const NVS_WRITE_PROTECTION: u8 = 55;
 const POSITION_PID_EXPECTED: [u8; 3] = [15, 0, 0];
 const TEMPERATURE_LIMIT_EXPECTED: u8 = 120;
 const CONFIG_READ_ATTEMPTS: usize = 3;
+// Includes both persistent configuration and the motion registers at 41..48.
+const STARTUP_BLOCK_LENGTH: u8 = 48;
 
 struct Change {
     address: u8,
@@ -16,105 +18,130 @@ struct Change {
     expected: Vec<u8>,
 }
 
+pub(super) fn servo_failure(id: u8, error: &IoError) -> String {
+    let detail = match error {
+        IoError::ReadFailure(failure) => {
+            let mut text = String::new();
+            let _ = failure.write_reason(&mut text);
+            text
+        }
+        _ => error.to_string().chars().take(240).collect(),
+    };
+    format!("ID {id}: {detail}")
+}
+
+pub(super) fn startup_check_result(fixed: usize, failed: Vec<String>) -> Result<usize> {
+    if failed.is_empty() {
+        Ok(fixed)
+    } else {
+        Err(IoError::Bus(format!("HX startup servo checks failed: {}", failed.join("; "))))
+    }
+}
+
 impl HxIo {
     pub(super) fn check_servo_startup_configuration(&mut self) -> Result<usize> {
         self.invalidate_observation_configuration();
-        // One required startup check also obtains the immutable version fields.
-        // No device-status subscriber needs to send separate runtime requests.
-        let mut blocks = self.sync_read_ids(&HX_BUS_JOINT_IDS, 0, 26)?;
-
-        let mut plans = Vec::new();
-        for (index, id) in HX_BUS_JOINT_IDS.iter().copied().enumerate() {
-            let mut changes = Vec::new();
-            for (offset, expected) in POSITION_PID_EXPECTED.iter().copied().enumerate() {
-                if blocks[index][usize::from(POSITION_PID) + offset] != expected {
-                    changes.push(Change {
-                        address: POSITION_PID + offset as u8,
-                        actual: vec![blocks[index][usize::from(POSITION_PID) + offset]],
-                        expected: vec![expected],
-                    });
-                }
-            }
-            if id != 34 {
-                if blocks[index][usize::from(TEMPERATURE_LIMIT)] != TEMPERATURE_LIMIT_EXPECTED {
-                    changes.push(Change {
-                        address: TEMPERATURE_LIMIT,
-                        actual: vec![blocks[index][usize::from(TEMPERATURE_LIMIT)]],
-                        expected: vec![TEMPERATURE_LIMIT_EXPECTED],
-                    });
-                }
-                if blocks[index][usize::from(MINIMUM_START_TORQUE)..usize::from(MINIMUM_START_TORQUE) + 2] != [0, 0] {
-                    changes.push(Change {
-                        address: MINIMUM_START_TORQUE,
-                        actual: blocks[index][usize::from(MINIMUM_START_TORQUE)..usize::from(MINIMUM_START_TORQUE) + 2].to_vec(),
-                        expected: vec![0, 0],
-                    });
-                }
-            }
-            if !changes.is_empty() {
-                plans.push((id, changes));
-            }
-        }
-        if plans.is_empty() {
-            self.cache_startup_configuration(&blocks);
-            return Ok(0);
-        }
-
-        let ids: Vec<u8> = plans.iter().map(|(id, _)| *id).collect();
-        let locks = self.sync_read_ids(&ids, NVS_WRITE_PROTECTION, 1)?;
-        for (&id, lock) in ids.iter().zip(&locks) {
-            if !matches!(lock.as_slice(), [0] | [1]) {
-                return Err(IoError::Bus(format!(
-                    "HX startup configuration: ID {id} has invalid write protection {lock:?}"
-                )));
-            }
-        }
-
         let mut fixed = 0;
-        for ((id, changes), lock) in plans.into_iter().zip(locks) {
-            let was_locked = lock[0] == 1;
-            let operation = (|| {
-                if was_locked {
-                    self.write_configuration_verified(id, NVS_WRITE_PROTECTION, &[0])?;
+        let mut failed = Vec::new();
+        for id in HX_BUS_JOINT_IDS {
+            match self.check_one_servo_startup(id) {
+                Ok((count, block)) => {
+                    fixed += count;
+                    self.cache_startup_configuration(id, &block);
                 }
-                for change in &changes {
-                    tracing::warn!(id, address = change.address, actual = ?change.actual,
-                        expected = ?change.expected, "correcting HX startup configuration");
-                    self.write_configuration_verified(id, change.address, &change.expected)?;
-                    let index = HX_BUS_JOINT_IDS.iter().position(|candidate| *candidate == id).expect("known servo");
-                    let start = usize::from(change.address);
-                    blocks[index][start..start + change.expected.len()].copy_from_slice(&change.expected);
-                    fixed += 1;
-                }
-                Ok(())
-            })();
-            let restore = if was_locked {
-                self.write_configuration_verified(id, NVS_WRITE_PROTECTION, &[1])
-            } else {
-                Ok(())
-            };
-            match (operation, restore) {
-                (Ok(()), Ok(())) => {}
-                (Err(error), Ok(())) => return Err(error),
-                (Ok(()), Err(error)) => {
-                    return Err(IoError::Bus(format!(
-                        "HX startup configuration: ID {id} write protection restoration failed: {error}"
-                    )));
-                }
-                (Err(error), Err(restore_error)) => {
-                    return Err(IoError::Bus(format!(
-                        "HX startup configuration: ID {id} failed: {error}; write protection restoration failed: {restore_error}"
-                    )));
+                Err(error) => {
+                    tracing::debug!(id, %error, "HX startup servo check failed");
+                    failed.push(servo_failure(id, &error));
+                    // A bus whose late replies cannot be drained must not receive
+                    // additional configuration writes, even for other servos.
+                    if self.status_unconfirmed { break; }
                 }
             }
         }
-        tracing::info!(
-            servos = HX_BUS_JOINT_IDS.len(),
-            corrected = fixed,
-            "HX startup configuration verified"
-        );
-        self.cache_startup_configuration(&blocks);
-        Ok(fixed)
+        if failed.is_empty() {
+            tracing::info!(servos = HX_BUS_JOINT_IDS.len(), corrected = fixed,
+                "HX startup configuration verified");
+        }
+        startup_check_result(fixed, failed)
+    }
+
+    fn check_one_servo_startup(&mut self, id: u8) -> Result<(usize, Vec<u8>)> {
+        // One addressed read supplies both sets of parameters. If this servo
+        // times out, the next request targets another ID; it cannot accept a
+        // delayed reply from this servo as its own.
+        let mut block = self.read_register_block(id, 0, STARTUP_BLOCK_LENGTH)?;
+        let mut fixed = self.check_servo_motion_registers_of(id, &block[usize::from(ACCELERATION)..])?;
+        fixed += self.correct_servo_configuration(id, &mut block)?;
+        Ok((fixed, block))
+    }
+
+    fn correct_servo_configuration(&mut self, id: u8, block: &mut [u8]) -> Result<usize> {
+        let mut changes = Vec::new();
+        for (offset, expected) in POSITION_PID_EXPECTED.iter().copied().enumerate() {
+            if block[usize::from(POSITION_PID) + offset] != expected {
+                changes.push(Change {
+                    address: POSITION_PID + offset as u8,
+                    actual: vec![block[usize::from(POSITION_PID) + offset]],
+                    expected: vec![expected],
+                });
+            }
+        }
+        if id != 34 {
+            if block[usize::from(TEMPERATURE_LIMIT)] != TEMPERATURE_LIMIT_EXPECTED {
+                changes.push(Change {
+                    address: TEMPERATURE_LIMIT,
+                    actual: vec![block[usize::from(TEMPERATURE_LIMIT)]],
+                    expected: vec![TEMPERATURE_LIMIT_EXPECTED],
+                });
+            }
+            if block[usize::from(MINIMUM_START_TORQUE)..usize::from(MINIMUM_START_TORQUE) + 2] != [0, 0] {
+                changes.push(Change {
+                    address: MINIMUM_START_TORQUE,
+                    actual: block[usize::from(MINIMUM_START_TORQUE)..usize::from(MINIMUM_START_TORQUE) + 2].to_vec(),
+                    expected: vec![0, 0],
+                });
+            }
+        }
+        if changes.is_empty() { return Ok(0); }
+
+        let lock = self.read_configuration(id, NVS_WRITE_PROTECTION, 1)?;
+        let was_locked = match lock.as_slice() {
+            [0] => false,
+            [1] => true,
+            _ => return Err(IoError::Bus(format!(
+                "HX startup configuration: ID {id} has invalid write protection {lock:?}"
+            ))),
+        };
+        let mut fixed = 0;
+        let operation = (|| {
+            if was_locked {
+                self.write_configuration_verified(id, NVS_WRITE_PROTECTION, &[0])?;
+            }
+            for change in &changes {
+                tracing::warn!(id, address = change.address, actual = ?change.actual,
+                    expected = ?change.expected, "correcting HX startup configuration");
+                self.write_configuration_verified(id, change.address, &change.expected)?;
+                let start = usize::from(change.address);
+                block[start..start + change.expected.len()].copy_from_slice(&change.expected);
+                fixed += 1;
+            }
+            Ok(())
+        })();
+        let restore = if was_locked {
+            self.write_configuration_verified(id, NVS_WRITE_PROTECTION, &[1])
+        } else {
+            Ok(())
+        };
+        match (operation, restore) {
+            (Ok(()), Ok(())) => Ok(fixed),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(error)) => Err(IoError::Bus(format!(
+                "HX startup configuration: ID {id} write protection restoration failed: {error}"
+            ))),
+            (Err(error), Err(restore_error)) => Err(IoError::Bus(format!(
+                "HX startup configuration: ID {id} failed: {error}; write protection restoration failed: {restore_error}"
+            ))),
+        }
     }
 
     fn write_configuration_verified(&mut self, id: u8, address: u8, expected: &[u8]) -> Result<()> {
@@ -132,17 +159,20 @@ impl HxIo {
         for attempt in 1..=CONFIG_READ_ATTEMPTS {
             match self.read_register_block(id, address, length) {
                 Ok(data) => return Ok(data),
-                Err(error)
-                    if attempt < CONFIG_READ_ATTEMPTS
-                        && matches!(&error,
+                Err(error) if matches!(&error,
                     IoError::ReadFailure(failure) if matches!(&failure.reason, ReadFailureReason::Timeout)) =>
                 {
-                    tracing::warn!(
-                        id,
-                        address,
-                        attempt,
-                        "retrying HX configuration read after timeout"
-                    );
+                    // A retry or lock restoration addresses the same servo; wait
+                    // for late replies so a reply to another register cannot be
+                    // mistaken for the new request's confirmation.
+                    if let Err(drain_error) = self.port_mut().and_then(drain_status_port) {
+                        self.status_unconfirmed = true;
+                        return Err(IoError::Bus(format!(
+                            "HX startup configuration ID {id}: cannot settle serial bus: {drain_error}"
+                        )));
+                    }
+                    if attempt == CONFIG_READ_ATTEMPTS { return Err(error); }
+                    tracing::debug!(id, address, attempt, "retrying HX configuration read after timeout");
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => return Err(error),

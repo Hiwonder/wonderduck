@@ -171,10 +171,18 @@ impl DynamixelIo {
     /// a whole class of "why is it slow on this robot".
     pub fn check_registers(&mut self) -> Result<usize> {
         let mut fixed = 0;
+        let mut failed = Vec::new();
         for &id in &JOINT_IDS {
-            fixed += self.check_registers_of(id)?;
+            match self.check_registers_of(id) {
+                Ok(count) => fixed += count,
+                Err(error) => failed.push(format!("ID {id}: {error}")),
+            }
         }
-        Ok(fixed)
+        if failed.is_empty() {
+            Ok(fixed)
+        } else {
+            Err(IoError::Bus(format!("servo startup checks failed: {}", failed.join("; "))))
+        }
     }
 
     /// [`Self::check_registers`] for one servo.

@@ -8,12 +8,16 @@ import json
 import math
 import os
 from pathlib import Path
+import queue
 import re
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
+
+from network_announcement import NetworkAnnouncements
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -431,6 +435,10 @@ class PromptService:
         self.child = None
         self.child_kind = None
         self.child_started = 0.0
+        self.child_timeout = PLAYER_TIMEOUT
+        self.network = None
+        self.pending_network = None
+        self.next_network = 0.0
         self.next_poll = 0.0
         self.next_startup = 0.0
         self.next_warning = (0.0 if self.last_warning_attempt is None
@@ -502,7 +510,7 @@ class PromptService:
             if not self.low_volume_asserted and now >= self.next_volume_retry:
                 self.low_volume_asserted = self.maximize_volume(now)
                 self.next_volume_retry = now + VOLUME_RETRY
-        elif self.child_kind != "startup":
+        elif self.child_kind not in ("startup", "network"):
             self.low_volume_asserted = False
             if (self.volume.saved is not None or self.volume.error) and now >= self.next_volume_retry:
                 try:
@@ -512,7 +520,6 @@ class PromptService:
                     self.next_volume_retry = now + VOLUME_RETRY
 
     def launch(self, kind, now):
-        sound = self.sound_dir / ("startup.wav" if kind == "startup" else "low_battery.wav")
         try:
             descriptor = acquire_speaker(OUTPUT_LOCK)
         except OSError as error:
@@ -522,6 +529,9 @@ class PromptService:
             self.warn("Speaker is in use; prompt will retry", now)
             if kind == "startup":
                 self.next_startup = now + BUSY_RETRY
+                self.startup_deadline = max(self.startup_deadline, now + 30.0)
+            elif kind == "network":
+                self.next_network = now + BUSY_RETRY
             else:
                 self.next_warning = now + BUSY_RETRY
             return
@@ -529,32 +539,50 @@ class PromptService:
             # Preserve the spacing if this service is restarted during playback.
             self.last_warning_attempt = now
             self.sync_timing_marker(now)
+        source = None
         try:
             # The lock remains held by the player until it finishes, so no
             # other sound can start between changing the mixer and playback.
             self.maximize_volume(now)
+            arguments = [sys.executable, str(self.player), "--lock-fd", str(descriptor),
+                         "--warmup-prompt-ms", str(PROMPT_WARMUP_MS), "-q", "-D", self.device]
+            timeout = PLAYER_TIMEOUT
+            if kind == "network":
+                data, _automatic = self.pending_network
+                source = tempfile.TemporaryFile()
+                source.write(data)
+                source.seek(0)
+                arguments.extend(("-t", "wav"))
+                timeout = max(PLAYER_TIMEOUT, len(data) / 48000.0 + 5.0)
+            else:
+                sound = self.sound_dir / ("startup.wav" if kind == "startup" else "low_battery.wav")
+                arguments.append(str(sound))
             self.child = subprocess.Popen(
-                [sys.executable, str(self.player), "--lock-fd", str(descriptor),
-                 "--warmup-prompt-ms", str(PROMPT_WARMUP_MS), "-q", "-D", self.device, str(sound)],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                arguments, stdin=source if source is not None else subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 pass_fds=(descriptor,),
             )
         except OSError as error:
             self.warn("Cannot start prompt playback: {}".format(error), now)
             if kind == "startup":
                 self.next_startup = now + PROMPT_INTERVAL
+            elif kind == "network":
+                self.next_network = now + PROMPT_INTERVAL
             else:
                 self.next_warning = now + PROMPT_INTERVAL
             return
         finally:
             os.close(descriptor)
+            if source is not None:
+                source.close()
         self.child_kind, self.child_started = kind, now
+        self.child_timeout = timeout
 
     def finish_child(self, now):
         if self.child is None:
             return
         result = self.child.poll()
-        if result is None and now - self.child_started >= PLAYER_TIMEOUT:
+        if result is None and now - self.child_started >= self.child_timeout:
             self.child.terminate()
             try:
                 self.child.wait(timeout=1)
@@ -570,11 +598,20 @@ class PromptService:
             self.warn("Speaker is in use; prompt will retry", now)
             if kind == "startup":
                 self.next_startup = now + BUSY_RETRY
+            elif kind == "network":
+                self.next_network = now + BUSY_RETRY
             else:
                 self.next_warning = now + BUSY_RETRY
         elif result == 0:
             if kind == "startup":
                 self.startup_pending = False
+            elif kind == "network":
+                if self.pending_network is not None and self.pending_network[1]:
+                    try:
+                        claim_startup(self.network.marker)
+                    except OSError as error:
+                        self.warn("Cannot save network speech state: {}".format(error), now)
+                self.pending_network = None
             else:
                 # Successful, uncontended starts are spaced by five seconds.
                 self.next_warning = started + PROMPT_INTERVAL
@@ -582,6 +619,8 @@ class PromptService:
             self.warn("Prompt playback failed; retrying later", now)
             if kind == "startup":
                 self.next_startup = now + PROMPT_INTERVAL
+            elif kind == "network":
+                self.next_network = now + PROMPT_INTERVAL
             else:
                 self.next_warning = now + PROMPT_INTERVAL
 
@@ -622,11 +661,27 @@ class PromptService:
                 return
         if self.warning.active and now >= self.next_warning:
             self.launch("low_battery", now)
+            return
+        if self.network is not None:
+            if self.pending_network is None:
+                try:
+                    self.pending_network = self.network.ready.get_nowait()
+                except queue.Empty:
+                    pass
+            if self.pending_network is not None and now >= self.next_network:
+                self.launch("network", now)
 
     def run(self):
-        while not self.stopping:
-            self.tick(time.monotonic())
-            time.sleep(0.1)
+        if self.audio_enabled:
+            self.network = NetworkAnnouncements()
+            self.network.start()
+        try:
+            while not self.stopping:
+                self.tick(time.monotonic())
+                time.sleep(0.1)
+        finally:
+            if self.network is not None:
+                self.network.stop()
         if self.child is not None and self.child.poll() is None:
             self.child.terminate()
             try:

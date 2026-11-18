@@ -310,19 +310,18 @@ impl HxIo {
     }
 
     /// Cache only registers actually read and verified by the startup checks.
-    pub(super) fn cache_startup_configuration(&mut self, blocks: &[Vec<u8>]) {
+    pub(super) fn cache_startup_configuration(&mut self, id: u8, bytes: &[u8]) {
         let scan = self.observation.get_or_insert_with(ObservationScan::new);
-        for (bus_index, bytes) in blocks.iter().enumerate() {
-            let joint = HX_BUS_JOINT_INDICES[bus_index];
-            scan.latest.servos[joint].configuration = Some(duck_ipc_proto::ServoConfiguration {
-                firmware_version: [bytes[0], bytes[1]],
-                servo_version: [bytes[3], bytes[4]],
-                position_pid: [bytes[21], bytes[23], bytes[22]],
-                overtemperature_c: bytes[13],
-                minimum_starting_torque: u16::from_le_bytes([bytes[24], bytes[25]]),
-            });
-            scan.latest.servos[joint].configuration_error = None;
-        }
+        let Some(joint) = HX_BUS_JOINT_IDS.iter().position(|candidate| *candidate == id)
+            .map(|index| HX_BUS_JOINT_INDICES[index]) else { return };
+        scan.latest.servos[joint].configuration = Some(duck_ipc_proto::ServoConfiguration {
+            firmware_version: [bytes[0], bytes[1]],
+            servo_version: [bytes[3], bytes[4]],
+            position_pid: [bytes[21], bytes[23], bytes[22]],
+            overtemperature_c: bytes[13],
+            minimum_starting_torque: u16::from_le_bytes([bytes[24], bytes[25]]),
+        });
+        scan.latest.servos[joint].configuration_error = None;
     }
 
     pub(super) fn invalidate_observation_configuration(&mut self) {

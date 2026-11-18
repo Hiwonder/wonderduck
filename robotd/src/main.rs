@@ -3090,10 +3090,12 @@ fn check_open_bus(io: &mut BusIo, bus: &params::Bus, attempt: u32, imu_source: I
     if bus.protocol == BusProtocol::Dynamixel && !bus.fast_sync_read && loud {
         tracing::warn!("bus.fast_sync_read is off; every sync read is a plain one");
     }
-    if !adopt_missing_servo(io, loud) {
-        return false;
-    }
-    match io.check_registers() {
+    // A missing or faulty servo must not stop the settings of the other joints
+    // from being checked. The result still gates motion until every check and
+    // any replacement-device adoption succeed.
+    let registers = io.check_registers();
+    let adoption_ok = adopt_missing_servo(io, loud);
+    match registers {
         Ok(0) if loud => tracing::info!("motor registers already correct"),
         Ok(0) => {}
         Ok(n) => tracing::warn!(corrected = n, "motor registers corrected"),
@@ -3109,6 +3111,7 @@ fn check_open_bus(io: &mut BusIo, bus: &params::Bus, attempt: u32, imu_source: I
             return false;
         }
     }
+    if !adoption_ok { return false; }
     if let BusIo::Hx(hx) = io
         && imu_source != ImuSource::Id200Host
     {

@@ -270,26 +270,50 @@ impl HxIo {
     /// Probe the selected control devices and verify their startup registers.
     pub fn check_registers(&mut self) -> Result<usize> {
         self.begin_control_observation();
+        // Check each servo before probing the combined control stream. A missing
+        // device must not prevent healthy joints from receiving their settings.
+        let fixed = self.check_servo_startup_configuration()?;
         self.read_control_blocks(PRESENT_POSITION, PRESENT_POSITION_LEN)?;
-        let motion_fixed = self.check_servo_motion_registers()?;
-        Ok(motion_fixed + self.check_servo_startup_configuration()?)
+        Ok(fixed)
     }
 
     /// Verify servo motion shaping without querying the IMU.
     pub fn check_servo_motion_registers(&mut self) -> Result<usize> {
         let mut fixed = 0;
-        for &(address, width, want) in MOTION_REGISTERS {
-            let blocks = self.sync_read_ids(&HX_BUS_JOINT_IDS, address, width)?;
-            for (index, block) in blocks.iter().enumerate() {
-                let id = HX_BUS_JOINT_IDS[index];
-                let got = decode_register(block, width)?;
-                if got == want {
-                    continue;
+        let mut failed = Vec::new();
+        for id in HX_BUS_JOINT_IDS {
+            let result = self.read_register_block(id, ACCELERATION, 7)
+                .and_then(|block| self.check_servo_motion_registers_of(id, &block));
+            match result {
+                Ok(count) => fixed += count,
+                Err(error) => {
+                    failed.push(startup_config::servo_failure(id, &error));
+                    if self.status_unconfirmed { break; }
                 }
-                tracing::warn!(id, address, got, want, "correcting HX motion register");
-                self.write_register(id, address, width, want)?;
-                fixed += 1;
             }
+        }
+        startup_config::startup_check_result(fixed, failed)
+    }
+
+    fn check_servo_motion_registers_of(&mut self, id: u8, block: &[u8]) -> Result<usize> {
+        let mut fixed = 0;
+        for &(address, width, want) in MOTION_REGISTERS {
+            let start = usize::from(address - ACCELERATION);
+            let end = start + usize::from(width);
+            let got = decode_register(block.get(start..end).ok_or(IoError::ShortRead {
+                what: "HX motion registers", expected: end, got: block.len(),
+            })?, width)?;
+            if got == want { continue; }
+            tracing::warn!(id, address, got, want, "correcting HX motion register");
+            self.write_register(id, address, width, want)?;
+            let confirmed = self.read_register_block(id, address, width)?;
+            let actual = decode_register(&confirmed, width)?;
+            if actual != want {
+                return Err(IoError::Bus(format!(
+                    "HX motion register ID {id} address {address} expected {want}, got {actual}"
+                )));
+            }
+            fixed += 1;
         }
         Ok(fixed)
     }
