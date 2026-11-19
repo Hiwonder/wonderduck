@@ -548,7 +548,7 @@ class PromptService:
                          "--warmup-prompt-ms", str(PROMPT_WARMUP_MS), "-q", "-D", self.device]
             timeout = PLAYER_TIMEOUT
             if kind == "network":
-                data, _automatic = self.pending_network
+                data = self.pending_network[0]
                 source = tempfile.TemporaryFile()
                 source.write(data)
                 source.seek(0)
@@ -668,9 +668,11 @@ class PromptService:
                     self.pending_network = self.network.ready.get_nowait()
                 except queue.Empty:
                     pass
-            if (self.pending_network is not None and self.pending_network[1]
-                    and not self.network.automatic_enabled()):
-                self.pending_network = None
+            if self.pending_network is not None and self.pending_network[1]:
+                generation = self.pending_network[2] if len(self.pending_network) > 2 else None
+                if (not self.network.automatic_enabled()
+                        or (generation is not None and generation != self.network.current_generation())):
+                    self.pending_network = None
             if self.pending_network is not None and now >= self.next_network:
                 self.launch("network", now)
 

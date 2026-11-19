@@ -23,6 +23,8 @@ MARKER = Path("/run/wonderduck-network-speech.played")
 SETTINGS = ROOT.parent / ".config/wonderduck-studio/network-announcement.json"
 INTERFACE = "wlan0"
 MAX_PENDING = 8
+MAX_REQUEST_BYTES = 512
+SWITCH_TIMEOUT_SECONDS = 90
 CHARACTER_PAUSE_FRAMES = 4320  # 180 ms at 24 kHz
 SEPARATOR_PAUSE_FRAMES = 14400  # 600 ms at 24 kHz
 
@@ -47,7 +49,7 @@ def address():
     raise RuntimeError("wireless IP address is unavailable")
 
 
-def active_network():
+def active_network_state():
     values = _run("nmcli", "-g", "GENERAL.STATE,GENERAL.CON-UUID",
                   "device", "show", INTERFACE).splitlines()
     if len(values) != 2 or not values[0].startswith("100 ") or not values[1]:
@@ -59,10 +61,17 @@ def active_network():
                     "connection", "show", "uuid", uuid)
         if not name:
             raise RuntimeError("hotspot name is unavailable")
-        return "hotspot", name
+        return "hotspot", name, name
     if mode in ("infrastructure", "", "--"):
-        return "ip", address()
+        name = _run("nmcli", "-e", "no", "-g", "802-11-wireless.ssid",
+                    "connection", "show", "uuid", uuid)
+        return "ip", address(), name
     raise RuntimeError("wireless mode is unavailable")
+
+
+def active_network():
+    kind, value, _ssid = active_network_state()
+    return kind, value
 
 
 def hotspot_name():
@@ -122,6 +131,27 @@ def render(kind, value, clips=CLIPS):
     return output.getvalue()
 
 
+class NetworkSwitch:
+    """Wait for the requested network and a stable address or hotspot name."""
+
+    def __init__(self, mode, ssid, generation, now):
+        self.kind = "hotspot" if mode == "ap" else "ip"
+        self.ssid = ssid
+        self.generation = generation
+        self.deadline = now + SWITCH_TIMEOUT_SECONDS
+        self.previous = None
+
+    def observe(self, state):
+        kind, value, ssid = state
+        if kind != self.kind or (self.kind == "ip" and self.ssid and ssid != self.ssid):
+            self.previous = None
+            return None
+        if state == self.previous:
+            return kind, value
+        self.previous = state
+        return None
+
+
 class NetworkAnnouncements:
     def __init__(self, clips=CLIPS, marker=MARKER, socket_path=SOCKET, settings=SETTINGS):
         self.clips = clips
@@ -131,6 +161,8 @@ class NetworkAnnouncements:
         self.requests = queue.Queue(maxsize=MAX_PENDING)
         self.ready = queue.Queue(maxsize=MAX_PENDING)
         self.stopping = threading.Event()
+        self.generation_lock = threading.Lock()
+        self.generation = 0
         self.worker = threading.Thread(target=self._work, daemon=True)
         self.listener = threading.Thread(target=self._listen, daemon=True)
 
@@ -165,36 +197,83 @@ class NetworkAnnouncements:
                   file=sys.stderr, flush=True)
             return False
 
+    def current_generation(self):
+        with self.generation_lock:
+            return self.generation
+
+    def queue_switch(self, mode, ssid=None):
+        if mode not in ("ap", "station"):
+            raise ValueError("invalid network mode")
+        if mode == "station" and (not isinstance(ssid, str) or not ssid
+                                  or len(ssid.encode("utf-8")) > 32):
+            raise ValueError("invalid wireless network name")
+        enabled = self.automatic_enabled()
+        with self.generation_lock:
+            self.generation += 1
+            generation = self.generation
+            if not enabled:
+                return False
+            self.requests.put_nowait(("watch", mode, ssid, generation))
+        return True
+
     def _work(self):
         automatic = not self.marker.exists() and self.automatic_enabled()
         previous = None
+        pending = None
         while not self.stopping.is_set():
             try:
                 request = self.requests.get(timeout=2)
             except queue.Empty:
                 request = None
-            if request is None and not automatic:
-                continue
-            if request is None and not self.automatic_enabled():
+            if request is not None and request[0] == "watch":
+                _, mode, ssid, generation = request
+                pending = NetworkSwitch(mode, ssid, generation, time.monotonic())
                 automatic = False
+                previous = None
+                continue
+            if request is None and not (automatic or pending):
                 continue
             try:
                 if request is not None:
                     kind, value = request
+                    generation = None
+                    is_automatic = False
+                elif not self.automatic_enabled():
+                    automatic = False
+                    pending = None
+                    continue
+                elif pending is not None:
+                    if (time.monotonic() >= pending.deadline
+                            or pending.generation != self.current_generation()):
+                        pending = None
+                        continue
+                    result = pending.observe(active_network_state())
+                    if result is None:
+                        continue
+                    kind, value = result
+                    generation = pending.generation
+                    is_automatic = True
                 else:
+                    generation = self.current_generation()
                     current = active_network()
+                    if generation != self.current_generation():
+                        continue
                     if current != previous:
                         previous = current
                         continue
                     kind, value = current
+                    is_automatic = True
                 data = render(kind, value, self.clips)
-                self._put_ready((data, request is None))
-                if request is None:
+                self._put_ready((data, is_automatic, generation))
+                if is_automatic:
                     automatic = False
+                    pending = None
             except (OSError, RuntimeError, ValueError, KeyError, EOFError, wave.Error,
                     subprocess.SubprocessError) as error:
                 if request is None:
                     previous = None
+                    if pending is not None:
+                        pending.previous = None
                 else:
                     print("Network speech could not be prepared: {}".format(error),
                           file=sys.stderr, flush=True)
@@ -232,15 +311,13 @@ class NetworkAnnouncements:
                     try:
                         connection.settimeout(1)
                         data = bytearray()
-                        while b"\n" not in data and len(data) < 32:
-                            chunk = connection.recv(32 - len(data))
+                        while b"\n" not in data and len(data) < MAX_REQUEST_BYTES:
+                            chunk = connection.recv(MAX_REQUEST_BYTES - len(data))
                             if not chunk:
                                 break
                             data.extend(chunk)
                         command = data.decode("ascii").strip()
-                        if command not in ("hotspot", "ip"):
-                            response = b"invalid\n"
-                        else:
+                        if command in ("hotspot", "ip"):
                             try:
                                 value = hotspot_name() if command == "hotspot" else address()
                                 tokens(command, value)
@@ -251,6 +328,17 @@ class NetworkAnnouncements:
                             except (OSError, RuntimeError, ValueError, KeyError,
                                     subprocess.SubprocessError):
                                 response = b"unavailable\n"
+                        else:
+                            try:
+                                message = json.loads(command)
+                                if not isinstance(message, dict) or set(message) - {"watch", "ssid"}:
+                                    raise ValueError("invalid network speech request")
+                                queued = self.queue_switch(message.get("watch"), message.get("ssid"))
+                                response = b"queued\n" if queued else b"disabled\n"
+                            except queue.Full:
+                                response = b"full\n"
+                            except (TypeError, ValueError):
+                                response = b"invalid\n"
                         connection.sendall(response)
                     except (OSError, UnicodeError):
                         pass
