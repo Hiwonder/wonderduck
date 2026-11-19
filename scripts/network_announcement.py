@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 CLIPS = ROOT / "assets/prompt-sounds/network"
 SOCKET = Path("/run/wonderduck-network-speech.sock")
 MARKER = Path("/run/wonderduck-network-speech.played")
+SETTINGS = ROOT.parent / ".config/wonderduck-studio/network-announcement.json"
 INTERFACE = "wlan0"
 MAX_PENDING = 8
 CHARACTER_PAUSE_FRAMES = 4320  # 180 ms at 24 kHz
@@ -122,10 +123,11 @@ def render(kind, value, clips=CLIPS):
 
 
 class NetworkAnnouncements:
-    def __init__(self, clips=CLIPS, marker=MARKER, socket_path=SOCKET):
+    def __init__(self, clips=CLIPS, marker=MARKER, socket_path=SOCKET, settings=SETTINGS):
         self.clips = clips
         self.marker = marker
         self.socket_path = socket_path
+        self.settings = settings
         self.requests = queue.Queue(maxsize=MAX_PENDING)
         self.ready = queue.Queue(maxsize=MAX_PENDING)
         self.stopping = threading.Event()
@@ -149,8 +151,22 @@ class NetworkAnnouncements:
             except queue.Full:
                 continue
 
+    def automatic_enabled(self):
+        """Read the owner's preference even when this service runs as root."""
+        try:
+            data = json.loads(self.settings.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or type(data.get("enabled")) is not bool:
+                raise ValueError("invalid network announcement setting")
+            return data["enabled"]
+        except FileNotFoundError:
+            return True
+        except (OSError, ValueError, UnicodeError) as error:
+            print("Cannot read network announcement setting: {}".format(error),
+                  file=sys.stderr, flush=True)
+            return False
+
     def _work(self):
-        automatic = not self.marker.exists()
+        automatic = not self.marker.exists() and self.automatic_enabled()
         previous = None
         while not self.stopping.is_set():
             try:
@@ -158,6 +174,9 @@ class NetworkAnnouncements:
             except queue.Empty:
                 request = None
             if request is None and not automatic:
+                continue
+            if request is None and not self.automatic_enabled():
+                automatic = False
                 continue
             try:
                 if request is not None:

@@ -11,41 +11,23 @@
 //!
 //! ## The mapping
 //!
-//! Laid out so that each part of the pad has one job: the face buttons and bumpers run skills,
-//! the D-pad picks what the sticks mean, and the two small buttons in the middle are holds —
-//! nothing that cuts torque or powers the robot off fires on a brush of the thumb.
+//! The sticks drive continuously, the D-pad and left/right face buttons provide fixed-speed
+//! movement, and the two small buttons in the middle are holds.
 //!
-//! The six one-shot buttons are `[pad]` in `robotd.toml`, so a robot that has learned a new skill
-//! can put it on a button without a release. Only those six: `Start`, the D-pad and held `Select`
-//! are not `robot.do` calls, and the button that powers a robot off is the one binding worth not
-//! being able to lose to a config edit.
-//!
-//! This daemon still knows nothing about what a skill *is*. It reads which button went down,
-//! looks up the name beside it, and sends that name; `robotd` decides whether the robot has such
-//! a thing and answers with the list it does have when it does not.
+//! A and the bumpers remain configurable in `[pad]`; triangle always requests ground pick.
 //!
 //! ```text
 //! A (South)       sit ↔ stand
-//! B (East)        ground pick
-//! X / Y           configured skills (X defaults to roulade)
+//! Y (North)       ground pick
+//! X / B           turn left / right at 0.5 rad/s while held
 //! LB / RB         left / right kick
-//! L2 / R2         mouth (either trigger; the max wins), currently silent
-//! L3 / R3         walking linear speed -/+ 0.01 m/s
-//! D-pad left + L3 / R3   walking turn speed -/+ 0.1 rad/s
-//! D-pad up        head mode — the sticks pose the head, the body holds still
-//! D-pad right     head + move — left stick walks and turns, right stick looks around
-//! D-pad left      move — the sticks walk, strafe and turn
-//! D-pad down      body + head — left stick crouches and leans sideways, right stick looks around
-//! Start           first press stands up, then toggles the policy
-//! Start, 1.5 s    home pose, motors stiff, policy off — a seated robot stays seated
-//! Select, 2–4 s   let go: sit, rest pose, then torque off and every servo rebooted
-//! Select, 4 s     sit, rest pose, then power off
+//! L2              mouth opens while held and closes on release, currently silent
+//! D-pad           forward / back / strafe at 0.15 m/s while held
+//! Left stick      forward / back / strafe
+//! Right stick     turn left / right
+//! Start           short press initializes and enables the policy
+//! Start + Select  request rest
 //! ```
-//!
-//! The D-pad *selects* a mode rather than toggling one, so a press always lands where its arrow
-//! says whatever mode the robot was in. Head and body + head mode both zero the velocity while
-//! active — a robot that keeps walking because you started posing its head is a bad surprise —
-//! and leaving a mode puts back what it moved: the body snaps to nominal, the head re-centres.
 //!
 //! Smoothing lives in `robotd` (`[control] cmd_alpha` / `head_alpha`), not here: this
 //! process sends raw targets, so every client gets the same feel.
@@ -54,7 +36,7 @@
 //!
 //! At startup this asks `robot.mode`. On a roller robot the stick mapping becomes the
 //! prototype's roller preset — asymmetric forward/brake (0.6 / 0.5), no strafe, ±0.3 rad/s
-//! heading — and B triggers the crouch that lives in the ground-pick slot. The other
+//! heading — and Y triggers the crouch that lives in the ground-pick slot. The other
 //! skills ride along on wheels, as the rebased roller line has them. Switching between walk and
 //! roller is `robot.setMode`; it is no longer on the pad.
 //!
@@ -66,7 +48,7 @@
 //! within a tick.
 //!
 //! Waiting with no pad sends no stick commands. Losing the controlling pad stops its motion.
-//! Start and Select together request an emergency stop even without the lease.
+//! Start and Select together request rest when the gamepad can acquire control.
 //!
 //! Pairing is **not** done here: bonding a device needs root and BlueZ, and a `padd` holding
 //! either would stop being the unprivileged client whose whole value is having no special
@@ -177,7 +159,7 @@ struct Args {
     layout: Layout,
 
     /// How often to read the pad, 1–1000 Hz. While a pad is present the loop runs at least
-    /// every 100 ms for lease renewal and emergency-stop detection.
+    /// every 100 ms for lease renewal and rest-chord detection.
     ///
     /// Not quite how often intents are *sent*: a frame identical to the last one and asking
     /// for no motion is held back, down to [`HEARTBEAT`]. See [`Continuous`].
@@ -237,74 +219,12 @@ struct Args {
 /// switches a pad on and is not a background load.
 const IDLE_POLL: Duration = Duration::from_millis(500);
 
-/// Start held this long brings the robot to its home pose with the motors stiff and the policy
-/// off: the "put everything back" button. Long enough that a press meant for the policy toggle
-/// never reaches it, short enough to be the obvious thing to do when the robot is somewhere odd.
-const HOME_HOLD: Duration = Duration::from_millis(1500);
-
-/// Select let go after this long, and before [`SHUTDOWN_HOLD`], puts the robot down for a rest:
-/// `robot.rest` — it sits if it is driving, eases into the rest pose, then torque goes off and
-/// every servo reboots. Decided on the release, because until then the hold may still become a
-/// power-off, and both start the same way.
-const REST_HOLD: Duration = Duration::from_secs(2);
-
-/// Select held this long powers the robot off: `robot.shutdown`, the same sit and rest pose ending
-/// in a power-off. Sent the moment the hold gets here; the release after it does nothing.
-const SHUTDOWN_HOLD: Duration = Duration::from_secs(4);
-
-// Keep the trigger sound mapping available for a later sound change.
-const TRIGGER_SOUNDS_ENABLED: bool = false;
-
-fn mouth_trigger_commands(
-    lt: f64,
-    rt: f64,
-    chirp_pressed: bool,
-    previous_lt: f64,
-) -> (proto::MouthParams, [Option<proto::SoundParams>; 2]) {
-    let mouth = proto::MouthParams { open: rt.max(lt) };
-    if !TRIGGER_SOUNDS_ENABLED {
-        return (mouth, [None, None]);
-    }
-    const SOUND_THRESHOLD: f64 = 0.3;
-    let chirp = chirp_pressed.then_some(proto::SoundParams {
-        tag: proto::SoundTag::Chirp,
-        hold: None,
-    });
-    let wheee = if lt >= SOUND_THRESHOLD {
-        Some(proto::SoundParams { tag: proto::SoundTag::Wheee, hold: Some(true) })
-    } else if previous_lt >= SOUND_THRESHOLD {
-        Some(proto::SoundParams { tag: proto::SoundTag::Wheee, hold: Some(false) })
-    } else {
-        None
-    };
-    (mouth, [chirp, wheee])
-}
-
-/// Consume every trigger value, including a press and release inside one poll.
-/// Separate press/release thresholds keep pressure noise from repeating an activity edge.
-#[derive(Default)]
-struct ChirpTrigger {
-    held: bool,
-}
-
-impl ChirpTrigger {
-    fn update(&mut self, value: f32) -> bool {
-        if value <= 0.2 {
-            self.held = false;
-        } else if value >= 0.3 && !self.held {
-            self.held = true;
-            return true;
-        }
-        false
-    }
-}
-
-
+/// Longer Start holds do nothing; only a short release requests initialization.
+const START_TAP_MAX: Duration = Duration::from_millis(1500);
 
 /// A button that does different things depending on how long it is held.
 ///
-/// Each threshold fires once, on the tick the hold crosses it, so a longer hold walks through
-/// every shorter one on the way — Select offers rest at two seconds and powers off at four.
+/// Each threshold fires once, on the tick the hold crosses it.
 /// A release that crossed no threshold is a [`HoldAction::Tap`]; the release after a hold that
 /// did fire says nothing, because the thumb coming off is not a second request.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -355,12 +275,15 @@ impl HoldButton {
             return HoldAction::Nothing;
         }
         let was_held = released || self.held_since.is_some();
+        let exceeded = self.held_since.is_some_and(|since| {
+            thresholds.first().is_some_and(|limit| now.saturating_duration_since(since) >= *limit)
+        });
         let (fired, spent) = (self.fired, self.spent);
         *self = Self::default();
         match (fired, spent) {
             // The tail of a hold cut by a dropout says nothing — see `reset`.
             (_, true) => HoldAction::Nothing,
-            (0, false) if released => HoldAction::Tap,
+            (0, false) if released && !exceeded => HoldAction::Tap,
             (0, false) => HoldAction::Nothing,
             (n, false) if was_held => HoldAction::ReleasedAfter(n - 1),
             (_, false) => HoldAction::Nothing,
@@ -382,12 +305,6 @@ impl HoldButton {
     }
 }
 
-/// Body-pose stick ranges, from the training env via the prototype: z is asymmetric
-/// (little headroom up at the standing height, more crouch down), angles capped at ~15°.
-const BODY_MAX_Z_UP: f64 = 0.010;
-const BODY_MAX_Z_DOWN: f64 = 0.025;
-const BODY_MAX_ANGLE: f64 = 0.2618;
-
 /// The prototype's roller-mode stick shaping: push and brake are asymmetric, there is no
 /// strafe, and heading is capped at 0.3 rad/s regardless of the walking limits — the
 /// roller launch line's `--max-angular-vel 0.3`, unchanged across both of its eras.
@@ -395,58 +312,47 @@ const ROLLER_PUSH: f64 = 0.6;
 const ROLLER_BRAKE: f64 = 0.5;
 const ROLLER_YAW: f64 = 0.3;
 
-/// What the sticks drive, picked on the D-pad. Modal because two sticks cannot express nine
-/// degrees of freedom.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    /// D-pad left. Left stick walks and strafes, right stick turns.
-    Drive,
-    /// D-pad up. All four axes pose the head; the body holds still.
-    Head,
-    /// D-pad right. Left stick walks and turns, right stick looks around — or, with
-    /// `[pad_imu_head_control]` on a pad that has an IMU, the pad's tilt poses the head and the
-    /// sticks keep the whole [`Mode::Drive`] mapping.
-    HeadDrive,
-    /// D-pad down. Body + head: the left stick crouches and leans the standing robot sideways,
-    /// the right stick looks around. The body does not walk.
-    BodyPose,
-}
-
-impl Mode {
-    /// Whether this mode sends head poses, so leaving it has a head to put back.
-    fn poses_head(self) -> bool {
-        matches!(self, Self::Head | Self::HeadDrive | Self::BodyPose)
-    }
-}
-
-/// What has to be sent when the sticks stop meaning `from` and start meaning `to`.
-///
-/// Leaving a mode puts back what it moved, because nothing else will: a body left leaning or a
-/// head left turned stays that way, and the next mode does not send the joints the last one did.
-/// Moving between modes that all pose the head keeps the head, since the next one goes on posing
-/// it.
-fn mode_exit_calls(from: Mode, to: Mode) -> Vec<proto::Call> {
-    let mut calls = Vec::new();
-    if from == Mode::BodyPose && to != Mode::BodyPose {
-        calls.push(proto::Call::RobotPose(proto::PoseParams {
-            active: false,
-            ..Default::default()
-        }));
-    }
-    if from.poses_head() && !to.poses_head() {
-        calls.push(proto::Call::RobotHead(proto::HeadParams::default()));
-    }
-    calls
-}
-
 /// How often to look for a rewritten config. See the loop.
 const BINDINGS_POLL: Duration = Duration::from_secs(1);
 
-/// Stick buttons change the walking command limits in small, predictable increments. The
-/// limits are bounded by the command-line maxima so a button cannot drive the policy outside the
-/// range selected by the operator at startup.
-const WALK_SPEED_STEP_MPS: f64 = 0.01;
-const WALK_TURN_SPEED_STEP_RAD_S: f64 = 0.1;
+const BUTTON_LINEAR_MPS: f64 = 0.15;
+const BUTTON_TURN_RAD_S: f64 = 0.5;
+const PICK_MOUTH_OPEN_AFTER: Duration = Duration::from_millis(200);
+const PICK_MOUTH_CLOSE_AFTER: Duration = Duration::from_millis(1500);
+const MOUTH_MANUAL_THRESHOLD: f64 = 0.05;
+
+/// Mouth timing for an accepted ground-pick request. An L2 press takes over immediately.
+#[derive(Default)]
+struct PickMouth {
+    started_at: Option<Instant>,
+}
+
+impl PickMouth {
+    fn start(&mut self, at: Instant) {
+        self.started_at = Some(at);
+    }
+
+    fn cancel(&mut self) -> bool {
+        self.started_at.take().is_some()
+    }
+
+    fn output(&mut self, now: Instant, manual: f64) -> f64 {
+        let Some(started_at) = self.started_at else { return manual };
+        if manual > MOUTH_MANUAL_THRESHOLD {
+            self.cancel();
+            return manual;
+        }
+        let elapsed = now.saturating_duration_since(started_at);
+        if elapsed >= PICK_MOUTH_CLOSE_AFTER {
+            self.cancel();
+            0.0
+        } else if elapsed >= PICK_MOUTH_OPEN_AFTER {
+            1.0
+        } else {
+            manual
+        }
+    }
+}
 
 fn parse_speed_limit(value: &str) -> Result<f64, String> {
     let limit = value.parse::<f64>().map_err(|_| "expected a finite speed >= 0")?;
@@ -457,25 +363,6 @@ fn parse_speed_limit(value: &str) -> Result<f64, String> {
 }
 
 
-
-fn adjust_speed(current: f64, direction: i8, step: f64, maximum: f64) -> f64 {
-    let maximum = maximum.max(0.0);
-    let next = (current + f64::from(direction) * step).clamp(0.0, maximum);
-    ((next * 100.0).round() / 100.0).clamp(0.0, maximum)
-}
-
-fn speed_step(button: Button, turn_modifier: bool) -> (i8, i8) {
-    let direction = match button {
-        Button::LeftThumb => -1,
-        Button::RightThumb => 1,
-        _ => return (0, 0),
-    };
-    if turn_modifier {
-        (0, direction)
-    } else {
-        (direction, 0)
-    }
-}
 
 /// Configured axis ranges within the operator's startup and button-adjusted speed limits.
 fn walking_limits(
@@ -504,7 +391,7 @@ fn walking_limits(
     }
 }
 
-/// The button bindings, the IMU head switch and the walking speeds, or the defaults.
+/// The configurable button bindings and walking speeds, or the defaults.
 ///
 /// A file that will not parse is never a reason to leave somebody without a pad: the defaults
 /// are a working robot, and the reason is logged. That matters more here than elsewhere because
@@ -512,24 +399,18 @@ fn walking_limits(
 /// away, and the next read a second later gets the finished one.
 fn read_bindings(
     path: &Path,
-) -> (
-    robotd_params::PadParams,
-    robotd_params::PadImuHeadControlParams,
-    robotd_params::PadDriveParams,
-) {
+) -> (robotd_params::PadParams, robotd_params::PadDriveParams) {
     match robotd_params::Params::load(path, false) {
         Ok(params) => {
             let pad = params.pad;
-            let imu_head = params.pad_imu_head_control;
             let drive = params.pad_drive;
             tracing::info!(
-                a = %pad.a, b = %pad.b, x = %pad.x, y = %pad.y, lb = %pad.lb, rb = %pad.rb,
-                pad_imu_head_control = imu_head.enabled, pad_imu_head_gain = imu_head.gain,
+                a = %pad.a, lb = %pad.lb, rb = %pad.rb,
                 vx = ?(drive.vx_min, drive.vx_max), vy = ?(drive.vy_min, drive.vy_max),
                 vyaw = ?(drive.vyaw_min, drive.vyaw_max),
                 "button bindings"
             );
-            (pad, imu_head, drive)
+            (pad, drive)
         }
         Err(e) => {
             tracing::warn!(
@@ -539,27 +420,9 @@ fn read_bindings(
             );
             (
                 robotd_params::PadParams::default(),
-                robotd_params::PadImuHeadControlParams::default(),
                 robotd_params::PadDriveParams::default(),
             )
         }
-    }
-}
-
-/// The head pose for a pad attitude relative to its reference.
-///
-/// `relative` is body → world of the pad now, in the frame of the reference — [`pad_imu::relative`].
-/// Its pitch, roll and yaw become the head's, scaled by `gain` and clamped to `max_head`. The signs
-/// follow the joint axes: pad nose-up gives positive `head_pitch`, pad yaw left gives positive
-/// `head_yaw`, and pad roll right gives negative `head_roll`. The neck stays at zero.
-fn head_from_pad(relative: [f32; 4], gain: f64, max_head: f64) -> proto::HeadParams {
-    let [pitch, roll, yaw] = pad_imu::euler_deg(relative);
-    let angle = |degrees: f32| (f64::from(degrees).to_radians() * gain).clamp(-max_head, max_head);
-    proto::HeadParams {
-        neck_pitch: 0.0,
-        head_pitch: angle(pitch),
-        head_yaw: angle(yaw),
-        head_roll: -angle(roll),
     }
 }
 
@@ -569,12 +432,21 @@ fn config_mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
+fn is_active_button(button: Button) -> bool {
+    matches!(
+        button,
+        Button::South | Button::East | Button::West | Button::North
+            | Button::LeftTrigger | Button::RightTrigger | Button::LeftTrigger2
+            | Button::Start | Button::DPadUp | Button::DPadDown
+            | Button::DPadLeft | Button::DPadRight
+    )
+}
+
 fn pad_neutral(pad: &gilrs::Gamepad<'_>, deadzone: f64) -> bool {
     let axes = [
         Axis::LeftStickX,
         Axis::LeftStickY,
         Axis::RightStickX,
-        Axis::RightStickY,
     ];
     let buttons = [
         Button::South,
@@ -584,11 +456,7 @@ fn pad_neutral(pad: &gilrs::Gamepad<'_>, deadzone: f64) -> bool {
         Button::LeftTrigger,
         Button::RightTrigger,
         Button::LeftTrigger2,
-        Button::RightTrigger2,
         Button::Start,
-        Button::Select,
-        Button::LeftThumb,
-        Button::RightThumb,
         Button::DPadUp,
         Button::DPadDown,
         Button::DPadLeft,
@@ -598,7 +466,7 @@ fn pad_neutral(pad: &gilrs::Gamepad<'_>, deadzone: f64) -> bool {
         let value = (pad.value(*axis) as f64).abs();
         value == 0.0 || value < deadzone
     }) && buttons.iter().all(|button| !pad.is_pressed(*button))
-        && [Button::LeftTrigger2, Button::RightTrigger2]
+        && [Button::LeftTrigger2]
             .iter()
             .all(|button| {
                 pad.button_data(*button)
@@ -615,7 +483,7 @@ fn intent_accepted(response: Option<proto::Response>) -> bool {
     })
 }
 
-fn policies_homed(response: Option<proto::Response>) -> std::io::Result<bool> {
+fn policies_status(response: Option<proto::Response>) -> std::io::Result<proto::PoliciesResult> {
     let response = response.ok_or_else(|| std::io::Error::other("missing policies response"))?;
     if let Some(error) = &response.error {
         return Err(std::io::Error::other(format!(
@@ -623,13 +491,33 @@ fn policies_homed(response: Option<proto::Response>) -> std::io::Result<bool> {
             error.message
         )));
     }
-    let policies: proto::PoliciesResult = response.result_as()?;
-    policies.homed.ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "policies response has no homed state",
-        )
-    })
+    response.result_as().map_err(Into::into)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartResult {
+    AlreadyEnabled,
+    Requested,
+    InitializationRefused,
+    EnableRefused,
+}
+
+fn start_robot(stream: &mut UnixStream, next_id: &mut u64) -> std::io::Result<StartResult> {
+    let policies = policies_status(request(stream, next_id, &proto::Call::RobotPolicies)?)?;
+    if policies.motion_enabled == Some(true) {
+        return Ok(StartResult::AlreadyEnabled);
+    }
+    if policies.homed != Some(true)
+        && !intent_accepted(request(stream, next_id, &proto::Call::RobotInit)?)
+    {
+        return Ok(StartResult::InitializationRefused);
+    }
+    let enable = proto::Call::RobotEnable(proto::EnableParams { on: true, toggle: false });
+    if intent_accepted(request(stream, next_id, &enable)?) {
+        Ok(StartResult::Requested)
+    } else {
+        Ok(StartResult::EnableRefused)
+    }
 }
 
 fn maintain_control(
@@ -643,26 +531,6 @@ fn maintain_control(
         let result = control::call(stream, next_id, proto::HumanControlAction::Refresh)?;
         gate.refreshed(&result, now);
         gate.expire(Instant::now());
-    }
-    if gate.releasing() {
-        let calls = [
-            proto::Call::RobotMove(proto::MoveParams::default()),
-            proto::Call::RobotHead(proto::HeadParams::default()),
-            proto::Call::RobotPose(proto::PoseParams {
-                active: false,
-                ..Default::default()
-            }),
-            proto::Call::RobotMouth(proto::MouthParams::default()),
-            proto::Call::RobotSound(proto::SoundParams {
-                tag: proto::SoundTag::Wheee,
-                hold: Some(false),
-            }),
-        ];
-        for call in calls {
-            notify(stream, &call)?;
-        }
-        let result = control::call(stream, next_id, proto::HumanControlAction::Release)?;
-        gate.released(&result);
     }
     Ok(())
 }
@@ -739,9 +607,9 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    let mut emergency = control::Emergency::default();
+    let mut rest_chord = control::RestChord::default();
     loop {
-        let _ = run_session(&args, &mut gilrs, tap.as_ref(), &mut emergency);
+        let _ = run_session(&args, &mut gilrs, tap.as_ref(), &mut rest_chord);
         if let Some(tap) = tap.as_ref() {
             tap.idle();
         }
@@ -754,7 +622,7 @@ fn run_session(
     args: &Args,
     gilrs: &mut Gilrs,
     tap: Option<&tap::Tap>,
-    emergency: &mut control::Emergency,
+    rest_chord: &mut control::RestChord,
 ) -> std::process::ExitCode {
     let mut stream = match connection::connect(&args.socket) {
         Ok(stream) => stream,
@@ -796,39 +664,26 @@ fn run_session(
         socket = %args.socket.display(),
         hz = args.hz,
         roller,
-        "driving — A sit, B ground pick, LB/RB kicks, triggers mouth; D-pad up head, \
-         right head + move, left move, down body + head; Start stands up then toggles the policy, \
-         Start (1.5s) home pose; Select (2-4s) rest, Select (4s) power off"
+        "driving — sticks and D-pad move, X/B turn, Y ground pick, A sit, LB/RB kicks, \
+         L2 mouth; Start initializes and enables, Start + Select rests"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
     // The button bindings, read once like every other daemon reads its config. A file that will
     // not parse is not a reason to leave somebody without a pad: the default mapping is the
     // fallback, and the reason is logged.
-    let (mut bindings, mut imu_head_cfg, mut drive) = read_bindings(&args.config);
+    let (mut bindings, mut drive) = read_bindings(&args.config);
     // When the file was last written, so a change is picked up without a restart.
     let mut bindings_at = config_mtime(&args.config);
     let mut bindings_checked = Instant::now();
 
-    let mut walk_speed = args.max_linear.max(0.0);
-    let mut turn_speed = args.max_angular.max(0.0);
-    let mut mode = Mode::Drive;
-    // The pad attitude that reads as "head centred" while head + move follows the pad's IMU.
-    // `None` whenever it is not following — another mode, the feature off, no IMU, or the pad
-    // gone: a reference taken against one pad means nothing to the next.
-    let mut imu_reference: Option<[f32; 4]> = None;
+    let mut buttons_were_driving = false;
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
     let mut active_pad_id = None;
     let mut start = HoldButton::default();
-    let mut select = HoldButton::default();
-    // RT consumes queued edges; LT remains a continuously polled hold.
-    let mut chirp_trigger = ChirpTrigger::default();
-    let mut prev_lt = 0.0f64;
-    // Does this pad think the robot is up (torque on, at the home pose)? When not, Start sends
-    // `robot.init` (stand up and hold) instead of enabling the policy; the next Start enables it.
-    // Starts false: padd starts with the robot, and a robotd restart restarts padd too.
-    let mut up = false;
+    let mut rest_rearm_required = false;
+    let mut pick_mouth = PickMouth::default();
     // The continuous intents, and the buffer this tick's are built in. Both live across
     // ticks so a steady state neither allocates nor re-sends — see [`Continuous`].
     let mut continuous = Continuous::default();
@@ -848,7 +703,7 @@ fn run_session(
             let now = config_mtime(&args.config);
             if now != bindings_at {
                 bindings_at = now;
-                (bindings, imu_head_cfg, drive) = read_bindings(&args.config);
+                (bindings, drive) = read_bindings(&args.config);
                 tracing::warn!("button bindings reloaded");
             }
             match ask_roller(&mut stream, &mut next_id) {
@@ -870,8 +725,7 @@ fn run_session(
             }
         }
 
-        // Drain the queue so axis polling below sees present state, and catch button
-        // *edges* — a held D-pad must select once, not fifty times a second.
+        // Drain the queue so axis and movement-button polling below sees the current state.
         //
         // The driving pad is the first one, and only its events may act: with two pads
         // connected, a Start or Select from the *other* one would otherwise steer a robot
@@ -881,66 +735,38 @@ fn run_session(
         } else {
             gilrs.gamepads().next().map(|(id, _)| id)
         };
-        let mut wanted_mode: Option<Mode> = None;
         // Which bindable buttons went down this tick, by their config name. A list rather than
         // a flag apiece, because what each one runs is config now and this loop no longer knows.
         let mut pressed: Vec<&'static str> = Vec::new();
-        let mut linear_direction = 0i8;
-        let mut turn_direction = 0i8;
         let mut start_released = false;
-        let mut select_released = false;
-        let mut chirp_pressed = false;
         let mut button_activity = false;
         let mut pad_disconnected = false;
         while let Some(event) = gilrs.next_event() {
             if Some(event.id) != pad_id {
                 continue;
             }
-            if matches!(event.event, gilrs::EventType::ButtonPressed(_, _)) {
+            if matches!(event.event, gilrs::EventType::ButtonPressed(button, _) if is_active_button(button)) {
                 button_activity = true;
             }
             if matches!(event.event, gilrs::EventType::Disconnected) {
                 pad_disconnected = true;
             }
             match event.event {
-                gilrs::EventType::ButtonPressed(button, _) => emergency.button(button, true),
-                gilrs::EventType::ButtonReleased(button, _) => emergency.button(button, false),
+                gilrs::EventType::ButtonPressed(button, _) => rest_chord.button(button, true),
+                gilrs::EventType::ButtonReleased(button, _) => rest_chord.button(button, false),
                 _ => {}
             }
             match event.event {
-                gilrs::EventType::ButtonChanged(Button::RightTrigger2, value, _) => {
-                    chirp_pressed |= chirp_trigger.update(value);
-                }
-                // Start and Select are holds: what they do depends on how long they stay down,
-                // so they are read off their state every tick and their release here.
+                // Start activates on a short release.
                 gilrs::EventType::ButtonReleased(Button::Start, _) => start_released = true,
-                gilrs::EventType::ButtonReleased(Button::Select, _) => select_released = true,
                 gilrs::EventType::ButtonPressed(button, _) => match button {
-                    // The six bindable ones. What each runs is `[pad]` in the config; this
-                    // only knows which physical control was pressed.
-                    //
                     // gilrs names the *bumpers* `LeftTrigger`/`RightTrigger`; the analog
                     // triggers are `LeftTrigger2`/`RightTrigger2`. Getting that backwards binds
                     // a skill to a control nobody presses.
-                    Button::LeftThumb | Button::RightThumb => {
-                        let turn_modifier = pad_id
-                            .and_then(|id| gilrs.connected_gamepad(id))
-                            .is_some_and(|pad| pad.is_pressed(Button::DPadLeft));
-                        let (linear, turn) = speed_step(button, turn_modifier);
-                        linear_direction += linear;
-                        turn_direction += turn;
-                    }
                     Button::South => pressed.push("a"),
-                    Button::East => pressed.push("b"),
-                    Button::West => pressed.push("x"),
                     Button::North => pressed.push("y"),
                     Button::LeftTrigger => pressed.push("lb"),
                     Button::RightTrigger => pressed.push("rb"),
-                    // The D-pad picks what the sticks mean.
-                    Button::DPadUp => wanted_mode = Some(Mode::Head),
-                    Button::DPadRight => wanted_mode = Some(Mode::HeadDrive),
-                    Button::DPadLeft => wanted_mode = Some(Mode::Drive),
-                    Button::DPadDown => wanted_mode = Some(Mode::BodyPose),
                     // Home. Not bindable: it is not a skill, and the robot owns the toggle.
                     _ => {}
                 },
@@ -960,21 +786,16 @@ fn run_session(
             // Logged once per transition, at `warn` so it survives `RUST_LOG=warn` on a board.
             // "The pad went away" is the single most useful line in the journal when the robot
             // stops responding mid-drive, and one line per tick would bury it.
-            let emergency_stop = emergency.disconnected();
+            rest_chord.disconnected();
+            pick_mouth.cancel();
             gate.expire(Instant::now());
             let cancellation = reset_precision(
                 &mut precision,
                 &mut stream,
                 &mut next_id,
-                !emergency_stop && gate.owns(),
+                gate.owns(),
             );
-            if emergency_stop {
-                if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotStop) {
-                    tracing::error!(error = %e, "emergency stop failed");
-                    return std::process::ExitCode::FAILURE;
-                }
-                gate.lost();
-            } else if control::stop_on_pad_loss(driving, gate.owns()) {
+            if control::stop_on_pad_loss(driving, gate.owns()) {
                 match control::call(
                     &mut stream,
                     &mut next_id,
@@ -1000,13 +821,9 @@ fn run_session(
                 driving = false;
                 active_pad_id = None;
             }
-            // A hold in flight was measured against the pad that just left: drop it, or a
-            // Select still down when the pad returns lands its full hold time at once — a
-            // power-off nobody asked for.
             start.reset();
-            select.reset();
-            chirp_trigger = ChirpTrigger::default();
-            imu_reference = None;
+            buttons_were_driving = false;
+            rest_rearm_required = false;
             if let Some(tap) = tap.as_ref() {
                 tap.idle();
             }
@@ -1016,36 +833,77 @@ fn run_session(
         };
         active_pad_id = pad_id;
 
-        let emergency_action = emergency.finish(
+        if args.layout.requires_normalized_mapping() && pad.mapping_source() == MappingSource::None
+        {
+            tracing::error!("classic layout requires a normalized gamepad mapping");
+            return std::process::ExitCode::FAILURE;
+        }
+        let chord_action = rest_chord.finish(
             pad.is_pressed(Button::Start),
             pad.is_pressed(Button::Select),
         );
-        if emergency_action.stop {
-            tracing::warn!("Start and Select — emergency stop");
+        if chord_action.rest {
+            gate.expire(Instant::now());
+            if !gate.driving() {
+                let requested_at = Instant::now();
+                match control::call(&mut stream, &mut next_id, proto::HumanControlAction::AcquireIfFree) {
+                    Ok(result) => {
+                        gate.acquired(&result, requested_at);
+                        if !gate.driving() {
+                            tracing::warn!(reason = ?result.reason, "rest unavailable: gamepad control not acquired");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "control acquisition for rest failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+            }
+            if gate.driving() {
+                if pick_mouth.cancel()
+                    && let Err(error) = notify(&mut stream, &proto::Call::RobotMouth(proto::MouthParams::default()))
+                {
+                    tracing::error!(%error, "closing mouth before rest failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+                if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true) {
+                    tracing::error!(%error, "precision cancellation before rest failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+                if let Err(error) = notify(&mut stream, &proto::Call::RobotMove(proto::MoveParams::default())) {
+                    tracing::error!(%error, "stopping before rest failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+                match request(&mut stream, &mut next_id, &proto::Call::RobotRest) {
+                    Ok(response) => {
+                        if intent_accepted(response) {
+                            tracing::warn!("Start and Select — rest requested");
+                            rest_rearm_required = true;
+                        } else {
+                            tracing::warn!("Start and Select — rest refused");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "rest request failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
+                }
+            }
+        }
+        if chord_action.suppress || (rest_rearm_required && !pad_neutral(&pad, args.deadzone)) {
             if let Some(precision) = precision.as_mut() {
                 precision.reset();
                 precision.awaiting_completion = false;
             }
-            if let Err(e) = request(&mut stream, &mut next_id, &proto::Call::RobotStop) {
-                tracing::error!(error = %e, "emergency stop failed");
+            start = HoldButton::default();
+            buttons_were_driving = false;
+            if let Err(error) = maintain_control(&mut stream, &mut next_id, &mut gate) {
+                tracing::error!(%error, "control refresh during rest failed");
                 return std::process::ExitCode::FAILURE;
             }
-            gate.lost();
-        }
-        if emergency_action.suppress {
-            if let Some(precision) = precision.as_mut() {
-                precision.reset();
-                precision.awaiting_completion = false;
-            }
-            gate.lost();
-            start = HoldButton::default();
-            select = HoldButton::default();
-            chirp_trigger = ChirpTrigger::default();
-            prev_lt = 0.0;
-            imu_reference = None;
             if let Some(tap) = tap.as_ref() {
                 tap.watch(&pad);
-                tap.imu_control(imu_head_cfg.enabled);
+                tap.imu_control(false);
             }
             driving = true;
             if let Some(remaining) = period
@@ -1056,14 +914,10 @@ fn run_session(
             }
             continue;
         }
+        rest_rearm_required = false;
 
-        if args.layout.requires_normalized_mapping() && pad.mapping_source() == MappingSource::None
-        {
-            tracing::error!("classic layout requires a normalized gamepad mapping");
-            return std::process::ExitCode::FAILURE;
-        }
         let neutral = pad_neutral(&pad, args.deadzone);
-        let activity = button_activity || chirp_pressed || !neutral;
+        let activity = button_activity || !neutral;
         gate.expire(Instant::now());
         if gate.observe(neutral, activity) {
             let requested_at = Instant::now();
@@ -1074,21 +928,7 @@ fn run_session(
             ) {
                 Ok(result) => {
                     gate.acquired(&result, requested_at);
-                    if gate.driving() {
-                        match request(&mut stream, &mut next_id, &proto::Call::RobotPolicies) {
-                            Ok(response) => match policies_homed(response) {
-                                Ok(homed) => up = homed,
-                                Err(e) => {
-                                    tracing::error!(error = %e, "cannot synchronize robot home state");
-                                    gate.release();
-                                }
-                            },
-                            Err(e) => {
-                                tracing::error!(error = %e, "policies request failed");
-                                return std::process::ExitCode::FAILURE;
-                            }
-                        }
-                    } else {
+                    if !gate.driving() {
                         tracing::info!(reason = ?result.reason, "gamepad control unavailable");
                     }
                 }
@@ -1103,6 +943,7 @@ fn run_session(
             return std::process::ExitCode::FAILURE;
         }
         if !gate.driving() {
+            pick_mouth.cancel();
             if let Some(precision) = precision.as_mut() {
                 precision.reset();
                 precision.awaiting_completion = false;
@@ -1112,13 +953,10 @@ fn run_session(
                 }
             }
             start = HoldButton::default();
-            select = HoldButton::default();
-            chirp_trigger = ChirpTrigger::default();
-            prev_lt = 0.0;
-            imu_reference = None;
+            buttons_were_driving = false;
             if let Some(tap) = tap.as_ref() {
                 tap.watch(&pad);
-                tap.imu_control(imu_head_cfg.enabled);
+                tap.imu_control(false);
             }
             driving = true;
             let sleep_period = period.min(control::REFRESH_INTERVAL);
@@ -1134,22 +972,6 @@ fn run_session(
             tracing::error!(%error, "precision status query failed");
             return std::process::ExitCode::FAILURE;
         }
-        walk_speed = adjust_speed(
-            walk_speed,
-            linear_direction,
-            WALK_SPEED_STEP_MPS,
-            args.max_linear,
-        );
-        turn_speed = adjust_speed(
-            turn_speed,
-            turn_direction,
-            WALK_TURN_SPEED_STEP_RAD_S,
-            args.max_angular,
-        );
-        if linear_direction != 0 || turn_direction != 0 {
-            tracing::info!(walk_speed, turn_speed, "walking speed limits");
-        }
-
         if !driving {
             tracing::warn!(pad = pad.name(), "pad connected — driving");
             driving = true;
@@ -1160,177 +982,30 @@ fn run_session(
         // enough that a tap following the old one would report the rest of the session as silence.
         if let Some(tap) = tap.as_ref() {
             tap.watch(&pad);
-            // Every tick, like the bindings: switching the feature on in the config has to start
-            // the IMU reader without a restart, and off has to let it go.
-            tap.imu_control(imu_head_cfg.enabled);
+            tap.imu_control(false);
         }
 
-        // The pad's attitude this tick, when the feature is on and the pad has an IMU that has
-        // said something believable. `None` is every other case, and head + move then poses the
-        // head from the right stick.
-        let attitude = if imu_head_cfg.enabled {
-            tap.as_ref().and_then(|tap| tap.attitude())
-        } else {
-            None
-        };
-        if attitude.is_none() && imu_reference.is_some() {
-            // The feature went off, or the IMU went away under us. Not silent: a head that stops
-            // following mid-turn wants a line in the journal saying why.
-            tracing::info!("IMU head control off — the right stick poses the head");
-            imu_reference = None;
-        }
-
-        // Start: a tap stands the robot up, then toggles the policy; held, it is the way home.
-        let mut go_home = false;
-        match start.tick(
-            pad.is_pressed(Button::Start),
-            start_released,
-            tick,
-            &[HOME_HOLD],
+        // A short Start press initializes if needed, then enables the policy. Never toggle it off.
+        if matches!(
+            start.tick(pad.is_pressed(Button::Start), start_released, tick, &[START_TAP_MAX]),
+            HoldAction::Tap
         ) {
-            // Start's one threshold acts when it is reached; its release says nothing more.
-            HoldAction::Nothing | HoldAction::ReleasedAfter(_) => {}
-            HoldAction::Reached(_) => {
-                match explicit_low_voltage_rearm(&mut stream, &mut next_id, &mut gate) {
-                    Ok(true) => {}, Ok(false) => continue,
-                    Err(error) => { tracing::warn!(%error, "low-voltage recovery result unknown; reconnecting and requiring neutral controls"); return std::process::ExitCode::FAILURE; }
-                }
-                go_home = true;
+            match explicit_low_voltage_rearm(&mut stream, &mut next_id, &mut gate) {
+                Ok(true) => {}, Ok(false) => continue,
+                Err(error) => { tracing::warn!(%error, "low-voltage recovery result unknown; reconnecting and requiring neutral controls"); return std::process::ExitCode::FAILURE; }
             }
-            HoldAction::Tap if !up => {
-                match explicit_low_voltage_rearm(&mut stream, &mut next_id, &mut gate) {
-                    Ok(true) => {}, Ok(false) => continue,
-                    Err(error) => { tracing::warn!(%error, "low-voltage recovery result unknown; reconnecting and requiring neutral controls"); return std::process::ExitCode::FAILURE; }
-                }
-                if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true)
-                {
-                    tracing::error!(%error, "precision cancellation failed");
-                    return std::process::ExitCode::FAILURE;
-                }
-                tracing::warn!("Start — robot.init: standing up. Press Start again to drive");
-                match request(&mut stream, &mut next_id, &proto::Call::RobotInit) {
-                    Err(e) => {
-                        tracing::error!(error = %e, "init failed");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                    Ok(response) => up = intent_accepted(response),
-                }
-            }
-            HoldAction::Tap => {
-                match explicit_low_voltage_rearm(&mut stream, &mut next_id, &mut gate) {
-                    Ok(true) => {}, Ok(false) => continue,
-                    Err(error) => { tracing::warn!(%error, "low-voltage recovery result unknown; reconnecting and requiring neutral controls"); return std::process::ExitCode::FAILURE; }
-                }
-                if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true)
-                {
-                    tracing::error!(%error, "precision cancellation failed");
-                    return std::process::ExitCode::FAILURE;
-                }
-                // The robot owns the toggle. A local on/off belief here drifts from the
-                // robot's the moment anything else moves it — robot.relax, the shutdown
-                // sequence, either side restarting — and a stale belief turns Start into a
-                // button that does nothing every other press. `toggle` flips the robot's own
-                // state; turning OFF returns it to the home pose (the prototype's "returning
-                // to default pose"), so turning on always starts the policy from home.
-                let call = proto::Call::RobotEnable(proto::EnableParams {
-                    on: false,
-                    toggle: true,
-                });
-                match request(&mut stream, &mut next_id, &call) {
-                    Err(e) => {
-                        tracing::error!(error = %e, "enable failed");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                    Ok(response) => {
-                        // The robot names the state it ended in; that is the log, since padd
-                        // no longer has a belief of its own to report.
-                        let outcome = response
-                            .and_then(|r| r.result_as::<proto::IntentResult>().ok())
-                            .and_then(|r| r.reason)
-                            .unwrap_or_else(|| "toggled".to_owned());
-                        tracing::warn!(%outcome, "policy");
-                    }
-                }
-            }
-        }
-
-        if go_home {
             if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true) {
                 tracing::error!(%error, "precision cancellation failed");
                 return std::process::ExitCode::FAILURE;
             }
-            // Everything back: the sticks to plain driving, the policy off, and the robot ramped
-            // to its home pose with torque on — from limp, from mid-walk or from a crouch alike.
-            // The disable comes first so the policy cannot pick the robot up again the moment the
-            // ramp ends, which is what `robot.init` alone does on a robot that is driving.
-            tracing::warn!("Start held — home pose, motors stiff, policy off");
-            for call in mode_exit_calls(mode, Mode::Drive) {
-                if let Err(e) = notify(&mut stream, &call) {
-                    tracing::error!(error = %e, "send failed");
+            match start_robot(&mut stream, &mut next_id) {
+                Ok(StartResult::AlreadyEnabled) => tracing::info!("Start — policy already enabled"),
+                Ok(StartResult::Requested) => tracing::info!("Start — initialization and policy requested"),
+                Ok(StartResult::InitializationRefused) => tracing::warn!("Start — initialization refused"),
+                Ok(StartResult::EnableRefused) => tracing::warn!("Start — policy enable refused"),
+                Err(error) => {
+                    tracing::error!(%error, "start request failed");
                     return std::process::ExitCode::FAILURE;
-                }
-            }
-            mode = Mode::Drive;
-            imu_reference = None;
-            let disable = proto::Call::RobotEnable(proto::EnableParams {
-                on: false,
-                toggle: false,
-            });
-            for call in [disable, proto::Call::RobotInit] {
-                match request(&mut stream, &mut next_id, &call) {
-                    Ok(response) => {
-                        if matches!(call, proto::Call::RobotInit) {
-                            up = intent_accepted(response);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "home request failed");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                }
-            }
-        }
-
-        if let Some(next) = wanted_mode {
-            if next != mode {
-                if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true)
-                {
-                    tracing::error!(%error, "precision cancellation failed");
-                    return std::process::ExitCode::FAILURE;
-                }
-                if let Err(e) = notify(
-                    &mut stream,
-                    &proto::Call::RobotMove(proto::MoveParams::default()),
-                ) {
-                    tracing::error!(error = %e, "mode change zero failed");
-                    return std::process::ExitCode::FAILURE;
-                }
-                for call in mode_exit_calls(mode, next) {
-                    if let Err(e) = notify(&mut stream, &call) {
-                        tracing::error!(error = %e, "send failed");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                }
-                mode = next;
-                tracing::info!(?mode, "mode");
-            }
-            // Head + move follows the pad's IMU when it can, from wherever the pad is at the
-            // press — and pressing it again re-centres, which is how a person beats the gyro's
-            // yaw drift without a magnetometer.
-            imu_reference = if mode == Mode::HeadDrive {
-                attitude
-            } else {
-                None
-            };
-            if mode == Mode::HeadDrive {
-                if imu_reference.is_some() {
-                    tracing::info!("IMU head control: following the pad from here");
-                } else if imu_head_cfg.enabled && tap.as_ref().is_some_and(|tap| tap.has_imu()) {
-                    // The IMU is there and has not spoken yet — a second after connecting,
-                    // typically. Saying so beats silently doing the other thing.
-                    tracing::warn!(
-                        "the pad's IMU has no attitude yet; the right stick has the head this once"
-                    );
                 }
             }
         }
@@ -1343,7 +1018,11 @@ fn run_session(
         // one with the list it does have, which is a better error than this side could give.
         for button in &pressed {
             // An empty binding is a button switched off on purpose, not a fault.
-            let skill = bindings.skill(button).unwrap_or_default();
+            let skill = if *button == "y" {
+                "ground_pick"
+            } else {
+                bindings.skill(button).unwrap_or_default()
+            };
             if skill.is_empty() {
                 tracing::debug!(button, "no skill bound");
                 continue;
@@ -1353,101 +1032,19 @@ fn run_session(
             });
             match request(&mut stream, &mut next_id, &call) {
                 Ok(response) => {
-                    if intent_accepted(response)
-                        && let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true)
-                    {
-                        tracing::error!(%error, "precision cancellation failed");
-                        return std::process::ExitCode::FAILURE;
+                    if intent_accepted(response) {
+                        if skill == "ground_pick" {
+                            pick_mouth.start(tick);
+                        }
+                        if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true) {
+                            tracing::error!(%error, "precision cancellation failed");
+                            return std::process::ExitCode::FAILURE;
+                        }
                     }
                 }
                 Err(error) => {
                     tracing::error!(%error, "skill request failed");
                     return std::process::ExitCode::FAILURE;
-                }
-            }
-        }
-
-        // X held: keep a chaining skill going. The robot starts another when a request lands
-        // near the end of the current one, so "held" is spelled "resent every tick" — as a
-        // notification, because fifty answered requests a second would spend their time waiting
-        // on replies, and the press above already got the real answer.
-        //
-        // Whatever X is bound to: a skill that does not chain simply refuses
-        // the resend, which costs a notification nobody reads. Only X, because it is the button
-        // the prototype held the roulade on.
-        let held = bindings.skill("x").unwrap_or_default();
-        if pad.is_pressed(Button::West)
-            && !pressed.contains(&"x")
-            && !held.is_empty()
-            && let Err(e) = notify(
-                &mut stream,
-                &proto::Call::RobotDo(proto::DoParams {
-                    skill: held.to_owned(),
-                }),
-            )
-        {
-            tracing::error!(error = %e, "send failed");
-            return std::process::ExitCode::FAILURE;
-        }
-
-        // Select: nothing on a tap. Let go between two and four seconds, a rest; held to four, a
-        // power-off. Both sit and ease into the rest pose before torque goes, which is why the
-        // rest waits for the release: until then the same hold may still become a power-off.
-        match select.tick(
-            pad.is_pressed(Button::Select),
-            select_released,
-            tick,
-            &[REST_HOLD, SHUTDOWN_HOLD],
-        ) {
-            HoldAction::ReleasedAfter(0) => {
-                if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true)
-                {
-                    tracing::error!(%error, "precision cancellation failed");
-                    return std::process::ExitCode::FAILURE;
-                }
-                tracing::warn!(
-                    "Select released — robot.rest: sit, rest pose, then torque off and servo reboot"
-                );
-                // A reboot at the end rather than a bare relax: a servo that tripped its overload
-                // comes back with it, so this is also the way out of a tripped servo without
-                // pulling the battery. The robot ends limp, so the next Start stands it up again
-                // rather than toggling the policy on a robot that is lying on the floor.
-                match request(&mut stream, &mut next_id, &proto::Call::RobotRest) {
-                    Ok(response) => {
-                        if intent_accepted(response) {
-                            up = false;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "rest request failed");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                }
-            }
-            HoldAction::Nothing | HoldAction::ReleasedAfter(_) => {}
-            HoldAction::Tap => {
-                tracing::info!("Select tapped — hold it 2 s to rest, 4 s to power off")
-            }
-            HoldAction::Reached(0) => {
-                tracing::warn!("Select held 2 s — let go to rest, keep holding to power off")
-            }
-            HoldAction::Reached(_) => {
-                if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true)
-                {
-                    tracing::error!(%error, "precision cancellation failed");
-                    return std::process::ExitCode::FAILURE;
-                }
-                tracing::warn!("Select held on — asking the robot to power off");
-                match request(&mut stream, &mut next_id, &proto::Call::RobotShutdown) {
-                    Ok(response) => {
-                        if intent_accepted(response) {
-                            up = false;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "shutdown request failed");
-                        return std::process::ExitCode::FAILURE;
-                    }
                 }
             }
         }
@@ -1459,115 +1056,53 @@ fn run_session(
         let left_x = deadzone(pad.value(Axis::LeftStickX));
         let left_y = deadzone(pad.value(Axis::LeftStickY));
         let right_x = deadzone(pad.value(Axis::RightStickX));
-        let right_y = deadzone(pad.value(Axis::RightStickY));
 
-        // Either trigger opens the mouth; the larger value wins.
-        let trigger = |b: Button| pad.button_data(b).map(|d| d.value()).unwrap_or(0.0) as f64;
-        let rt = trigger(Button::RightTrigger2);
-        let lt = trigger(Button::LeftTrigger2);
-        let (mouth, sound_calls) = mouth_trigger_commands(lt, rt, chirp_pressed, prev_lt);
+        // An accepted pick opens and closes the mouth; L2 can take over manually.
+        let lt = pad.button_data(Button::LeftTrigger2).map(|d| d.value()).unwrap_or(0.0) as f64;
+        let mouth = pick_mouth.output(Instant::now(), lt);
         if let Err(e) = notify(
             &mut stream,
-            &proto::Call::RobotMouth(mouth),
+            &proto::Call::RobotMouth(proto::MouthParams { open: mouth }),
         ) {
             tracing::error!(error = %e, "send failed");
             return std::process::ExitCode::FAILURE;
         }
-        prev_lt = lt;
-        for params in sound_calls.into_iter().flatten() {
-            if let Err(e) = notify(&mut stream, &proto::Call::RobotSound(params)) {
-                tracing::error!(error = %e, "send failed");
-                return std::process::ExitCode::FAILURE;
-            }
-        }
 
-        let walk_drive = walking_limits(&drive, &args, walk_speed, turn_speed);
+        let walk_drive = walking_limits(&drive, &args, args.max_linear.max(0.0), args.max_angular.max(0.0));
         let limits = DriveLimits {
             roller,
             drive: &walk_drive,
         };
-
-        // This tick's continuous intents, as one frame. Reused rather than built fresh:
-        // a `Vec` per tick is an allocation fifty times a second to say what the sticks
-        // were doing, which is the shape of thing this loop is meant not to do.
-        frame.clear();
-        match mode {
-            Mode::Drive => frame.push(proto::Call::RobotMove(limits.walk(left_y, left_x, right_x))),
-            Mode::HeadDrive => match (imu_reference, attitude) {
-                // The pad's tilt has the head, so the sticks keep the whole drive mapping. In the
-                // same frame: the pad's tilt and the sticks describe one instant.
-                (Some(reference), Some(now)) => {
-                    frame.push(proto::Call::RobotMove(limits.walk(left_y, left_x, right_x)));
-                    frame.push(proto::Call::RobotHead(head_from_pad(
-                        pad_imu::relative(reference, now),
-                        imu_head_cfg.gain,
-                        args.max_head,
-                    )));
-                }
-                // Left stick walks and turns — no strafe, the right stick is busy — and the right
-                // stick looks around, with the signs head mode uses for its left stick.
-                _ => {
-                    frame.push(proto::Call::RobotMove(limits.walk(left_y, 0.0, left_x)));
-                    frame.push(proto::Call::RobotHead(proto::HeadParams {
-                        neck_pitch: 0.0,
-                        head_pitch: -right_y * args.max_head,
-                        head_yaw: -right_x * args.max_head,
-                        head_roll: 0.0,
-                    }));
-                }
-            },
-            Mode::Head => {
-                // The body must not keep its last velocity while the sticks are posing the
-                // head. The deadman would catch it eventually; a robot that keeps walking
-                // because you started moving its head is a bad enough surprise to be
-                // explicit about.
-                //
-                // In the same frame as the head rather than a notification of its own: the
-                // two describe one instant, and sending them separately was two `write_all`
-                // and two `flush` syscalls a tick to say so.
-                frame.push(proto::Call::RobotMove(proto::MoveParams::default()));
-                // The prototype's alpha mapping, signs included (its head_pitch/head_yaw
-                // joint axes are inverted relative to stick direction — verified on
-                // hardware there, kept verbatim here).
-                frame.push(proto::Call::RobotHead(proto::HeadParams {
-                    neck_pitch: right_y * args.max_head,
-                    head_pitch: -left_y * args.max_head,
-                    head_yaw: -left_x * args.max_head,
-                    head_roll: right_x * args.max_head,
-                }));
-            }
-            Mode::BodyPose => {
-                frame.push(proto::Call::RobotMove(proto::MoveParams::default()));
-                frame.push(proto::Call::RobotPose(proto::PoseParams {
-                    z: left_y
-                        * if left_y >= 0.0 {
-                            BODY_MAX_Z_UP
-                        } else {
-                            BODY_MAX_Z_DOWN
-                        },
-                    // No forward/back tilt here: the right stick has the head. The side lean
-                    // keeps the old body mode's sign, moved from the right stick to the left.
-                    pitch: 0.0,
-                    roll: left_x * BODY_MAX_ANGLE,
-                    active: true,
-                }));
-                // The same look-around as head + move, so the right stick means one thing
-                // wherever it poses the head.
-                frame.push(proto::Call::RobotHead(proto::HeadParams {
-                    neck_pitch: 0.0,
-                    head_pitch: -right_y * args.max_head,
-                    head_yaw: -right_x * args.max_head,
-                    head_roll: 0.0,
-                }));
-            }
+        let digital = DigitalDrive {
+            forward: pad.is_pressed(Button::DPadUp),
+            backward: pad.is_pressed(Button::DPadDown),
+            left: pad.is_pressed(Button::DPadLeft),
+            right: pad.is_pressed(Button::DPadRight),
+            turn_left: pad.is_pressed(Button::West),
+            turn_right: pad.is_pressed(Button::East),
+        };
+        let buttons_driving = digital.active();
+        if buttons_driving && !buttons_were_driving
+            && let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true)
+        {
+            tracing::error!(%error, "precision cancellation before button driving failed");
+            return std::process::ExitCode::FAILURE;
         }
+        buttons_were_driving = buttons_driving;
+
+        frame.clear();
+        frame.push(proto::Call::RobotMove(digital.apply(
+            limits.walk(left_y, left_x, right_x),
+            &walk_drive,
+            roller,
+        )));
 
         let mut precision_start = None;
         let mut force_frame = false;
-        if precision.is_some() {
+        // Fixed-speed buttons are held commands, not precision gestures. Cancel any outstanding
+        // gesture on entry and bypass the gesture scheduler while a movement button is held.
+        if precision.is_some() && !buttons_driving {
             let (mapping, axes) = precision_axes(
-                mode,
-                imu_reference.is_some() && attitude.is_some(),
                 roller,
                 left_y,
                 left_x,
@@ -1675,7 +1210,55 @@ fn run_session(
     }
 }
 
-/// How full deflection maps to velocity, for the modes that walk.
+/// Which fixed-speed movement buttons are held on this tick.
+#[derive(Default)]
+struct DigitalDrive {
+    forward: bool,
+    backward: bool,
+    left: bool,
+    right: bool,
+    turn_left: bool,
+    turn_right: bool,
+}
+
+impl DigitalDrive {
+    fn active(&self) -> bool {
+        self.forward || self.backward || self.left || self.right || self.turn_left || self.turn_right
+    }
+
+    fn apply(
+        &self,
+        mut movement: proto::MoveParams,
+        limits: &robotd_params::PadDriveParams,
+        roller: bool,
+    ) -> proto::MoveParams {
+        let direction = |positive: bool, negative: bool, speed: f64| {
+            (i8::from(positive) - i8::from(negative)) as f64 * speed
+        };
+        if self.forward || self.backward {
+            movement.vx = direction(self.forward, self.backward, BUTTON_LINEAR_MPS)
+                .clamp(limits.vx_min, limits.vx_max);
+        }
+        if self.left || self.right {
+            movement.vy = if roller {
+                0.0
+            } else {
+                direction(self.left, self.right, BUTTON_LINEAR_MPS)
+                    .clamp(limits.vy_min, limits.vy_max)
+            };
+        }
+        if self.turn_left || self.turn_right {
+            movement.vyaw = direction(self.turn_left, self.turn_right, BUTTON_TURN_RAD_S)
+                .clamp(limits.vyaw_min, limits.vyaw_max);
+            if roller {
+                movement.vyaw = movement.vyaw.clamp(-ROLLER_YAW, ROLLER_YAW);
+            }
+        }
+        movement
+    }
+}
+
+/// How full stick deflection maps to velocity.
 #[derive(Debug, Clone, Copy)]
 struct DriveLimits<'a> {
     roller: bool,

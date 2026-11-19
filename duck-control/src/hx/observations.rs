@@ -8,6 +8,7 @@ pub(super) struct ObservationScan {
     enabled: bool,
     individual: bool,
     next_joint: usize,
+    raw_imu_retry_at: Option<Instant>,
     imu_decoder: crate::imu::SflpDecoder,
 }
 
@@ -24,6 +25,7 @@ impl ObservationScan {
             enabled: false,
             individual: false,
             next_joint: 0,
+            raw_imu_retry_at: None,
             // Do not alter the control path's stateful decoder.
             imu_decoder: crate::imu::SflpDecoder::with_gyro_unit([0.5; 4], 0.035),
         }
@@ -59,6 +61,7 @@ impl HxIo {
         if scan.individual == active { return; }
         scan.individual = active;
         scan.next_joint = 0;
+        scan.raw_imu_retry_at = None;
         if active {
             for servo in &mut scan.latest.servos {
                 *servo = ServoObservation { id: servo.id, ..Default::default() };
@@ -271,6 +274,11 @@ impl HxIo {
         let id = self.imu_device_id();
         let result = self.read_status_one(id, PRESENT_POSITION, PRESENT_POSITION_LEN);
         let stamp = duck_ipc_proto::clock::monotonic_ns();
+        let raw_sample = if result.as_ref().ok().and_then(|frame| frame.as_ref())
+            .is_some_and(|frame| frame.error == 0 && frame.data.len() == 12 && frame.data[11] & 0x80 == 0)
+        {
+            self.sample_status_raw_imu(id)?
+        } else { None };
         let scan = self.observation.as_mut().expect("status scan exists");
         match result {
             Ok(Some(frame)) => {
@@ -286,7 +294,10 @@ impl HxIo {
                     scan.imu_decoder.decode_packed(block).map_err(str::to_owned)
                 };
                 match imu {
-                    Ok(imu) => Self::store_control_imu(&mut scan.latest.imu, imu, stamp),
+                    Ok(imu) => {
+                        Self::store_control_imu(&mut scan.latest.imu, imu, stamp);
+                        scan.latest.imu.raw_sample = raw_sample;
+                    }
                     Err(error) => scan.latest.imu = ImuObservation {
                         observed_t_ns: Some(stamp), error: Some(error), ..Default::default()
                     },
@@ -307,6 +318,53 @@ impl HxIo {
                 Err(error)
             }
         }
+    }
+
+    fn sample_status_raw_imu(&mut self, id: u8) -> Result<Option<duck_ipc_proto::RawImuObservation>> {
+        if self.observation.as_ref().and_then(|scan| scan.raw_imu_retry_at)
+            .is_some_and(|retry_at| Instant::now() < retry_at) { return Ok(None); }
+        let frame = self.read_status_one(id, 68, 48)?;
+        let Some(frame) = frame.filter(|frame| frame.error == 0 && frame.data.len() == 48) else {
+            self.defer_status_raw_imu();
+            return Ok(None);
+        };
+        let b = &frame.data;
+        if b[0] != 1 || b[1] != 1 || b[3] != 0 || b[2] & !15 != 0 {
+            self.defer_status_raw_imu();
+            return Ok(None);
+        }
+        let age_us = u32::from_le_bytes(b[8..12].try_into().unwrap());
+        if b[2] & 10 != 0 || age_us > 100_000 { return Ok(None); }
+        let timestamp = duck_ipc_proto::clock::monotonic_ns().saturating_sub(u64::from(age_us) * 1000);
+        let vector = |offset| std::array::from_fn(|i| f64::from(f32::from_le_bytes(
+            b[offset + 4*i..offset + 4*i + 4].try_into().unwrap())));
+        let raw_g: [f64; 3] = vector(12);
+        let corrected_g: [f64; 3] = vector(24);
+        let gyro_rad_s: [f64; 3] = vector(36);
+        if raw_g.iter().chain(corrected_g.iter()).chain(gyro_rad_s.iter()).any(|value| !value.is_finite())
+            || raw_g.iter().any(|value| value.abs() >= 1.98) { return Ok(None); }
+        let gyro = self.read_status_one(id, 122, 48)?;
+        let Some(gyro) = gyro.filter(|frame| frame.error == 0 && frame.data.len() == 48) else {
+            self.defer_status_raw_imu();
+            return Ok(None);
+        };
+        let Ok(gyro) = crate::imu_timing::decode_gyro_bias_for_load(&gyro.data) else { return Ok(None) };
+        Ok(Some(duck_ipc_proto::RawImuObservation {
+            t_ns: timestamp,
+            sequence: u32::from_le_bytes(b[4..8].try_into().unwrap()),
+            raw_g, corrected_g, gyro_rad_s,
+            raw_gyro_rad_s: gyro.raw_rad_s.map(f64::from),
+            ready: b[2] & 1 != 0,
+            accel_calibrated: b[2] & 4 != 0,
+            gyro_calibrated: gyro.loaded && gyro.ready,
+        }))
+    }
+
+    fn defer_status_raw_imu(&mut self) {
+        // Older firmware may not implement these optional reads; temporary
+        // timeouts must also be retried instead of disabling them forever.
+        self.observation.as_mut().expect("status scan exists").raw_imu_retry_at =
+            Some(Instant::now() + Duration::from_secs(5));
     }
 
     /// Cache only registers actually read and verified by the startup checks.
@@ -405,7 +463,7 @@ impl HxIo {
         *observation = ImuObservation {
             t_ns: Some(timestamp), observed_t_ns: Some(timestamp), valid: true,
             quaternion_wxyz: Some(imu.quat), gyro_rad_s: Some(imu.gyro),
-            gravity: Some(imu.gravity), error: None,
+            gravity: Some(imu.gravity), error: None, raw_sample: None,
         };
     }
 

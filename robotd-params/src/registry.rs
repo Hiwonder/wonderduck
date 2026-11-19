@@ -499,25 +499,8 @@ pub const REGISTRY: &[Entry] = &[
         Kind::Text,
         "Skill on the A button — `robotctl policy list` names what this robot has",
     ),
-    feature("pad.b", Kind::Text, "Skill on the B button"),
-    feature("pad.y", Kind::Text, "Skill on the Y button"),
-    feature("pad.x", Kind::Text, "Skill on the X button"),
     feature("pad.lb", Kind::Text, "Skill on the left bumper"),
     feature("pad.rb", Kind::Text, "Skill on the right bumper"),
-    // ── [pad_imu_head_control] ───────────────────────────────────────────────
-    //
-    // Controller-IMU head control. Read by `padd`, like `[pad]`. Not `[head_imu]`, which is
-    // the IMU in the robot's head.
-    feature(
-        "pad_imu_head_control.enabled",
-        Kind::Bool,
-        "D-pad right follows the pad IMU with the head while the sticks keep driving",
-    ),
-    entry(
-        "pad_imu_head_control.gain",
-        Kind::Float,
-        "Head radians per pad radian — 1 follows the pad exactly, more amplifies the wrist",
-    ),
     // ── [pad_drive] ──────────────────────────────────────────────────────────
     //
     // What full stick deflection asks for while walking. Read by `padd`, like `[pad]`. Signed

@@ -1097,6 +1097,8 @@ struct RobotState {
     state_tx: tokio::sync::broadcast::Sender<proto::RobotState>,
     /// Independent per-device results; a slow subscriber cannot stall the bus owner.
     devices_tx: tokio::sync::broadcast::Sender<proto::DeviceObservation>,
+    /// Last guarded, individually sampled servo states used to admit partial maintenance.
+    partial_maintenance_observation: std::sync::Mutex<Option<proto::DeviceObservation>>,
     device_configuration_generation: AtomicU64,
     subscriptions: Arc<telemetry::Subscriptions>,
     device_subscriptions: Arc<telemetry::Subscriptions>,
@@ -1268,6 +1270,7 @@ impl RobotState {
             precision_ready: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
             devices_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
+            partial_maintenance_observation: std::sync::Mutex::new(None),
             device_configuration_generation: AtomicU64::new(0),
             subscriptions: Arc::new(telemetry::Subscriptions::default()),
             device_subscriptions: Arc::new(telemetry::Subscriptions::default()),
@@ -2812,6 +2815,10 @@ async fn open_bus_waiting(
             && let Err(error) = status_only.close(opened, state)
         {
             tracing::error!(%error, "cannot close startup status session");
+            state.human_control.lock().finish_maintenance_handoff(
+                human_control::MaintenancePhase::Failed, Some(error));
+            tokio::time::sleep(sample_period).await;
+            continue;
         }
         if service_startup_maintenance(state, &mut maintenance_parked, &mut maintenance_error, |release| {
             match io.as_mut() {
@@ -3474,6 +3481,100 @@ fn publish_device_observation(state: &RobotState, observation: Option<proto::Dev
     let _ = state.devices_tx.send(observation);
 }
 
+fn partial_maintenance_ready(observation: &proto::DeviceObservation, now_ns: u64) -> bool {
+    const MAX_AGE_NS: u64 = 10_000_000_000;
+    let expected = duck_control::model::JOINT_IDS;
+    if observation.bus_error.is_some() || observation.servos.len() != expected.len() { return false; }
+    let mut available = 0;
+    let mut missing = 0;
+    for id in expected {
+        let mut matches = observation.servos.iter().filter(|servo| servo.id == id);
+        let Some(servo) = matches.next() else { return false };
+        if matches.next().is_some() { return false; }
+        let Some(observed) = servo.observed_t_ns else { return false };
+        if observed > now_ns || now_ns - observed > MAX_AGE_NS { return false; }
+        if servo.valid {
+            if servo.t_ns.is_none() || servo.error.is_some() || servo.torque != Some(0) { return false; }
+            available += 1;
+        } else if servo.error.as_deref() == Some("读取超时") {
+            missing += 1;
+        } else { return false; }
+    }
+    available > 0 && missing > 0
+}
+
+#[cfg(test)]
+mod partial_maintenance_tests {
+    use super::*;
+
+    fn observations(now: u64) -> proto::DeviceObservation {
+        let servos = duck_control::model::JOINT_IDS.into_iter().map(|id| {
+            if id == 34 {
+                proto::ServoObservation { id, observed_t_ns: Some(now), valid: false,
+                    error: Some("读取超时".into()), ..Default::default() }
+            } else {
+                proto::ServoObservation { id, t_ns: Some(now), observed_t_ns: Some(now),
+                    valid: true, torque: Some(0), ..Default::default() }
+            }
+        }).collect();
+        proto::DeviceObservation { servos, imu: Default::default(), bus_error: None }
+    }
+
+    #[test]
+    fn partial_release_requires_each_reachable_servo_verified_and_a_clean_bus() {
+        let now = 20_000_000_000;
+        let mut state = observations(now);
+        assert!(partial_maintenance_ready(&state, now));
+        state.servos[0].torque = Some(1);
+        assert!(!partial_maintenance_ready(&state, now));
+        state.servos[0].torque = Some(0);
+        state.servos[1].observed_t_ns = Some(now - 10_000_000_001);
+        assert!(!partial_maintenance_ready(&state, now));
+        state.servos[1].observed_t_ns = Some(now);
+        state.bus_error = Some("unconfirmed frame".into());
+        assert!(!partial_maintenance_ready(&state, now));
+        state.bus_error = None;
+        state.servos.iter_mut().find(|servo| servo.id == 34).unwrap().error = Some("invalid frame".into());
+        assert!(!partial_maintenance_ready(&state, now));
+    }
+
+    #[test]
+    fn unverified_release_keeps_movement_blocked_during_partial_maintenance() {
+        let arbiter = human_control::Arbiter::default();
+        let session = human_control::Session::new();
+        let mut guard = arbiter.lock();
+        assert!(guard.begin_partial_maintenance(&session).is_err());
+        guard.begin_emergency_release().unwrap();
+        assert!(guard.begin_partial_maintenance(&session).is_err());
+        guard.mark_emergency_release_unverified();
+        guard.begin_partial_maintenance(&session).unwrap();
+        assert!(guard.partial_maintenance());
+        assert!(guard.emergency_release_active());
+    }
+
+    #[test]
+    fn failed_partial_handoff_and_disconnect_keep_motion_locked() {
+        use proto::HumanControlSource;
+        let arbiter = human_control::Arbiter::default();
+        let mut maintenance = human_control::Session::new();
+        let mut gamepad = human_control::Session::new();
+        let mut guard = arbiter.lock();
+        assert!(guard.register(&mut gamepad, HumanControlSource::Gamepad).accepted);
+        guard.begin_emergency_release().unwrap();
+        guard.mark_emergency_release_unverified();
+        guard.begin_partial_maintenance(&maintenance).unwrap();
+        guard.finish_maintenance_handoff(human_control::MaintenancePhase::Failed, Some("handoff failed".into()));
+        assert!(!guard.maintenance_result(&maintenance).accepted);
+        assert!(!guard.acquire(&gamepad, HumanControlSource::Gamepad).accepted);
+        guard.disconnect(&mut maintenance);
+        assert_eq!(guard.maintenance_phase(), Some(human_control::MaintenancePhase::Returning));
+        guard.finish_maintenance_return();
+        assert_eq!(guard.maintenance_phase(), None);
+        assert!(guard.emergency_release_active());
+        assert!(!guard.acquire(&gamepad, HumanControlSource::Gamepad).accepted);
+    }
+}
+
 fn publish_status_fault(state: &RobotState, cached: Option<proto::DeviceObservation>) {
     if state.devices_tx.receiver_count() == 0 { return; }
     let mut observation = cached.unwrap_or_else(|| proto::DeviceObservation {
@@ -3689,6 +3790,7 @@ impl ReadOnlyStatusSession {
         period: Duration, existing_marker_owned: bool) -> Result<(), String>
     {
         if !self.active {
+            *state.partial_maintenance_observation.lock().expect("partial observation mutex") = None;
             let pending = status_bus::pending(&state.status_journal).map_err(|error| error.to_string())?;
             if pending {
                 if !existing_marker_owned && !state.status_bus_fault.load(Ordering::Acquire) {
@@ -3715,6 +3817,7 @@ impl ReadOnlyStatusSession {
             if state.status_bus_fault.load(Ordering::Acquire) {
                 publish_status_fault(state, Some(observation));
             } else {
+                *state.partial_maintenance_observation.lock().expect("partial observation mutex") = Some(observation.clone());
                 publish_device_observation(state, Some(observation));
             }
         }
@@ -3824,8 +3927,10 @@ fn service_startup_emergency(
         Err(error) => tracing::error!(%error, "startup emergency torque release not verified"),
     }
     let mut guard = state.human_control.lock();
-    if !state.emergency_relax.complete(waiters, result) {
-        guard.finish_emergency_release();
+    match state.emergency_relax.complete(waiters, result) {
+        emergency_relax::CompletionState::Verified => guard.finish_emergency_release(),
+        emergency_relax::CompletionState::Unverified => guard.mark_emergency_release_unverified(),
+        emergency_relax::CompletionState::Pending => {},
     }
     true
 }
@@ -3849,6 +3954,10 @@ async fn adopt_startup_pose<T: RobotIo>(
         let status_requested = status_only_requested(state);
         if !status_requested && let Err(error) = status_only.close(safety, state) {
             tracing::error!(%error, "cannot close startup status session");
+            state.human_control.lock().finish_maintenance_handoff(
+                human_control::MaintenancePhase::Failed, Some(error));
+            tokio::time::sleep(period).await;
+            continue;
         }
         if service_startup_maintenance(state, &mut maintenance_parked, &mut maintenance_error, |release| {
             if !release && state.stopping.load(Ordering::Acquire) {
@@ -4970,8 +5079,10 @@ async fn control_loop<T: RobotIo>(
         if let Some(waiters) = emergency {
             if let Err(error) = status_only.close(&mut safety, &state) {
                 let mut guard = state.human_control.lock();
-                if !state.emergency_relax.complete(waiters, Err(format!("串口交接未确认：{error}"))) {
-                    guard.finish_emergency_release();
+                match state.emergency_relax.complete(waiters, Err(format!("串口交接未确认：{error}"))) {
+                    emergency_relax::CompletionState::Verified => guard.finish_emergency_release(),
+                    emergency_relax::CompletionState::Unverified => guard.mark_emergency_release_unverified(),
+                    emergency_relax::CompletionState::Pending => {},
                 }
                 continue;
             }
@@ -4981,8 +5092,10 @@ async fn control_loop<T: RobotIo>(
                     safety.quarantine_device_bus();
                     state.status_bus_fault.store(true, Ordering::Release);
                     let mut guard = state.human_control.lock();
-                    if !state.emergency_relax.complete(waiters, Err(format!("串口交接未确认：{error}"))) {
-                        guard.finish_emergency_release();
+                    match state.emergency_relax.complete(waiters, Err(format!("串口交接未确认：{error}"))) {
+                        emergency_relax::CompletionState::Verified => guard.finish_emergency_release(),
+                        emergency_relax::CompletionState::Unverified => guard.mark_emergency_release_unverified(),
+                        emergency_relax::CompletionState::Pending => {},
                     }
                     continue;
                 }
@@ -5021,14 +5134,26 @@ async fn control_loop<T: RobotIo>(
                 Err(error) => tracing::error!(%error, "emergency torque release not verified"),
             }
             let mut guard = state.human_control.lock();
-            if !state.emergency_relax.complete(waiters, result) {
-                guard.finish_emergency_release();
+            match state.emergency_relax.complete(waiters, result) {
+                emergency_relax::CompletionState::Verified => guard.finish_emergency_release(),
+                emergency_relax::CompletionState::Unverified => guard.mark_emergency_release_unverified(),
+                emergency_relax::CompletionState::Pending => {},
             }
             // Do not use an earlier snapshot or write a target in the release tick.
             continue;
         }
-        let emergency_active = state.human_control.lock().emergency_release_active();
-        if emergency_active {
+        let (emergency_active, partial_maintenance) = {
+            let guard = state.human_control.lock();
+            (guard.emergency_release_active(), guard.partial_maintenance())
+        };
+        if emergency_active && partial_maintenance {
+            if let Err(error) = status_only.close(&mut safety, &state) {
+                state.human_control.lock().finish_maintenance_handoff(
+                    human_control::MaintenancePhase::Failed, Some(error));
+                continue;
+            }
+        }
+        if emergency_active && !partial_maintenance {
             // A failed release stays locked until an explicit retry succeeds.
             // The status page may still inspect the exclusively owned bus one
             // device at a time; no normal read or actuator write is permitted.
@@ -5234,7 +5359,7 @@ async fn control_loop<T: RobotIo>(
             // already stopped the policy and released the joints. Do not wait
             // for another synchronous control read before yielding the bus.
             let released = !enabled && !transitions_active
-                && (safety.torque_release_verified() || intents.rest_phase() == proto::RestPhase::Rested);
+                && (partial_maintenance || safety.torque_release_verified() || intents.rest_phase() == proto::RestPhase::Rested);
             if !established_status && !released && !stop.ready(now, fresh && status_measurement_still,
                                                    transitions_active, posture_stable, twist_ema) {
                 if stop.timed_out(now) && maintenance_stop_requested {
@@ -5368,6 +5493,13 @@ async fn control_loop<T: RobotIo>(
                 }
                 MaintenancePhase::Active | MaintenancePhase::Failed => {}
             }
+            continue;
+        }
+
+        // Partial maintenance never clears the emergency interlock. In particular,
+        // a failed or still-quiescing handoff must not fall through to the normal
+        // synchronous read and its subsequent policy/actuator writes.
+        if emergency_active {
             continue;
         }
 
@@ -10010,11 +10142,22 @@ async fn maintenance_request(
                     Err("not_active_maintenance_owner")
                 }
             }
-            MaintenanceAction::Acquire | MaintenanceAction::AcquireStatus if state.managed_models.busy.load(Ordering::Acquire) => Err("model_update_in_progress"),
-            MaintenanceAction::Acquire if guard.status_blocked() => Err("status_page_active"),
-            MaintenanceAction::Acquire | MaintenanceAction::AcquireStatus if !state.startup_voltage_ready.load(Ordering::Acquire) || state.low_voltage_lock.requires_rearm() => Err("low_voltage_rearm_required"),
-            MaintenanceAction::Acquire | MaintenanceAction::AcquireStatus if state.stopping.load(Ordering::Acquire) => Err("robot_exiting"),
-            MaintenanceAction::Acquire | MaintenanceAction::AcquireStatus if state.exit_sit.load(Ordering::Acquire) != 0 => Err("robot_exiting"),
+            MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial | MaintenanceAction::AcquireStatus if state.managed_models.busy.load(Ordering::Acquire) => Err("model_update_in_progress"),
+            MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial if guard.status_blocked() => Err("status_page_active"),
+            MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial | MaintenanceAction::AcquireStatus if !state.startup_voltage_ready.load(Ordering::Acquire) || state.low_voltage_lock.requires_rearm() => Err("low_voltage_rearm_required"),
+            MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial | MaintenanceAction::AcquireStatus if state.stopping.load(Ordering::Acquire) => Err("robot_exiting"),
+            MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial | MaintenanceAction::AcquireStatus if state.exit_sit.load(Ordering::Acquire) != 0 => Err("robot_exiting"),
+            MaintenanceAction::AcquirePartial if !guard.maintenance_transition_blocked() => Err("partial_transition_guard_required"),
+            MaintenanceAction::AcquirePartial if state.status_bus_fault.load(Ordering::Acquire) => Err("status_bus_unconfirmed"),
+            MaintenanceAction::AcquirePartial if !state.partial_maintenance_observation.lock().expect("partial observation mutex")
+                .as_ref().is_some_and(|observation| partial_maintenance_ready(observation, proto::clock::monotonic_ns()))
+                => Err("partial_servo_release_not_verified"),
+            MaintenanceAction::AcquirePartial => guard.begin_partial_maintenance(session).map(|()| {
+                clear_human_intents_with_stop(intents, true);
+                intents.cancel_motion_tracking();
+                intents.cancel_maze();
+                let _ = intents.take_power_request();
+            }),
             MaintenanceAction::Acquire | MaintenanceAction::AcquireStatus => guard.begin_maintenance(session, action == MaintenanceAction::AcquireStatus).map(|()| {
                 clear_human_intents_with_stop(intents, true);
                 intents.cancel_motion_tracking();
@@ -10031,7 +10174,7 @@ async fn maintenance_request(
     loop {
         let mut result = state.human_control.lock().maintenance_result(session);
         let waiting = match action {
-            MaintenanceAction::Acquire | MaintenanceAction::AcquireStatus => result.phase == "requested",
+            MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial | MaintenanceAction::AcquireStatus => result.phase == "requested",
             MaintenanceAction::Release => result.phase == "returning",
             MaintenanceAction::Status => false,
             MaintenanceAction::StatusReadBegin | MaintenanceAction::StatusReadComplete

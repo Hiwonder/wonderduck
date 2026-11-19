@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from urllib.parse import quote
 from urllib.request import urlopen
 
@@ -291,19 +292,44 @@ def verify_signature(public_key, manifest, signature):
         raise ValueError('发布清单签名校验失败')
 
 
-def download(url, destination, limit, expected_size=None):
+def download(url, destination, limit, expected_size=None, progress=False):
+    if progress and (expected_size is None or expected_size <= 0):
+        raise ValueError('下载进度需要有效的文件大小')
     total = 0
-    with urlopen(url, timeout=60) as response, destination.open('xb') as stream:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            total += len(chunk)
-            if total > limit:
-                raise ValueError('下载文件超过允许大小')
-            stream.write(chunk)
-    if expected_size is not None and total != expected_size:
-        raise ValueError('运行包大小与发布清单不一致')
+    terminal = progress and sys.stdout.isatty()
+    last_report = time.monotonic()
+
+    def report(final=False):
+        message = '下载进度：{:3d}% ({:.1f}/{:.1f} MiB)'.format(
+            total * 100 // expected_size, total / (1024 * 1024), expected_size / (1024 * 1024))
+        print(('\r' if terminal else '') + message,
+              end='\n' if final or not terminal else '', flush=True)
+
+    if progress:
+        report()
+    try:
+        with urlopen(url, timeout=60) as response, destination.open('xb') as stream:
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError('下载文件超过允许大小')
+                stream.write(chunk)
+                if progress and total < expected_size:
+                    now = time.monotonic()
+                    if now - last_report >= (0.25 if terminal else 2.0):
+                        report()
+                        last_report = now
+        if expected_size is not None and total != expected_size:
+            raise ValueError('运行包大小与发布清单不一致')
+    except BaseException:
+        if terminal:
+            print(flush=True)
+        raise
+    if progress:
+        report(final=True)
 
 
 def allowed_path(name):
@@ -1115,7 +1141,7 @@ def install(args):
                 raise ValueError('当前镜像版本低于运行包要求')
             archive = stage / ARCHIVE_NAME
             print('正在下载运行包（{} 字节）'.format(manifest['size']), flush=True)
-            download(base + ARCHIVE_NAME, archive, manifest['size'], manifest['size'])
+            download(base + ARCHIVE_NAME, archive, manifest['size'], manifest['size'], progress=True)
             if digest_file(archive) != manifest['sha256']:
                 raise ValueError('运行包 SHA-256 不匹配')
             unpack(archive, stage)

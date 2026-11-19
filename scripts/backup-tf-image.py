@@ -14,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 from tf_image_sanitize import sanitize
 
@@ -394,7 +395,9 @@ def output_path(directory):
     name = "wonderduck_rk3566_" + datetime.date.today().strftime("%Y%m%d")
     for index in range(1, 10000):
         path = directory / (name + ("" if index == 1 else "_" + str(index)) + ".img")
-        if not path.exists() and not Path(str(path) + ".sha256").exists():
+        outputs = (path, Path(str(path) + ".sha256"), Path(str(path) + ".gz"),
+                   Path(str(path) + ".gz.sha256"))
+        if not any(item.exists() or item.is_symlink() for item in outputs):
             return path
     raise RuntimeError("当天的备份文件名已用完")
 
@@ -448,6 +451,112 @@ def verify_and_hash(image, root_image, offset, size):
     return image_hash.hexdigest()
 
 
+def compress_image(image, expected_hash, compressor, owner):
+    """Create and verify an additional gzip image without replacing existing files."""
+    destination = Path(str(image) + ".gz")
+    checksum = Path(str(destination) + ".sha256")
+    if any(path.exists() or path.is_symlink() for path in (destination, checksum)):
+        raise RuntimeError("压缩镜像或校验文件已存在：" + str(destination))
+    size = image.stat().st_size
+    if size <= 0:
+        raise RuntimeError("原始镜像为空，无法压缩")
+    command = [compressor, "-6", "-n", "-c"]
+    if Path(compressor).name == "pigz":
+        command += ["-p", str(min(4, os.cpu_count() or 1))]
+    fd, name = tempfile.mkstemp(prefix="." + destination.name + ".", suffix=".partial", dir=image.parent)
+    partial = Path(name)
+    checksum_created = False
+    published = False
+    try:
+        compressed_hash = hashlib.sha256()
+        print("正在压缩镜像……", flush=True)
+        with os.fdopen(fd, "wb") as output, image.open("rb", buffering=0) as source:
+            process = subprocess.Popen(command, stdin=source, stdout=subprocess.PIPE)
+            last_progress = time.monotonic()
+            try:
+                while True:
+                    data = process.stdout.read1(MIB)
+                    if not data:
+                        break
+                    output.write(data)
+                    compressed_hash.update(data)
+                    now = time.monotonic()
+                    if now - last_progress >= 5:
+                        print("压缩进度：{}%".format(min(99, source.tell() * 100 // size)), flush=True)
+                        last_progress = now
+                process.stdout.close()
+                if process.wait() != 0:
+                    raise RuntimeError("镜像压缩程序执行失败")
+            except BaseException:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                raise
+            finally:
+                process.stdout.close()
+            output.flush()
+            os.fsync(output.fileno())
+        print("压缩进度：100%；正在校验解压后的镜像……", flush=True)
+        restored_hash = hashlib.sha256()
+        restored_size = 0
+        last_progress = time.monotonic()
+        with partial.open("rb") as compressed:
+            process = subprocess.Popen([compressor, "-d", "-c"], stdin=compressed, stdout=subprocess.PIPE)
+            try:
+                while True:
+                    data = process.stdout.read(4 * MIB)
+                    if not data:
+                        break
+                    restored_size += len(data)
+                    if restored_size > size:
+                        raise RuntimeError("压缩镜像解压后超过原始大小")
+                    restored_hash.update(data)
+                    now = time.monotonic()
+                    if now - last_progress >= 5:
+                        print("校验进度：{}%".format(min(99, restored_size * 100 // size)), flush=True)
+                        last_progress = now
+                process.stdout.close()
+                if process.wait() != 0:
+                    raise RuntimeError("压缩镜像完整性校验失败")
+            except BaseException:
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                raise
+            finally:
+                process.stdout.close()
+        if restored_size != size or restored_hash.hexdigest() != expected_hash:
+            raise RuntimeError("压缩镜像解压后与原始镜像不一致")
+        print("校验进度：100%", flush=True)
+        if all(value and value.isdigit() for value in owner):
+            os.chown(partial, int(owner[0]), int(owner[1]))
+        with checksum.open("x", encoding="ascii") as stream:
+            checksum_created = True
+            stream.write("{}  {}\n".format(compressed_hash.hexdigest(), destination.name))
+            stream.flush()
+            os.fsync(stream.fileno())
+        if all(value and value.isdigit() for value in owner):
+            os.chown(checksum, int(owner[0]), int(owner[1]))
+        os.link(partial, destination)
+        published = True
+        partial.unlink()
+        print("压缩镜像：{}（{:.2f} GiB）".format(destination, destination.stat().st_size / 2**30), flush=True)
+        print("压缩镜像校验文件：{}".format(checksum), flush=True)
+    finally:
+        if partial.exists():
+            partial.unlink()
+        if checksum_created and not published:
+            checksum.unlink()
+
+
 def save_table(image, table, root, root_sectors):
     lines = ["label: gpt", "label-id: " + table["id"], "unit: sectors", ""]
     for part in table["partitions"]:
@@ -478,6 +587,9 @@ def main():
     for command in ("lsblk", "findmnt", "sfdisk", "blkid", "e2image", "e2fsck", "resize2fs", "dumpe2fs", "debugfs", "tune2fs", "umount"):
         if not shutil.which(command):
             raise RuntimeError("缺少必需工具：" + command)
+    compressor = shutil.which("pigz") or shutil.which("gzip")
+    if not compressor:
+        raise RuntimeError("缺少压缩工具：请安装 pigz 或 gzip")
     output_dir = Path(args.output_dir).resolve(strict=True)
     if not output_dir.is_dir():
         raise RuntimeError("输出路径不是目录")
@@ -562,8 +674,14 @@ def main():
                 stream.write("{}  {}\n".format(digest, destination.name))
             if all(value and value.isdigit() for value in owner):
                 os.chown(checksum, int(owner[0]), int(owner[1]))
-            print("备份完成：{}（{:.2f} GiB）".format(destination, needed / 2**30), flush=True)
+            print("原始镜像：{}（{:.2f} GiB）".format(destination, needed / 2**30), flush=True)
             print("校验文件：{}".format(checksum), flush=True)
+            try:
+                compress_image(destination, digest, compressor, owner)
+            except BaseException:
+                print("压缩未完成，原始镜像仍已保留：{}".format(destination), file=sys.stderr, flush=True)
+                raise
+            print("备份完成。", flush=True)
     finally:
         if partial and partial.exists():
             partial.unlink()

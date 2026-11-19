@@ -6,35 +6,23 @@ use std::time::{Duration, Instant};
 
 use duck_ipc_proto as proto;
 
-use crate::{Mode, connection, control, notify, precision_input};
+use crate::{connection, control, notify, precision_input};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PrecisionMapping {
     Full { roller: bool },
-    ForwardTurn { roller: bool },
-    Stationary,
 }
 
 pub(super) fn precision_axes(
-    mode: Mode,
-    imu_drives_head: bool,
     roller: bool,
     left_y: f64,
     left_x: f64,
     right_x: f64,
 ) -> (PrecisionMapping, Option<[f64; 3]>) {
-    match mode {
-        Mode::Drive | Mode::HeadDrive if mode == Mode::Drive || imu_drives_head => (
-            PrecisionMapping::Full { roller },
-            Some([left_y, if roller { 0.0 } else { -left_x }, -right_x]),
-        ),
-        Mode::HeadDrive => (
-            PrecisionMapping::ForwardTurn { roller },
-            Some([left_y, 0.0, -left_x]),
-        ),
-        Mode::Head | Mode::BodyPose => (PrecisionMapping::Stationary, None),
-        Mode::Drive => unreachable!("drive mode always uses the full mapping"),
-    }
+    (
+        PrecisionMapping::Full { roller },
+        Some([left_y, if roller { 0.0 } else { -left_x }, -right_x]),
+    )
 }
 
 pub(super) struct PrecisionDrive {

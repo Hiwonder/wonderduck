@@ -160,12 +160,8 @@ impl PadDriveParams {
     }
 }
 
-/// Controller-IMU head control: pose the head by tilting the pad.
-///
-/// Some pads carry an inertial unit. With this enabled, D-pad right selects head + drive:
-/// pad tilt poses the head while the sticks keep driving. The reference is taken on entry;
-/// leaving this mode clears it, so the next entry re-centres the pad attitude.
-/// Without an available pad IMU, the right stick poses the head in the same mode.
+/// Legacy controller-IMU head control settings, retained to read older configuration files.
+/// The current gamepad layout does not use the controller IMU for head control.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PadImuHeadControlParams {
@@ -187,20 +183,19 @@ impl Default for PadImuHeadControlParams {
 
 /// Which pad button runs which skill.
 ///
-/// The six skill buttons. Direction keys select stick modes; Start and Select control the
-/// initialization, rest and shutdown lifecycle. Empty disables a skill button; the daemon
-/// reports unknown or unavailable skills.
+/// A and the bumpers are configurable skill buttons. Direction keys and B/X are reserved for
+/// movement, Y is ground pick, and Start/Select control initialization and rest.
+/// The old B/X/Y fields remain readable so that existing configurations do not need migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PadParams {
     /// A (South). Sit ↔ stand, by default.
     pub a: String,
-    /// B (East). The ground pick, by default.
+    /// Legacy B binding, ignored because B is now turn right.
     pub b: String,
-    /// X (West). The roulade by default. Held, it is re-sent every tick, so a chaining skill such as
-    /// the roulade keeps going for as long as it is held.
+    /// Legacy X binding, ignored because X is now turn left.
     pub x: String,
-    /// Y (North). Free by default.
+    /// Legacy Y binding, ignored because Y now runs ground pick.
     pub y: String,
     /// The left bumper — `LeftTrigger` in gilrs, which names the *analog* trigger
     /// `LeftTrigger2`. Getting that backwards binds a skill to a control nobody presses.
@@ -213,8 +208,8 @@ impl Default for PadParams {
     fn default() -> Self {
         Self {
             a: "sit_toggle".to_owned(),
-            b: "ground_pick".to_owned(),
-            x: "roulade".to_owned(),
+            b: String::new(),
+            x: String::new(),
             y: String::new(),
             lb: "kick_left".to_owned(),
             rb: "kick_right".to_owned(),
@@ -224,15 +219,12 @@ impl Default for PadParams {
 
 impl PadParams {
     /// The bindable buttons, in the order a listing should print them.
-    pub const BUTTONS: [&'static str; 6] = ["a", "b", "x", "y", "lb", "rb"];
+    pub const BUTTONS: [&'static str; 3] = ["a", "lb", "rb"];
 
     /// What a button runs, or `None` for a name this build has no button for.
     pub fn skill(&self, button: &str) -> Option<&str> {
         Some(match button {
             "a" => &self.a,
-            "b" => &self.b,
-            "x" => &self.x,
-            "y" => &self.y,
             "lb" => &self.lb,
             "rb" => &self.rb,
             _ => return None,
@@ -243,9 +235,6 @@ impl PadParams {
     pub fn bind(&mut self, button: &str, skill: &str) -> bool {
         let slot = match button {
             "a" => &mut self.a,
-            "b" => &mut self.b,
-            "x" => &mut self.x,
-            "y" => &mut self.y,
             "lb" => &mut self.lb,
             "rb" => &mut self.rb,
             _ => return false,

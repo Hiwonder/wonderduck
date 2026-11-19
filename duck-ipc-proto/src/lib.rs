@@ -2173,6 +2173,9 @@ pub struct HumanControlResult {
 #[serde(rename_all = "snake_case")]
 pub enum MaintenanceAction {
     Acquire,
+    /// Acquire maintenance after a completed partial torque release, with the
+    /// walking control interlock still latched.
+    AcquirePartial,
     /// Stop the walking policy before handing the bus to device-status sampling.
     AcquireStatus,
     /// Mark a status read pending before sending it to the shared bus.
@@ -3394,6 +3397,22 @@ pub struct ImuObservation {
     pub gyro_rad_s: Option<[f64; 3]>,
     pub gravity: Option<[f64; 3]>,
     pub error: Option<String>,
+    /// Optional sensor-frame values sampled separately during a status scan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_sample: Option<RawImuObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RawImuObservation {
+    pub t_ns: u64,
+    pub sequence: u32,
+    pub raw_g: [f64; 3],
+    pub corrected_g: [f64; 3],
+    pub gyro_rad_s: [f64; 3],
+    pub raw_gyro_rad_s: [f64; 3],
+    pub ready: bool,
+    pub accel_calibrated: bool,
+    pub gyro_calibrated: bool,
 }
 
 /// Answer to [`Call::RobotSubscribe`].

@@ -14,25 +14,25 @@ pub fn stop_on_pad_loss(present: bool, owns: bool) -> bool {
 }
 
 #[derive(Default)]
-pub struct Emergency {
+pub struct RestChord {
     start: bool,
     select: bool,
     latched: bool,
-    pending_stop: bool,
+    pending_rest: bool,
 }
 
-pub struct EmergencyAction {
-    pub stop: bool,
+pub struct RestChordAction {
+    pub rest: bool,
     pub suppress: bool,
 }
 
-impl Emergency {
+impl RestChord {
     fn update(&mut self, start: bool, select: bool) {
         self.start = start;
         self.select = select;
         if start && select && !self.latched {
             self.latched = true;
-            self.pending_stop = true;
+            self.pending_rest = true;
         }
     }
 
@@ -44,25 +44,24 @@ impl Emergency {
         }
     }
 
-    pub fn finish(&mut self, start: bool, select: bool) -> EmergencyAction {
+    pub fn finish(&mut self, start: bool, select: bool) -> RestChordAction {
         self.update(start, select);
-        let action = EmergencyAction {
-            stop: self.pending_stop,
+        let action = RestChordAction {
+            rest: self.pending_rest,
             suppress: self.latched,
         };
-        self.pending_stop = false;
+        self.pending_rest = false;
         if !start && !select {
             self.latched = false;
         }
         action
     }
 
-    pub fn disconnected(&mut self) -> bool {
-        let stop = self.pending_stop;
+    pub fn disconnected(&mut self) {
         self.start = false;
         self.select = false;
-        self.pending_stop = false;
-        stop
+        self.pending_rest = false;
+        self.latched = false;
     }
 }
 
@@ -95,7 +94,6 @@ enum State {
     NeutralRequired,
     Armed,
     Owned,
-    Releasing,
 }
 
 pub struct Gate {
@@ -117,7 +115,6 @@ impl Gate {
         match self.state {
             State::NeutralRequired if neutral && !activity => self.state = State::Armed,
             State::Armed if activity => return true,
-            State::Releasing if activity => self.state = State::Owned,
             _ => {}
         }
         false
@@ -133,18 +130,10 @@ impl Gate {
     }
 
     pub fn owns(&self) -> bool {
-        matches!(self.state, State::Owned | State::Releasing)
+        self.state == State::Owned
     }
     pub fn driving(&self) -> bool {
         self.state == State::Owned
-    }
-    pub fn releasing(&self) -> bool {
-        self.state == State::Releasing
-    }
-    pub fn release(&mut self) {
-        if self.owns() {
-            self.state = State::Releasing;
-        }
     }
     pub fn refresh_due(&self, now: Instant) -> bool {
         self.owns()
@@ -165,16 +154,6 @@ impl Gate {
         if result.accepted && result.owner == Some(proto::HumanControlSource::Gamepad) {
             self.refreshed = Some(now);
         } else {
-            self.lost();
-        }
-    }
-    pub fn released(&mut self, result: &proto::HumanControlResult) {
-        if result.accepted {
-            self.state = State::NeutralRequired;
-            self.refreshed = None;
-        } else if result.owner != Some(proto::HumanControlSource::Gamepad)
-            || result.reason.as_deref() != Some("busy")
-        {
             self.lost();
         }
     }

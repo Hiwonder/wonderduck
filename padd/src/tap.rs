@@ -252,23 +252,6 @@ impl Tap {
         self.shared.wake.notify_all();
     }
 
-    /// Does the connected pad have an IMU at all? True as soon as the node is known, before it is
-    /// open — the question "can Y mean IMU head control on this pad" needs answering on the press.
-    pub fn has_imu(&self) -> bool {
-        self.shared.lock().wanted_imu.is_some()
-    }
-
-    /// The pad's attitude, body → world, `w` first. `None` while no IMU is open or before its
-    /// first believable sample.
-    pub fn attitude(&self) -> Option<[f32; 4]> {
-        self.shared
-            .attitude
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .and_then(pad_imu::Imu::quaternion)
-    }
-
     fn want(&self, node: Option<PathBuf>, imu: Option<PathBuf>) {
         let mut state = self.shared.lock();
         if state.wanted == node && state.wanted_imu == imu {

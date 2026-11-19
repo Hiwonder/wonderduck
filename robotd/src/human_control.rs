@@ -61,6 +61,7 @@ struct State {
     last_released: Option<u64>,
     maintenance: Option<Maintenance>,
     emergency_release: bool,
+    emergency_release_complete: bool,
     manual_blockers: HashSet<u64>,
     status_blockers: HashSet<u64>,
     maintenance_transition_blockers: HashSet<u64>,
@@ -82,6 +83,7 @@ struct Maintenance {
     error: Option<String>,
     status_stop: bool,
     status_reads: bool,
+    partial: bool,
     status_pending: Option<(u8, u8, u8)>,
 }
 
@@ -204,11 +206,21 @@ impl<'a> Guard<'a> {
         }
         self.emergency_stop();
         self.state.emergency_release = true;
+        self.state.emergency_release_complete = false;
         Ok(())
     }
 
     pub(crate) fn finish_emergency_release(&mut self) {
         self.state.emergency_release = false;
+        self.state.emergency_release_complete = false;
+    }
+
+    pub(crate) fn mark_emergency_release_unverified(&mut self) {
+        if self.state.emergency_release { self.state.emergency_release_complete = true; }
+    }
+
+    pub(crate) fn emergency_release_completed(&self) -> bool {
+        self.state.emergency_release && self.state.emergency_release_complete
     }
 
     /// Includes both an in-flight release and a failed, unverified release.
@@ -218,6 +230,10 @@ impl<'a> Guard<'a> {
 
     pub(crate) fn maintenance_phase(&self) -> Option<MaintenancePhase> {
         self.state.maintenance.as_ref().map(|maintenance| maintenance.phase)
+    }
+
+    pub(crate) fn partial_maintenance(&self) -> bool {
+        self.state.maintenance.as_ref().is_some_and(|maintenance| maintenance.partial)
     }
 
     /// Whether this connected session holds the active ordinary maintenance lease.
@@ -260,8 +276,19 @@ impl<'a> Guard<'a> {
     }
 
     pub(crate) fn begin_maintenance(&mut self, session: &Session, status_stop: bool) -> Result<(), &'static str> {
+        self.begin_maintenance_inner(session, status_stop, false)
+    }
+
+    pub(crate) fn begin_partial_maintenance(&mut self, session: &Session) -> Result<(), &'static str> {
+        self.begin_maintenance_inner(session, false, true)
+    }
+
+    fn begin_maintenance_inner(&mut self, session: &Session, status_stop: bool, partial: bool) -> Result<(), &'static str> {
         if !session.connected { return Err("disconnected"); }
-        if self.state.emergency_release { return Err("emergency_release_in_progress"); }
+        if self.state.emergency_release && !(partial && self.state.emergency_release_complete) {
+            return Err("emergency_release_in_progress");
+        }
+        if partial && !self.emergency_release_completed() { return Err("partial_release_not_confirmed"); }
         if self.state.maintenance.is_some() { return Err("maintenance_busy"); }
         self.state.lease = None;
         self.state.last_released = None;
@@ -272,6 +299,7 @@ impl<'a> Guard<'a> {
             // Every exclusive bus handoff first follows the normal stop path.
             status_stop: true,
             status_reads: status_stop,
+            partial,
             status_pending: None,
         });
         Ok(())

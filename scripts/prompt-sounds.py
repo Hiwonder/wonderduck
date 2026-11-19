@@ -668,6 +668,9 @@ class PromptService:
                     self.pending_network = self.network.ready.get_nowait()
                 except queue.Empty:
                     pass
+            if (self.pending_network is not None and self.pending_network[1]
+                    and not self.network.automatic_enabled()):
+                self.pending_network = None
             if self.pending_network is not None and now >= self.next_network:
                 self.launch("network", now)
 

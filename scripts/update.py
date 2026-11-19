@@ -35,6 +35,7 @@ TEXT = {
         'no_repo': '未找到设备程序目录，请确认已烧录并配置 WonderDuck 镜像。',
         'dirty': '{} 存在未提交的修改，请先处理后再更新。',
         'fetch': '正在获取源码……',
+        'reload': '正在刷新服务配置……',
         'stop': '正在停止机器人服务……',
         'install': '正在安装更新，请稍候……',
         'start': '正在启动机器人服务……',
@@ -55,6 +56,7 @@ TEXT = {
         'no_repo': 'The device software directory was not found. Use a configured WonderDuck image.',
         'dirty': '{} has uncommitted changes. Resolve them before updating.',
         'fetch': 'Fetching source...',
+        'reload': 'Reloading service configuration...',
         'stop': 'Stopping robot service...',
         'install': 'Installing the update...',
         'start': 'Starting robot service...',
@@ -150,6 +152,11 @@ def install(source, version, text):
                               '--untracked-files=no', '--ignore-submodules=all'], stdout=subprocess.PIPE).stdout
             if status.strip():
                 raise ValueError(text['dirty'].format(label))
+        reload_needed = command(['systemctl', 'show', 'robotd', '-p', 'NeedDaemonReload', '--value'],
+                                stdout=subprocess.PIPE).stdout.strip()
+        if reload_needed == b'yes':
+            print(text['reload'], flush=True)
+            command(['sudo', 'systemctl', 'daemon-reload'])
         print(text['stop'], flush=True)
         command(['sudo', 'systemctl', 'stop', 'robotd'])
         stopped = True
