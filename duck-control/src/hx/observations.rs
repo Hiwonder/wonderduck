@@ -128,13 +128,13 @@ impl HxIo {
         // A missing device must not hide every other device. While the status
         // session still exclusively owns the port, wait for a bounded quiet
         // interval and validate any late reply before starting the next read.
-        self.drain_timed_out_status(id, length)?;
+        let late = self.drain_timed_out_status(id, address, length)?;
         self.port_mut()?.set_timeout(READ_TIMEOUT).map_err(io_error)?;
         self.status_unconfirmed = false;
-        Ok(None)
+        Ok(late)
     }
 
-    fn drain_timed_out_status(&mut self, id: u8, length: u8) -> Result<()> {
+    fn drain_timed_out_status(&mut self, id: u8, address: u8, length: u8) -> Result<Option<StatusFrame>> {
         const QUIET: Duration = Duration::from_millis(500);
         const LIMIT: Duration = Duration::from_secs(3);
         let started = Instant::now();
@@ -165,16 +165,19 @@ impl HxIo {
                     return Err(IoError::Bus("unexpected frame during status drain".into()));
                 }
             } else if now.duration_since(last_data) >= QUIET {
-                if !late.is_empty() {
-                    if late.len() < 6 || late.len() != usize::from(late[3]) + 4
-                        || (late[3] == 2 && late[4] == 0)
-                        || late[2..].iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) != 0xff
-                        || (length == 71 && late[3] != 2 && late[10] != id)
-                    {
-                        return Err(IoError::Bus("invalid or incomplete late status frame".into()));
-                    }
+                if late.is_empty() {
+                    return Ok(None);
                 }
-                return Ok(());
+                if late.len() < 6 || late.len() != usize::from(late[3]) + 4
+                    || (late[3] == 2 && late[4] == 0)
+                    || late[2..].iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) != 0xff
+                    || (address == 0 && length == 71 && late[3] != 2 && late[10] != id)
+                {
+                    return Err(IoError::Bus("invalid or incomplete late status frame".into()));
+                }
+                return Ok(Some(StatusFrame {
+                    id, error: late[4], data: late[5..late.len() - 1].to_vec()
+                }));
             } else {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -229,9 +232,13 @@ impl HxIo {
                 Ok(Some(scan.latest.clone()))
             }
             Ok(None) => {
+                let error = match scan.latest.servos[joint].error.as_deref() {
+                    Some("读取超时" | "未连接") => "未连接",
+                    _ => "读取超时",
+                };
                 scan.latest.servos[joint] = ServoObservation {
                     id, observed_t_ns: Some(stamp), valid: false,
-                    error: Some("读取超时".into()), ..Default::default()
+                    error: Some(error.into()), ..Default::default()
                 };
                 scan.next_joint = joint + 1;
                 Ok(Some(scan.latest.clone()))

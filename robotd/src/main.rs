@@ -3509,7 +3509,7 @@ fn partial_maintenance_ready(observation: &proto::DeviceObservation, now_ns: u64
         if servo.valid {
             if servo.t_ns.is_none() || servo.error.is_some() || servo.torque != Some(0) { return false; }
             available += 1;
-        } else if servo.error.as_deref() == Some("读取超时") {
+        } else if servo.error.as_deref() == Some("未连接") {
             missing += 1;
         } else { return false; }
     }
@@ -3524,7 +3524,7 @@ mod partial_maintenance_tests {
         let servos = duck_control::model::JOINT_IDS.into_iter().map(|id| {
             if id == 34 {
                 proto::ServoObservation { id, observed_t_ns: Some(now), valid: false,
-                    error: Some("读取超时".into()), ..Default::default() }
+                    error: Some("未连接".into()), ..Default::default() }
             } else {
                 proto::ServoObservation { id, t_ns: Some(now), observed_t_ns: Some(now),
                     valid: true, torque: Some(0), ..Default::default() }
@@ -3547,6 +3547,9 @@ mod partial_maintenance_tests {
         state.bus_error = Some("unconfirmed frame".into());
         assert!(!partial_maintenance_ready(&state, now));
         state.bus_error = None;
+        let missing = state.servos.iter_mut().find(|servo| servo.id == 34).unwrap();
+        missing.error = Some("读取超时".into());
+        assert!(!partial_maintenance_ready(&state, now));
         state.servos.iter_mut().find(|servo| servo.id == 34).unwrap().error = Some("invalid frame".into());
         assert!(!partial_maintenance_ready(&state, now));
     }

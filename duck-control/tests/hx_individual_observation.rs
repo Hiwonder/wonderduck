@@ -148,12 +148,18 @@ fn missing_servo_does_not_hide_other_servos_or_raw_imu() {
     let data = bus.scan().unwrap();
     assert!(data.servos.iter().filter(|servo| servo.id != 34).all(|servo| servo.valid));
     assert!(!data.servos.iter().find(|servo| servo.id == 34).unwrap().valid);
+    assert_eq!(data.servos.iter().find(|servo| servo.id == 34).unwrap().error.as_deref(), Some("读取超时"));
     assert!(data.imu.valid);
     let raw = data.imu.raw_sample.unwrap();
     assert_eq!(raw.sequence, 42);
     assert!((raw.raw_g[0] - 0.2).abs() < 0.0001);
     assert!((raw.raw_gyro_rad_s[1] + 0.05).abs() < 0.0001);
     assert!(raw.ready && raw.accel_calibrated && raw.gyro_calibrated);
+    let second = bus.scan().unwrap();
+    assert_eq!(second.servos.iter().find(|servo| servo.id == 34).unwrap().error.as_deref(), Some("未连接"));
+    bus.state.lock().unwrap().missing_servo = None;
+    let reconnected = bus.scan().unwrap();
+    assert!(reconnected.servos.iter().all(|servo| servo.valid && servo.error.is_none()));
 }
 
 #[test]
