@@ -26,6 +26,7 @@
 //! Left stick      forward / back / strafe
 //! Right stick     turn left / right
 //! Start           short press initializes and enables the policy
+//! Start, 5 s      switch between drive and drive + head control
 //! Start + Select  request rest
 //! ```
 //!
@@ -132,10 +133,6 @@ mod tap {
 
         pub fn imu_control(&self, _on: bool) {}
 
-        pub fn has_imu(&self) -> bool {
-            false
-        }
-
         pub fn attitude(&self) -> Option<[f32; 4]> {
             None
         }
@@ -219,89 +216,98 @@ struct Args {
 /// switches a pad on and is not a background load.
 const IDLE_POLL: Duration = Duration::from_millis(500);
 
-/// Longer Start holds do nothing; only a short release requests initialization.
 const START_TAP_MAX: Duration = Duration::from_millis(1500);
+const START_MODE_HOLD: Duration = Duration::from_secs(5);
 
-/// A button that does different things depending on how long it is held.
-///
-/// Each threshold fires once, on the tick the hold crosses it.
-/// A release that crossed no threshold is a [`HoldAction::Tap`]; the release after a hold that
-/// did fire says nothing, because the thumb coming off is not a second request.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct HoldButton {
-    /// When the current hold began. `None` between presses.
+#[derive(Default)]
+struct StartButton {
     held_since: Option<Instant>,
-    /// How many thresholds this hold has crossed.
-    fired: usize,
-    /// The pad went away during a hold that had already fired. Whatever is still held when it
-    /// comes back is the tail of that hold, and does nothing until the release.
-    spent: bool,
+    mode_toggled: bool,
 }
 
-/// What a [`HoldButton`] asks for this tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HoldAction {
-    Nothing,
-    /// Pressed and let go before the first threshold.
-    Tap,
-    /// The hold just crossed this threshold, by index.
-    Reached(usize),
-    /// Let go after a hold whose furthest threshold was this one, by index. For a button whose
-    /// action depends on where the hold stopped, which is only known at the release.
-    ReleasedAfter(usize),
+#[derive(Debug, PartialEq, Eq)]
+enum StartAction {
+    None,
+    Initialize,
+    ToggleHeadDrive,
 }
 
-impl HoldButton {
-    /// One tick: is the button down now, and did it come up since the last tick.
-    ///
-    /// `released` is the edge from the event queue, because a press and release inside one tick
-    /// leaves `pressed` false on both sides and would otherwise be a tap nobody saw.
-    fn tick(
-        &mut self,
-        pressed: bool,
-        released: bool,
-        now: Instant,
-        thresholds: &[Duration],
-    ) -> HoldAction {
+impl StartButton {
+    fn update(&mut self, pressed: bool, tapped_this_tick: bool, now: Instant) -> StartAction {
         if pressed {
             let since = *self.held_since.get_or_insert(now);
-            if !self.spent
-                && let Some(&next) = thresholds.get(self.fired)
-                && now.duration_since(since) >= next
-            {
-                self.fired += 1;
-                return HoldAction::Reached(self.fired - 1);
+            if !self.mode_toggled && now.saturating_duration_since(since) >= START_MODE_HOLD {
+                self.mode_toggled = true;
+                return StartAction::ToggleHeadDrive;
             }
-            return HoldAction::Nothing;
+            return StartAction::None;
         }
-        let was_held = released || self.held_since.is_some();
-        let exceeded = self.held_since.is_some_and(|since| {
-            thresholds.first().is_some_and(|limit| now.saturating_duration_since(since) >= *limit)
-        });
-        let (fired, spent) = (self.fired, self.spent);
-        *self = Self::default();
-        match (fired, spent) {
-            // The tail of a hold cut by a dropout says nothing — see `reset`.
-            (_, true) => HoldAction::Nothing,
-            (0, false) if released && !exceeded => HoldAction::Tap,
-            (0, false) => HoldAction::Nothing,
-            (n, false) if was_held => HoldAction::ReleasedAfter(n - 1),
-            (_, false) => HoldAction::Nothing,
+
+        let elapsed = self
+            .held_since
+            .take()
+            .map(|since| now.saturating_duration_since(since));
+        if std::mem::take(&mut self.mode_toggled) {
+            return StartAction::None;
+        }
+        match elapsed {
+            Some(duration) if duration >= START_MODE_HOLD => StartAction::ToggleHeadDrive,
+            Some(duration) if duration < START_TAP_MAX => StartAction::Initialize,
+            None if tapped_this_tick => StartAction::Initialize,
+            _ => StartAction::None,
         }
     }
+}
 
-    /// Forget a hold in flight. Called when the pad goes away: the hold's start was measured
-    /// against *that* pad's button, and carrying it onto the next pad would turn a button still
-    /// held across a long dropout into its longest action on the first tick back.
-    ///
-    /// A hold that already fired is marked spent rather than forgotten, because what it did is a
-    /// fact about the robot rather than about the pad: the release that follows must stay silent,
-    /// and the rest of the hold must not reach the next threshold from a fresh start.
-    fn reset(&mut self) {
-        self.held_since = None;
-        if self.fired > 0 {
-            self.spent = true;
-        }
+#[cfg(test)]
+mod start_button_tests {
+    use super::*;
+
+    #[test]
+    fn long_hold_toggles_once_until_released() {
+        let now = Instant::now();
+        let mut start = StartButton::default();
+        assert_eq!(start.update(true, false, now), StartAction::None);
+        assert_eq!(
+            start.update(true, false, now + START_MODE_HOLD - Duration::from_millis(1)),
+            StartAction::None
+        );
+        assert_eq!(
+            start.update(true, false, now + START_MODE_HOLD),
+            StartAction::ToggleHeadDrive
+        );
+
+        let later = now + START_MODE_HOLD * 2;
+        assert_eq!(start.update(true, false, later), StartAction::None);
+        assert_eq!(start.update(false, false, later), StartAction::None);
+        assert_eq!(start.update(true, false, later), StartAction::None);
+        assert_eq!(
+            start.update(true, false, later + START_MODE_HOLD),
+            StartAction::ToggleHeadDrive
+        );
+    }
+
+    #[test]
+    fn only_short_releases_initialize_and_canceled_holds_are_ignored() {
+        let now = Instant::now();
+        let mut start = StartButton::default();
+        assert_eq!(start.update(false, true, now), StartAction::Initialize);
+        assert_eq!(start.update(true, false, now), StartAction::None);
+        assert_eq!(
+            start.update(false, false, now + Duration::from_millis(200)),
+            StartAction::Initialize
+        );
+        assert_eq!(start.update(true, false, now), StartAction::None);
+        assert_eq!(
+            start.update(false, false, now + START_TAP_MAX),
+            StartAction::None
+        );
+        assert_eq!(start.update(true, false, now), StartAction::None);
+        start = StartButton::default();
+        assert_eq!(
+            start.update(false, false, now + START_MODE_HOLD),
+            StartAction::None
+        );
     }
 }
 
@@ -399,7 +405,11 @@ fn walking_limits(
 /// away, and the next read a second later gets the finished one.
 fn read_bindings(
     path: &Path,
-) -> (robotd_params::PadParams, robotd_params::PadDriveParams) {
+) -> (
+    robotd_params::PadParams,
+    robotd_params::PadDriveParams,
+    robotd_params::PadImuHeadControlParams,
+) {
     match robotd_params::Params::load(path, false) {
         Ok(params) => {
             let pad = params.pad;
@@ -410,7 +420,7 @@ fn read_bindings(
                 vyaw = ?(drive.vyaw_min, drive.vyaw_max),
                 "button bindings"
             );
-            (pad, drive)
+            (pad, drive, params.pad_imu_head_control)
         }
         Err(e) => {
             tracing::warn!(
@@ -421,8 +431,21 @@ fn read_bindings(
             (
                 robotd_params::PadParams::default(),
                 robotd_params::PadDriveParams::default(),
+                robotd_params::PadImuHeadControlParams::default(),
             )
         }
+    }
+}
+
+/// Map the controller's attitude relative to its neutral pose to head joint angles.
+fn head_from_pad(relative: [f32; 4], gain: f64, max_head: f64) -> proto::HeadParams {
+    let [pitch, roll, yaw] = pad_imu::euler_deg(relative);
+    let angle = |degrees: f32| (f64::from(degrees).to_radians() * gain).clamp(-max_head, max_head);
+    proto::HeadParams {
+        head_pitch: angle(pitch),
+        head_yaw: angle(yaw),
+        head_roll: -angle(roll),
+        ..proto::HeadParams::default()
     }
 }
 
@@ -442,7 +465,7 @@ fn is_active_button(button: Button) -> bool {
     )
 }
 
-fn pad_neutral(pad: &gilrs::Gamepad<'_>, deadzone: f64) -> bool {
+fn pad_neutral(pad: &gilrs::Gamepad<'_>, deadzone: f64, head_drive: bool) -> bool {
     let axes = [
         Axis::LeftStickX,
         Axis::LeftStickY,
@@ -462,10 +485,13 @@ fn pad_neutral(pad: &gilrs::Gamepad<'_>, deadzone: f64) -> bool {
         Button::DPadLeft,
         Button::DPadRight,
     ];
-    axes.iter().all(|axis| {
-        let value = (pad.value(*axis) as f64).abs();
-        value == 0.0 || value < deadzone
-    }) && buttons.iter().all(|button| !pad.is_pressed(*button))
+    axes.into_iter()
+        .chain(head_drive.then_some(Axis::RightStickY))
+        .all(|axis| {
+            let value = (pad.value(axis) as f64).abs();
+            value == 0.0 || value < deadzone
+        })
+        && buttons.iter().all(|button| !pad.is_pressed(*button))
         && [Button::LeftTrigger2]
             .iter()
             .all(|button| {
@@ -665,14 +691,14 @@ fn run_session(
         hz = args.hz,
         roller,
         "driving — sticks and D-pad move, X/B turn, Y ground pick, A sit, LB/RB kicks, \
-         L2 mouth; Start initializes and enables, Start + Select rests"
+         L2 mouth; Start initializes and enables, hold Start for 5 s to switch head control, Start + Select rests"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
     // The button bindings, read once like every other daemon reads its config. A file that will
     // not parse is not a reason to leave somebody without a pad: the default mapping is the
     // fallback, and the reason is logged.
-    let (mut bindings, mut drive) = read_bindings(&args.config);
+    let (mut bindings, mut drive, mut imu_head) = read_bindings(&args.config);
     // When the file was last written, so a change is picked up without a restart.
     let mut bindings_at = config_mtime(&args.config);
     let mut bindings_checked = Instant::now();
@@ -681,7 +707,10 @@ fn run_session(
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
     let mut active_pad_id = None;
-    let mut start = HoldButton::default();
+    let mut start = StartButton::default();
+    let mut head_drive = false;
+    let mut imu_reference = None;
+    let mut center_sticks = false;
     let mut rest_rearm_required = false;
     let mut pick_mouth = PickMouth::default();
     // The continuous intents, and the buffer this tick's are built in. Both live across
@@ -703,7 +732,7 @@ fn run_session(
             let now = config_mtime(&args.config);
             if now != bindings_at {
                 bindings_at = now;
-                (bindings, drive) = read_bindings(&args.config);
+                (bindings, drive, imu_head) = read_bindings(&args.config);
                 tracing::warn!("button bindings reloaded");
             }
             match ask_roller(&mut stream, &mut next_id) {
@@ -738,6 +767,7 @@ fn run_session(
         // Which bindable buttons went down this tick, by their config name. A list rather than
         // a flag apiece, because what each one runs is config now and this loop no longer knows.
         let mut pressed: Vec<&'static str> = Vec::new();
+        let mut start_pressed = false;
         let mut start_released = false;
         let mut button_activity = false;
         let mut pad_disconnected = false;
@@ -757,12 +787,13 @@ fn run_session(
                 _ => {}
             }
             match event.event {
-                // Start activates on a short release.
+                // Retain both edges when a tap starts and ends between polls.
                 gilrs::EventType::ButtonReleased(Button::Start, _) => start_released = true,
                 gilrs::EventType::ButtonPressed(button, _) => match button {
                     // gilrs names the *bumpers* `LeftTrigger`/`RightTrigger`; the analog
                     // triggers are `LeftTrigger2`/`RightTrigger2`. Getting that backwards binds
                     // a skill to a control nobody presses.
+                    Button::Start => start_pressed = true,
                     Button::South => pressed.push("a"),
                     Button::North => pressed.push("y"),
                     Button::LeftTrigger => pressed.push("lb"),
@@ -821,7 +852,8 @@ fn run_session(
                 driving = false;
                 active_pad_id = None;
             }
-            start.reset();
+            start = StartButton::default();
+            imu_reference = None;
             buttons_were_driving = false;
             rest_rearm_required = false;
             if let Some(tap) = tap.as_ref() {
@@ -890,12 +922,13 @@ fn run_session(
                 }
             }
         }
-        if chord_action.suppress || (rest_rearm_required && !pad_neutral(&pad, args.deadzone)) {
+        if chord_action.suppress || (rest_rearm_required && !pad_neutral(&pad, args.deadzone, head_drive)) {
             if let Some(precision) = precision.as_mut() {
                 precision.reset();
                 precision.awaiting_completion = false;
             }
-            start = HoldButton::default();
+            start = StartButton::default();
+            imu_reference = None;
             buttons_were_driving = false;
             if let Err(error) = maintain_control(&mut stream, &mut next_id, &mut gate) {
                 tracing::error!(%error, "control refresh during rest failed");
@@ -916,7 +949,7 @@ fn run_session(
         }
         rest_rearm_required = false;
 
-        let neutral = pad_neutral(&pad, args.deadzone);
+        let neutral = pad_neutral(&pad, args.deadzone, head_drive);
         let activity = button_activity || !neutral;
         gate.expire(Instant::now());
         if gate.observe(neutral, activity) {
@@ -952,7 +985,8 @@ fn run_session(
                     precision.gesture.step(now, [0.0; 3], [0.0; 3]);
                 }
             }
-            start = HoldButton::default();
+            start = StartButton::default();
+            imu_reference = None;
             buttons_were_driving = false;
             if let Some(tap) = tap.as_ref() {
                 tap.watch(&pad);
@@ -980,16 +1014,37 @@ fn run_session(
         // Every tick rather than on the transition above: a pad that drops and comes back between
         // two ticks never clears `driving`, and it comes back as a different event node often
         // enough that a tap following the old one would report the rest of the session as silence.
-        if let Some(tap) = tap.as_ref() {
-            tap.watch(&pad);
-            tap.imu_control(false);
+        let start_action = start.update(
+            pad.is_pressed(Button::Start),
+            start_pressed && start_released,
+            tick,
+        );
+        let mode_changed = start_action == StartAction::ToggleHeadDrive;
+        if mode_changed {
+            if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true) {
+                tracing::error!(%error, "precision cancellation on mode change failed");
+                return std::process::ExitCode::FAILURE;
+            }
+            head_drive = !head_drive;
+            imu_reference = None;
+            center_sticks = true;
+            tracing::info!(head_drive, "Start held five seconds — gamepad mode switched");
         }
 
-        // A short Start press initializes if needed, then enables the policy. Never toggle it off.
-        if matches!(
-            start.tick(pad.is_pressed(Button::Start), start_released, tick, &[START_TAP_MAX]),
-            HoldAction::Tap
-        ) {
+        let attitude = tap.and_then(|tap| {
+            tap.watch(&pad);
+            tap.imu_control(head_drive && imu_head.enabled);
+            if head_drive && imu_head.enabled { tap.attitude() } else { None }
+        });
+        if attitude.is_none() {
+            imu_reference = None;
+        }
+        let imu_head_pose = attitude.map(|attitude| {
+            let reference = *imu_reference.get_or_insert(attitude);
+            head_from_pad(pad_imu::relative(reference, attitude), imu_head.gain, args.max_head)
+        });
+
+        if start_action == StartAction::Initialize {
             match explicit_low_voltage_rearm(&mut stream, &mut next_id, &mut gate) {
                 Ok(true) => {}, Ok(false) => continue,
                 Err(error) => { tracing::warn!(%error, "low-voltage recovery result unknown; reconnecting and requiring neutral controls"); return std::process::ExitCode::FAILURE; }
@@ -1053,9 +1108,17 @@ fn run_session(
             let v = v as f64;
             if v.abs() < args.deadzone { 0.0 } else { v }
         };
-        let left_x = deadzone(pad.value(Axis::LeftStickX));
-        let left_y = deadzone(pad.value(Axis::LeftStickY));
-        let right_x = deadzone(pad.value(Axis::RightStickX));
+        let axes = [Axis::LeftStickY, Axis::LeftStickX, Axis::RightStickX, Axis::RightStickY]
+            .map(|axis| deadzone(pad.value(axis)));
+        if axes == [0.0; 4] {
+            center_sticks = false;
+        }
+        let [left_y, left_x, right_x, right_y] = if center_sticks { [0.0; 4] } else { axes };
+        let (strafe, turn) = if head_drive && imu_head_pose.is_none() {
+            (0.0, left_x)
+        } else {
+            (left_x, right_x)
+        };
 
         // An accepted pick opens and closes the mouth; L2 can take over manually.
         let lt = pad.button_data(Button::LeftTrigger2).map(|d| d.value()).unwrap_or(0.0) as f64;
@@ -1092,21 +1155,32 @@ fn run_session(
 
         frame.clear();
         frame.push(proto::Call::RobotMove(digital.apply(
-            limits.walk(left_y, left_x, right_x),
+            limits.walk(left_y, strafe, turn),
             &walk_drive,
             roller,
         )));
 
+        if head_drive {
+            let head = imu_head_pose.unwrap_or(proto::HeadParams {
+                head_pitch: -right_y * args.max_head,
+                head_yaw: -right_x * args.max_head,
+                ..proto::HeadParams::default()
+            });
+            frame.push(proto::Call::RobotHead(head));
+        } else if mode_changed {
+            frame.push(proto::Call::RobotHead(proto::HeadParams::default()));
+        }
+
         let mut precision_start = None;
-        let mut force_frame = false;
+        let mut force_frame = mode_changed;
         // Fixed-speed buttons are held commands, not precision gestures. Cancel any outstanding
         // gesture on entry and bypass the gesture scheduler while a movement button is held.
         if precision.is_some() && !buttons_driving {
             let (mapping, axes) = precision_axes(
                 roller,
                 left_y,
-                left_x,
-                right_x,
+                strafe,
+                turn,
             );
             let mapping_changed = precision.as_ref().is_some_and(|precision| {
                 precision
@@ -1153,11 +1227,11 @@ fn run_session(
                 };
                 precision_start = out.request;
                 frame[0] = proto::Call::RobotMove(out.movement);
-                force_frame = precision.awaiting_completion
+                force_frame |= precision.awaiting_completion
                     || out.replayed
                     || precision_start.is_some();
             } else {
-                force_frame = precision.awaiting_completion;
+                force_frame |= precision.awaiting_completion;
             }
         }
 

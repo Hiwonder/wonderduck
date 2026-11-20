@@ -91,6 +91,14 @@ struct Args {
     #[arg(long, default_value = "/dev/video0")]
     camera_device: String,
 
+    /// Use a standard V4L2 camera with GStreamer format conversion.
+    #[arg(long)]
+    generic_camera: bool,
+
+    /// Capture a CSI camera through libcamera.
+    #[arg(long, conflicts_with = "generic_camera")]
+    libcamera: bool,
+
     /// Sensor exposure in lines (~19 µs each) and analogue gain, where 256 is 1x.
     ///
     /// The starting values only: with the driver's boot values the picture is black rather than
@@ -400,6 +408,13 @@ fn main() -> ExitCode {
                         device: args.camera_device.clone(),
                         exposure: args.exposure,
                         analogue_gain: args.analogue_gain,
+                        backend: if args.libcamera {
+                            mediad::pipeline::CameraBackend::Libcamera
+                        } else if args.generic_camera {
+                            mediad::pipeline::CameraBackend::V4l2
+                        } else {
+                            mediad::pipeline::CameraBackend::Rockchip
+                        },
                     })
                 }
                 robotd_params::MediaSource::Test => mediad::pipeline::Source::Test,
@@ -452,19 +467,6 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        let frame_source = frames.clone();
-        // The mount angle every frame header carries — and zero when the pipeline was asked to
-        // flip, for the detector's sampler and the JPEG streamer's reason: those pixels arrive
-        // upright already, and turning them twice is a picture on its side with nothing to say why.
-        let frame_rotate = if args.flip_in_pipeline { 0 } else { rotate };
-        tokio::spawn(async move {
-            let _lock = frame_lock;
-            if let Err(error) = mediad::frame::serve(frame_listener, frame_source, frame_rotate).await
-            {
-                tracing::error!(error = %format!("{error:#}"), "media.frame endpoint stopped");
-            }
-        });
-
         // After the pipeline, because it meters the pipeline's own frames — and only with a real
         // camera, since a test pattern has no sensor to write and the loop would spend the daemon's
         // life reporting that it cannot.
@@ -474,7 +476,7 @@ fn main() -> ExitCode {
         // V4L2 controls through `ioctl`, so it exists only where a real camera can. Nothing else
         // in this function cares: the other two sources have no sensor to meter.
         #[cfg(target_os = "linux")]
-        let _exposure = match (&source, args.no_auto_exposure) {
+        let _exposure = match (&source, args.no_auto_exposure || args.generic_camera || args.libcamera) {
             (mediad::pipeline::Source::Camera(camera), false) => Some(mediad::exposure::spawn(
                 camera.device.clone(),
                 frames.clone(),
@@ -571,6 +573,24 @@ fn main() -> ExitCode {
             rotate,
             intrinsics,
         };
+
+        let frame_source = frames.clone();
+        let mut frame_video = video.clone();
+        if args.flip_in_pipeline {
+            frame_video.rotate = 0;
+            if matches!(rotate, 90 | 270) {
+                (frame_video.width, frame_video.height) = (height, width);
+            }
+            if rotate != 0 {
+                frame_video.intrinsics = None;
+            }
+        }
+        tokio::spawn(async move {
+            let _lock = frame_lock;
+            if let Err(error) = mediad::frame::serve(frame_listener, frame_source, frame_video).await {
+                tracing::error!(error = %format!("{error:#}"), "media.frame endpoint stopped");
+            }
+        });
 
         // Frames out to a WebSocket this robot dials, when something asks for them. Built here
         // because it needs the tee — and given the same `turn` the detector's sampler gets, for

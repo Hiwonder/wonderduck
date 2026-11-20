@@ -72,6 +72,30 @@ pub struct FallRecovery {
     standing: FallPredictor,
 }
 
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+
+    #[test]
+    fn recovery_waits_for_a_full_second_of_fresh_upright_samples() {
+        let mut recovery = FallRecovery::new();
+        let period = Duration::from_millis(20);
+        let upright = ImuData::default();
+
+        assert_eq!(recovery.observe(false, None, period), RecoveryState::Normal);
+        assert_eq!(recovery.observe(true, Some(&upright), period), RecoveryState::Paused);
+        for _ in 0..49 {
+            assert_eq!(recovery.observe(false, Some(&upright), period), RecoveryState::Paused);
+        }
+        assert_eq!(recovery.observe(false, None, period), RecoveryState::Paused);
+        for _ in 0..49 {
+            assert_eq!(recovery.observe(false, Some(&upright), period), RecoveryState::Paused);
+        }
+        assert_eq!(recovery.observe(false, Some(&upright), period), RecoveryState::Resumed);
+        assert_eq!(recovery.observe(false, Some(&upright), period), RecoveryState::Normal);
+    }
+}
+
 impl FallRecovery {
     pub fn new() -> Self {
         Self {

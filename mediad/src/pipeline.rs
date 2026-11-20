@@ -228,6 +228,14 @@ pub struct Camera {
     pub device: String,
     pub exposure: u32,
     pub analogue_gain: u32,
+    pub backend: CameraBackend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CameraBackend {
+    Rockchip,
+    V4l2,
+    Libcamera,
 }
 
 /// One raw frame off the tee, as the last one seen.
@@ -440,6 +448,8 @@ pub fn start(
             src.set_property("is-live", true);
             (src, target_rate)
         }
+        #[cfg(target_os = "linux")]
+        Source::Camera(camera) if camera.backend != CameraBackend::Rockchip => (generic_camera_source(camera)?, target_rate),
         #[cfg(target_os = "linux")]
         Source::Camera(camera) => {
             let src = camera_source(camera, fps)?;
@@ -1351,6 +1361,21 @@ fn camera_framerate(
     let rate = select_capture_rate(&queried?, target)?;
     tracing::info!(%rate, %target, "selected camera framerate");
     Ok(rate)
+}
+
+#[cfg(target_os = "linux")]
+fn generic_camera_source(camera: &Camera) -> Result<gst::Element> {
+    // Keep the same raw output contract for preview, color detection and object detection.
+    let pipeline = match camera.backend {
+        CameraBackend::Libcamera => "libcamerasrc ! videoconvertscale ! videorate drop-only=true",
+        _ => "v4l2src name=capture ! decodebin ! videoconvertscale ! videorate drop-only=true",
+    };
+    let source = gst::parse::bin_from_description(pipeline, true)
+        .context("cannot build the camera capture pipeline")?;
+    if let Some(capture) = source.by_name("capture") {
+        capture.set_property("device", &camera.device);
+    }
+    Ok(source.upcast())
 }
 
 /// The head camera as a `v4l2src`, with the one adjustment this driver needs.

@@ -472,7 +472,7 @@ mode = "walk"
 # pinned to a 1920x1080 mode that runs at 30 and the ISP scales down from it, so 1080p30 asks for
 # no scaling at all — what is unmeasured is whether the capture path and the encoder hold 30 fps
 # at 2.25x the pixels. A rung that does not hold runs slower rather than failing.
-# quality = "720p30"
+quality = "360p30"
 
 # Starting video bitrate, bits per second. Unset follows the quality — 4 Mb/s at 1080p30,
 # 2 Mb/s at 720p30, 1 Mb/s at 720p15, 800 kb/s at 360p30 — which is what almost every robot

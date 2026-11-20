@@ -2437,9 +2437,8 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
             }
         };
         let now = Instant::now();
-        state.low_voltage.observe_recovery(sample, now, state.low_voltage_lock.requires_rearm());
         if let Some(voltage) = sample { state.battery_v.store(voltage.to_bits(), Ordering::Relaxed); }
-        let ready = state.low_voltage_lock.observe_recovery(sample, now);
+        state.low_voltage_lock.observe_recovery(sample, now);
         if state.low_voltage_lock.locked() && admitted {
             // A new low or missing sample invalidates a previously offered
             // rearm before the bus is handed back to normal startup.
@@ -2449,9 +2448,22 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
             clear_human_intents(intents);
             intents.set_enabled(false);
             let _ = intents.take_power_request();
+            if let Err(error) = state.low_voltage_lock.trip() {
+                tracing::error!(%error, "cannot restore the persistent low-voltage lock");
+                state.status_bus_fault.store(true, Ordering::Release);
+                return false;
+            }
             admitted = false;
         }
-        if ready && !admitted {
+        if !admitted && !state.low_voltage_lock.locked() && state.low_voltage_lock.requires_rearm()
+            && let Err(error) = state.low_voltage_lock.mark_recovered()
+        {
+            state.low_voltage.observe_recovery(sample, now, true);
+            tracing::error!(%error, "cannot persist recovered voltage; startup remains blocked");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        }
+        if !admitted && !state.low_voltage_lock.locked() && state.low_voltage_lock.requires_rearm() {
             // No request received before this point may run afterwards.
             let mut guard = state.human_control.lock();
             guard.emergency_stop();
@@ -2483,6 +2495,7 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
             }
             admitted = false;
         }
+        state.low_voltage.observe_recovery(sample, now, !admitted);
         if admitted && !state.low_voltage_lock.requires_rearm()
             && sample.is_some_and(|v| v >= low_voltage_lock::RECOVER_VOLTAGE)
         {
@@ -4806,7 +4819,7 @@ async fn control_loop<T: RobotIo>(
     let mut coordinated_previous_phase = None;
     let mut coordinated_unwritten_sit = false;
     let mut maze_controller: Option<(u64, maze::Maze)> = None;
-    let mut maze_recovery: Option<(u64, maze::FallRecovery)> = None;
+    let mut autonomous_fall_recovery = maze::FallRecovery::new();
     let mut maze_last_head = 0.0;
     let mut maze_previous_phase = None;
     let mut body_ema = [0.0f64; 3];
@@ -5673,6 +5686,18 @@ async fn control_loop<T: RobotIo>(
         let mut maze_head = None;
         let mut maze_immediate_stop = false;
         let mut maze_wait_reason = None;
+        let autonomous_ready = snapshot.enabled && was_driving && bringup == Bringup::Ready
+            && safety.imu_ready() && !powered_off && !snapshot.pose.active
+            && shutdown_sit.is_none() && shutdown_rest.is_none()
+            && mode_change.is_none() && pending_swap.is_none()
+            && state.exit_sit.load(Ordering::Acquire) == 0
+            && snapshot.stop_generation == previous_stop_generation
+            && controller.as_ref().is_some_and(|controller| !controller.busy() && !controller.is_sitting());
+        let recovery_imu = fresh.as_ref().filter(|_| autonomous_ready).map(|sensors| &sensors.imu);
+        let autonomous_recovery = autonomous_fall_recovery.observe(
+            safety.fallen() || limp_fall != LimpFall::Idle, recovery_imu, period,
+        );
+        let autonomous_paused = autonomous_recovery == maze::RecoveryState::Paused;
         if let Some(maze) = snapshot.maze {
             let params = maze.params;
             let settings = maze::Settings {
@@ -5686,36 +5711,30 @@ async fn control_loop<T: RobotIo>(
                 linear_speed: params.linear_speed,
                 angular_speed: params.angular_speed,
             };
-            let unavailable = !snapshot.enabled || shutdown_sit.is_some() || snapshot.pose.active
-                || controller.as_ref().is_none_or(|controller| controller.busy() || controller.is_sitting());
+            let unavailable = !snapshot.enabled || shutdown_sit.is_some() || shutdown_rest.is_some()
+                || snapshot.pose.active || powered_off || state.exit_sit.load(Ordering::Acquire) != 0
+                || (!autonomous_paused && controller.as_ref()
+                    .is_none_or(|controller| controller.busy() || controller.is_sitting()));
             if unavailable {
                 intents.cancel_maze();
                 maze_controller = None;
-                maze_recovery = None;
+                requested.twist = [0.0; 3];
+                maze_immediate_stop = true;
+            } else if autonomous_paused {
+                // The standing controller can be busy getting up. Keep the
+                // maze intent and restart its scan after standing is stable.
+                maze_wait_reason = Some("fall_recovery");
                 requested.twist = [0.0; 3];
                 maze_immediate_stop = true;
             } else {
-                if maze_recovery.as_ref().is_none_or(|(sequence, _)| *sequence != maze.sequence) {
-                    maze_recovery = Some((maze.sequence, maze::FallRecovery::new()));
-                }
-                let ready = was_driving && bringup == Bringup::Ready && safety.imu_ready()
-                    && !powered_off && snapshot.stop_generation == previous_stop_generation;
-                let recovery_imu = fresh.as_ref().filter(|sensors| ready && sensors.positions[7].is_finite())
-                    .map(|sensors| &sensors.imu);
-                let recovery = maze_recovery.as_mut().expect("maze recovery created").1.observe(
-                    safety.fallen() || limp_fall != LimpFall::Idle, recovery_imu, period,
-                );
-                if recovery == maze::RecoveryState::Paused {
-                    maze_wait_reason = Some("fall_recovery");
-                    requested.twist = [0.0; 3];
-                    maze_immediate_stop = true;
-                } else if let Some(sensors) = sensors.as_ref().filter(|sensors| sensors.positions[7].is_finite()) {
+                let ready = autonomous_ready;
+                if let Some(sensors) = sensors.as_ref().filter(|sensors| sensors.positions[7].is_finite()) {
                     maze_last_head = sensors.positions[7];
                     if maze_controller.as_ref().is_none_or(|(sequence, _)| *sequence != maze.sequence) {
                         maze_controller = Some((maze.sequence, maze::Maze::new(sensors.positions[7])));
                     }
                     let controller = &mut maze_controller.as_mut().expect("maze created").1;
-                    if recovery == maze::RecoveryState::Resumed {
+                    if autonomous_recovery == maze::RecoveryState::Resumed {
                         controller.resume_after_fall(sensors.positions[7]);
                     }
                     let reading = if ready && fresh.is_some() {
@@ -5745,12 +5764,9 @@ async fn control_loop<T: RobotIo>(
                     maze_immediate_stop = true;
                 }
             }
-        } else {
-            maze_recovery = None;
-            if maze_controller.take().is_some() {
-                requested.twist = [0.0; 3];
-                maze_immediate_stop = true;
-            }
+        } else if maze_controller.take().is_some() {
+            requested.twist = [0.0; 3];
+            maze_immediate_stop = true;
         }
         let phase = if maze_wait_reason == Some("fall_recovery") {
             Some("fall_recovery")
@@ -5791,14 +5807,9 @@ async fn control_loop<T: RobotIo>(
             {
                 controller.release_completed_roll();
             }
-            let eligible = snapshot.enabled && was_driving && !safety.fallen()
-                && !snapshot.pose.active && bringup == Bringup::Ready && fresh.is_some()
-                && shutdown_sit.is_none() && shutdown_rest.is_none()
-                && state.exit_sit.load(Ordering::Acquire) == 0 && !powered_off
-                && mode_change.is_none() && pending_swap.is_none() && limp_fall == LimpFall::Idle
-                && snapshot.stop_generation == previous_stop_generation
-                && controller.as_ref().is_some_and(|controller| !controller.busy() && !controller.is_sitting()
-                    && (!coordinated_tracker.arrival_action_running() || !controller.scripted_active()));
+            let eligible = autonomous_ready && !autonomous_paused && fresh.is_some()
+                && controller.as_ref().is_some_and(|controller|
+                    !coordinated_tracker.arrival_action_running() || !controller.scripted_active());
             let paused = !tracking.fresh || tracking.params.camera.is_none();
             coordinated_eligible = eligible && !paused;
             if paused != coordinated_paused {
@@ -5975,7 +5986,7 @@ async fn control_loop<T: RobotIo>(
                 target_follow_stability.reset();
                 target_head_rate.reset();
                 let arrival_action_owns_motion = coordinated_tracker.arrival_action_running()
-                    && snapshot.enabled && limp_fall == LimpFall::Idle
+                    && snapshot.enabled && !autonomous_paused && limp_fall == LimpFall::Idle
                     && !snapshot.pose.active && bringup == Bringup::Ready
                     && shutdown_sit.is_none() && shutdown_rest.is_none() && !powered_off
                     && state.exit_sit.load(Ordering::Acquire) == 0
@@ -7998,7 +8009,7 @@ async fn control_loop<T: RobotIo>(
         if !head_available && snapshot.coordinated_tracking.is_some() {
             target_head_tracker.reset();
             let arrival_action_owns_motion = coordinated_tracker.arrival_action_running()
-                && snapshot.enabled && !in_limp_fall && !snapshot.pose.active
+                && snapshot.enabled && !autonomous_paused && !in_limp_fall && !snapshot.pose.active
                 && shutdown_sit.is_none() && shutdown_rest.is_none() && !powered_off
                 && state.exit_sit.load(Ordering::Acquire) == 0 && bringup == Bringup::Ready
                 && mode_change.is_none() && pending_swap.is_none()
@@ -8251,11 +8262,11 @@ async fn control_loop<T: RobotIo>(
 
         let tracking_phase = snapshot.coordinated_tracking.as_ref().map(|tracking| {
             use proto::CoordinatedTrackingPhase as Phase;
-            if !tracking.fresh || tracking.params.camera.is_none() { Phase::PausedVision }
+            if autonomous_paused || safety.fallen() || in_limp_fall { Phase::Fallen }
+            else if !tracking.fresh || tracking.params.camera.is_none() { Phase::PausedVision }
             else if coordinated_mouth.finishing() { Phase::MouthAfterAction }
             else if coordinated_mouth.preparing() { Phase::MouthBeforeAction }
             else if coordinated_tracker.arrival_action_running() { Phase::RunningAction }
-            else if safety.fallen() { Phase::Fallen }
             else if fresh.is_none() || coordinated_feedback_missing { Phase::WaitingFeedback }
             else if !snapshot.enabled || !driving || bringup != Bringup::Ready { Phase::WaitingRobot }
             else if !coordinated_initial_head.arrived() { Phase::InitialHead }
@@ -11131,7 +11142,11 @@ fn dispatch(
                 // The same flag `robot.do` refuses on, so a client can wait for it rather than
                 // be told no and guess whether asking again would help.
                 homed: state.startup_voltage_ready.load(Ordering::Acquire).then(|| state.homed.load(Ordering::Relaxed)),
-                rest_phase: Some(intents.rest_phase()),
+                rest_phase: Some(if state.low_voltage_lock.requires_rearm() {
+                    proto::RestPhase::Rested
+                } else {
+                    intents.rest_phase()
+                }),
                 motion_enabled: Some(intents.enabled()),
                 sitting: Some(state.sitting.load(Ordering::Relaxed)),
                 change_error: state

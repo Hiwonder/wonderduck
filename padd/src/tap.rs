@@ -252,6 +252,14 @@ impl Tap {
         self.shared.wake.notify_all();
     }
 
+    /// The pad's orientation relative to the world, when the IMU has a valid sample.
+    pub fn attitude(&self) -> Option<[f32; 4]> {
+        self.shared
+            .attitude_slot()
+            .as_ref()
+            .and_then(pad_imu::Imu::quaternion)
+    }
+
     fn want(&self, node: Option<PathBuf>, imu: Option<PathBuf>) {
         let mut state = self.shared.lock();
         if state.wanted == node && state.wanted_imu == imu {

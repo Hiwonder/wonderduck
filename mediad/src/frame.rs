@@ -28,6 +28,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 
 use crate::pipeline::Frames;
+use crate::session::{VIDEO_METHOD, Video, video_params};
 
 const SOCKET_MODE: u32 = 0o660;
 
@@ -96,7 +97,8 @@ pub async fn bind(socket: &Path) -> Result<(std::fs::File, UnixListener)> {
 ///
 /// `rotate` is degrees clockwise the camera is mounted from upright, reported in every frame
 /// header. It is the caller's business whether the pipeline already applied it.
-pub async fn serve(listener: UnixListener, frames: Frames, rotate: u32) -> Result<()> {
+pub async fn serve(listener: UnixListener, frames: Frames, video: Video) -> Result<()> {
+    let video = Arc::new(video);
     let slots = Arc::new(tokio::sync::Semaphore::new(16));
     loop {
         match listener.accept().await {
@@ -105,9 +107,10 @@ pub async fn serve(listener: UnixListener, frames: Frames, rotate: u32) -> Resul
                     continue;
                 };
                 let frames = frames.clone();
+                let video = video.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
-                    let _ = handle(stream, frames, rotate).await;
+                    let _ = handle(stream, frames, &video).await;
                 });
             }
             Err(error) => tracing::warn!(error = %error, "media.frame accept failed"),
@@ -115,7 +118,7 @@ pub async fn serve(listener: UnixListener, frames: Frames, rotate: u32) -> Resul
     }
 }
 
-async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
+async fn handle(stream: UnixStream, frames: Frames, video: &Video) -> Result<()> {
     let (read, mut write) = stream.into_split();
     // Bounded *before* the line is buffered. Checking the length afterwards would mean a client
     // could make this process hold an arbitrarily long line first, which is the thing the cap is
@@ -171,6 +174,10 @@ async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
             .await?;
             continue;
         }
+        if request.method == VIDEO_METHOD {
+            write_response(&mut write, proto::Response::ok(request.id, &video_params(video))).await?;
+            continue;
+        }
         if request.method != proto::method::MEDIA_FRAME {
             write_response(
                 &mut write,
@@ -214,7 +221,7 @@ async fn handle(stream: UnixStream, frames: Frames, rotate: u32) -> Result<()> {
             format: frame.format.to_owned(),
             bytes: frame.data.len(),
             captured_at_unix_us,
-            rotate,
+            rotate: video.rotate,
         };
         tokio::time::timeout(Duration::from_secs(5), async {
             write_response(&mut write, proto::Response::ok(request.id, &header)).await?;

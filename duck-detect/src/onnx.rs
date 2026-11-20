@@ -20,6 +20,7 @@ pub struct Model {
     session: Session,
     /// `[height, width, channels]`, as the graph declares it.
     pub input: (usize, usize, usize),
+    pub output_shapes: Vec<Vec<i64>>,
 }
 
 impl Model {
@@ -46,12 +47,27 @@ impl Model {
             [_, c, h, w] if *c == 3 => (*h as usize, *w as usize, *c as usize),
             other => bail!("expected a [1, 3, H, W] input, got {other:?}"),
         };
-        Ok(Self { session, input })
+        let output_shapes = session
+            .outputs()
+            .iter()
+            .map(|output| {
+                output.dtype().tensor_shape().map(|dims| dims.to_vec()).unwrap_or_default()
+            })
+            .collect();
+        Ok(Self { session, input, output_shapes })
     }
 
     /// One letterboxed RGB frame in, the raw head out — the same layout the NPU path returns, so
     /// [`crate::decode`] does not care which one produced it.
     pub fn infer(&mut self, frame: &[u8], out: &mut Vec<f32>) -> Result<()> {
+        self.infer_with(frame, |outputs| {
+            out.clear();
+            out.extend_from_slice(outputs[0]);
+            Ok(())
+        })
+    }
+
+    pub fn infer_with<T>(&mut self, frame: &[u8], decode: impl FnOnce(&[&[f32]]) -> Result<T>) -> Result<T> {
         let (height, width, channels) = self.input;
         if frame.len() != height * width * channels {
             bail!(
@@ -82,11 +98,13 @@ impl Model {
             .session
             .run(ort::inputs!["images" => tensor])
             .context("inference failed")?;
-        let (_, data) = outputs[0]
-            .try_extract_tensor::<f32>()
-            .context("the output is not f32")?;
-        out.clear();
-        out.extend_from_slice(data);
-        Ok(())
+        let tensors = (0..outputs.len())
+            .map(|index| {
+                outputs[index].try_extract_tensor::<f32>()
+                    .map(|(_, data)| data)
+                    .context("the output is not f32")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        decode(&tensors)
     }
 }

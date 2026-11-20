@@ -54,7 +54,7 @@ pub struct Video {
 }
 
 /// The methods a peer asks with. Answered here rather than routed: no service owns them.
-const VIDEO_METHOD: &str = "media.video";
+pub(crate) const VIDEO_METHOD: &str = "media.video";
 const STREAM_METHOD: &str = "media.stream";
 
 /// What this daemon can answer about its own media, when it has a pipeline to answer from.
@@ -94,7 +94,7 @@ pub fn video_notification(video: &Video) -> String {
 ///
 /// One function for both, because a peer that asks and a peer that listens must be told the same
 /// thing — and the console does both, a push when the channel opens and a call when it is ready.
-fn video_params(video: &Video) -> serde_json::Value {
+pub(crate) fn video_params(video: &Video) -> serde_json::Value {
     let mut params = serde_json::json!({
         "width": video.width,
         "height": video.height,

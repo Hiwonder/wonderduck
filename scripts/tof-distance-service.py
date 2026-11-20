@@ -5,6 +5,7 @@ import argparse
 from collections import deque
 import json
 import math
+import os
 import statistics
 import sys
 import time
@@ -112,7 +113,14 @@ def restore_identity_page(bus):
 def run(bus_number, hz, timing_budget_ms=None, signal_rate_limit=None, include_raw=False):
     try:
         import adafruit_vl53l0x
-        from adafruit_extended_bus import ExtendedI2C
+        if os.environ.get("WONDERDUCK_UNOQ_ROUTER"):
+            from unoq_io import TofBus
+            def open_bus():
+                return TofBus()
+        else:
+            from adafruit_extended_bus import ExtendedI2C
+            def open_bus():
+                return ExtendedI2C(bus_number)
     except ImportError as error:
         print(f"distance sensor dependencies unavailable: {error}", file=sys.stderr, flush=True)
         return 1
@@ -124,7 +132,7 @@ def run(bus_number, hz, timing_budget_ms=None, signal_rate_limit=None, include_r
     while True:
         bus = None
         try:
-            bus = ExtendedI2C(bus_number)
+            bus = open_bus()
             sensor = sensor_class(bus, address=0x29, io_timeout_s=1.0)
             configure_sensor(sensor, timing_budget_ms, signal_rate_limit)
             page_reset_attempted = False
