@@ -97,6 +97,7 @@ test -z "$(git status --porcelain --untracked-files=no --ignore-submodules=all)"
 test -z "$(git -C extensions/wonderduck_studio status --porcelain --untracked-files=no)"
 git remote set-url origin https://gitee.com/hiwonder_official/wonderduck.git
 git fetch --no-tags --no-recurse-submodules origin main
+git merge-base --is-ancestor HEAD FETCH_HEAD
 git merge --ff-only --no-overwrite-ignore FETCH_HEAD
 git submodule sync --recursive
 git submodule update --init --recursive --checkout
@@ -126,11 +127,11 @@ if [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -le 1048576 ] &&
    [ "$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)" -eq 0 ]; then
   mkdir -p "$CARGO_TARGET_DIR"
   swap_file=$(mktemp "$CARGO_TARGET_DIR/.swap.XXXXXX")
+  trap 'if ! grep -qF "$swap_file" /proc/swaps || sudo swapoff "$swap_file"; then unlink "$swap_file"; fi' EXIT
   fallocate -l 2G "$swap_file"
   sudo chown root:root "$swap_file"
   sudo mkswap "$swap_file"
   sudo swapon "$swap_file"
-  trap 'sudo swapoff "$swap_file" && unlink "$swap_file"' EXIT
 fi
 cargo +1.99.0 build --release --locked -j 1 -p robotd -p padd -p robotctl --bins
 cargo +1.99.0 build --release --locked -j 1 --manifest-path extensions/wonderduck_studio/webpadd/Cargo.toml --bin webpadd
