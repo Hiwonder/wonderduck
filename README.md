@@ -2,25 +2,17 @@
 
 English | [简体中文](README_zh.md)
 
-WonderDuck provides robot control software and WonderDuck Studio ([GitHub](https://github.com/Hiwonder/wonderduck_studio) | [Gitee](https://gitee.com/hiwonder_official/wonderduck_studio)). It is based on [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck).
+WonderDuck provides robot control software and WonderDuck Studio. It is based on Pollen Robotics Microduck. [WonderDuck Studio on GitHub](https://github.com/Hiwonder/wonderduck_studio) · [Microduck](https://github.com/pollen-robotics/microduck)
 
 ## Update and deployment
 
-On a device with a configured system image, select **Rest** and wait for it to finish. Run either command in the device terminal:
-
-GitHub:
+On a device with a configured system image, select **Rest** and wait for it to finish. Run the following command in the device terminal.
 
 ```bash
 python3 <(curl -fsSL --connect-timeout 10 https://raw.githubusercontent.com/Hiwonder/wonderduck/main/scripts/update.py) --lang en
 ```
 
-Gitee:
-
-```bash
-python3 <(curl -fsSL --connect-timeout 10 https://gitee.com/hiwonder_official/wonderduck/raw/main/scripts/update.py) --lang en
-```
-
-Choose the update source when prompted. Enter a version, or press Enter to install the latest stable release.
+Select **1 (GitHub)**. Enter a version or press Enter for the latest stable release.
 
 Installation updates the startup configuration and preserves device calibration, models, and action groups. If a local file conflicts with the new version, the update stops and keeps the original file. Resolve the conflict and run the commands again.
 
@@ -28,15 +20,14 @@ Studio provides control over the local network. Connect the robot to a trusted n
 
 ## Cross-compile on a computer
 
-These steps are for an x86-64 Ubuntu computer and a robot with an already configured WonderDuck image. Install Git, curl, rsync, pkg-config, Python 3 with `venv`, a C compiler and Node.js 20 first. On the computer, clone either source:
+These steps are for an x86-64 Ubuntu computer and a robot with a configured WonderDuck image. On the computer, install Git, curl, rsync, pkg-config, Python 3 with `venv`, a C compiler and Node.js 20, then clone the repository.
 
 ```bash
-git clone --recurse-submodules https://github.com/Hiwonder/wonderduck.git
-# Alternatively: git clone --recurse-submodules https://gitee.com/hiwonder_official/wonderduck.git
+git clone --branch main --recurse-submodules https://github.com/Hiwonder/wonderduck.git
 cd wonderduck
 ```
 
-To work on the development branch, add `-b develop` to the clone command. Install Rust, the ARM64 target, cargo-zigbuild and Zig:
+Install Rust, the ARM64 target, cargo-zigbuild and Zig.
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -96,54 +87,79 @@ If a command fails, the robot service may remain stopped; resolve the error and 
 
 ## Build and deploy on the robot
 
-Run these commands on an RK3566 robot with a configured WonderDuck image. The installed application is under `~/wonderduck`. A successful clone creates a separate build directory at `~/wonderduck-src`.
-
-```bash
-git clone --branch main --recurse-submodules https://gitee.com/hiwonder_official/wonderduck.git "$HOME/wonderduck-src" &&
-  cd "$HOME/wonderduck-src"
-```
-
-You can also use `https://github.com/Hiwonder/wonderduck.git` as the clone URL. If cloning fails, resolve the Git error before building. If you already cloned both repositories into this directory, you can proceed to the build.
-
-Install Node.js 20 or later for ARM64. The Ubuntu 20.04 image's default `nodejs` package is too old. On a 1 GB board, check `free -h` and enable swap before building if needed. The build uses one Rust job to limit memory use. [Node.js downloads](https://nodejs.org/en/download)
+On the RK3566 robot, update the existing `~/wonderduck` checkout and its Studio submodule from GitHub.
 
 ```bash
 (
 set -euo pipefail
-cd "$HOME/wonderduck-src"
-sudo apt-get update
-sudo apt-get install -y build-essential pkg-config libudev-dev git curl rsync
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-. "$HOME/.cargo/env"
-rustup toolchain install 1.99.0 --profile minimal
-export DUCK_REVISION="$(git rev-parse HEAD)"
-cargo +1.99.0 build --release --locked -j 1 -p robotd -p padd -p robotctl --bins
-cargo +1.99.0 build --release --locked -j 1 --manifest-path extensions/wonderduck_studio/webpadd/Cargo.toml --bin webpadd
-npm ci --prefix extensions/wonderduck_studio/console/web
-npm run build --prefix extensions/wonderduck_studio/console/web
+cd "$HOME/wonderduck"
+test -z "$(git status --porcelain --untracked-files=no --ignore-submodules=all)"
+test -z "$(git -C extensions/wonderduck_studio status --porcelain --untracked-files=no)"
+git remote set-url origin https://github.com/Hiwonder/wonderduck.git
+git fetch --no-tags --no-recurse-submodules origin main
+git merge --ff-only --no-overwrite-ignore FETCH_HEAD
+git submodule sync --recursive
+git submodule update --init --recursive --checkout
 )
 ```
 
-After the build completes, select **Rest** and wait for it to finish. Deployment uses the runtime libraries already installed by the system image and preserves device models, action groups and calibration.
+The source update stops if either repository has tracked changes or the main checkout cannot fast-forward.
+
+Before the first build, install the system dependencies, Rust 1.99.0, and ARM64 Node.js 22 with npm. [Node.js downloads](https://nodejs.org/en/download)
+
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential pkg-config libudev-dev rsync
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
+```
+
+Build the programs and Studio web interface in `target/native-build`. On devices with 1 GB of RAM and no active swap, this step creates a temporary 2 GiB swap file for compilation and removes it on exit.
 
 ```bash
 (
 set -euo pipefail
-cd "$HOME/wonderduck-src"
-installed="$HOME/wonderduck"
+cd "$HOME/wonderduck"
+. "$HOME/.cargo/env"
+export CARGO_TARGET_DIR="$PWD/target/native-build"
+export DUCK_REVISION="$(git rev-parse HEAD)"
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+if [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -le 1048576 ] &&
+   [ "$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)" -eq 0 ]; then
+  mkdir -p "$CARGO_TARGET_DIR"
+  swap_file=$(mktemp "$CARGO_TARGET_DIR/.swap.XXXXXX")
+  fallocate -l 2G "$swap_file"
+  sudo chown root:root "$swap_file"
+  sudo mkswap "$swap_file"
+  sudo swapon "$swap_file"
+  trap 'sudo swapoff "$swap_file" && unlink "$swap_file"' EXIT
+fi
+cargo +1.99.0 build --release --locked -j 1 -p robotd -p padd -p robotctl --bins
+cargo +1.99.0 build --release --locked -j 1 --manifest-path extensions/wonderduck_studio/webpadd/Cargo.toml --bin webpadd
+cd extensions/wonderduck_studio/console/web
+npm ci
+./node_modules/.bin/vite build --outDir "$CARGO_TARGET_DIR/web" --emptyOutDir
+)
+```
+
+Once the build succeeds, select **Rest** and wait for it to finish. Deploy the programs and web interface with the commands below. This uses the media runtime installed by the system image.
+
+```bash
+(
+set -euo pipefail
+cd "$HOME/wonderduck"
+build="$PWD/target/native-build"
+for program in robotd padd robotctl webpadd; do test -x "$build/release/$program"; done
+test -s "$build/web/index.html"
 sudo systemctl stop robotd
-git ls-files scripts/ assets/prompt-sounds/network/ | rsync -a --files-from=- ./ "$installed/"
-git -C extensions/wonderduck_studio ls-files console/ webpadd/web/ | rsync -a --files-from=- extensions/wonderduck_studio/ "$installed/extensions/wonderduck_studio/"
-rsync -a extensions/wonderduck_studio/console/web/build/ "$installed/extensions/wonderduck_studio/console/web/build/"
-install -m 0755 target/release/{robotd,padd,robotctl} extensions/wonderduck_studio/webpadd/target/release/webpadd "$installed/target/release/"
-install -m 0644 assets/prompt-sounds/{startup,low_battery}.wav "$installed/target/prompt-sounds/"
+install -m 0755 "$build"/release/{robotd,padd,robotctl,webpadd} target/release/
+rsync -a --delete "$build/web/" extensions/wonderduck_studio/console/web/build/
+install -m 0644 assets/prompt-sounds/{startup,low_battery}.wav target/prompt-sounds/
 sudo systemctl restart wonderduck-prompt-sounds
 sudo systemctl start robotd
 systemctl is-active robotd
 )
 ```
 
-Open Studio to verify the deployment. After testing, you can remove the `~/wonderduck-src` clone and any swap file created for this build. The installed program lives under `~/wonderduck`.
+Open Studio to verify the deployment, then remove the build output in `target/native-build`.
 
 ## Recover from a device status read failure
 

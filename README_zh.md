@@ -2,25 +2,17 @@
 
 [English](README.md) | 简体中文
 
-WonderDuck 提供机器人控制程序和 WonderDuck Studio（[GitHub](https://github.com/Hiwonder/wonderduck_studio) | [Gitee](https://gitee.com/hiwonder_official/wonderduck_studio)）。本项目基于 [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck)。
+WonderDuck 提供机器人控制程序和 WonderDuck Studio。本项目基于 Pollen Robotics Microduck。 [WonderDuck Studio（Gitee）](https://gitee.com/hiwonder_official/wonderduck_studio) · [Microduck](https://github.com/pollen-robotics/microduck)
 
 ## 更新与部署
 
-适用于已烧录并完成配置的设备镜像。先在网页点击“休息”并等待完成，然后在设备终端运行任一命令：
-
-GitHub：
-
-```bash
-python3 <(curl -fsSL --connect-timeout 10 https://raw.githubusercontent.com/Hiwonder/wonderduck/main/scripts/update.py) --lang zh
-```
-
-Gitee：
+适用于已烧录并完成配置的设备镜像。先在网页点击「休息」并等待完成，然后在设备终端执行下方命令。
 
 ```bash
 python3 <(curl -fsSL --connect-timeout 10 https://gitee.com/hiwonder_official/wonderduck/raw/main/scripts/update.py) --lang zh
 ```
 
-按提示选择更新来源并输入版本号；版本号直接按回车会自动选择最新正式版。
+选择 **2（Gitee）**。输入版本号，或直接回车安装最新正式版。
 
 安装时会覆盖开机启动配置，保留设备标定、模型和动作组。如果本地文件与新版本冲突，更新会停止并提示，原文件会保留。处理问题后可重新执行更新命令。
 
@@ -28,15 +20,14 @@ Studio 提供局域网控制功能；使用时请将机器人接入可信网络�
 
 ## 在电脑上交叉编译
 
-以下步骤适用于 x86-64 Ubuntu 电脑，以及已烧录并配置 WonderDuck 镜像的设备。电脑需先安装 Git、curl、rsync、pkg-config、Python 3 的 `venv`、C 编译器和 Node.js 20。在电脑上任选一个来源克隆：
+以下步骤适用于 x86-64 Ubuntu 电脑，以及已配置 WonderDuck 镜像的设备。在电脑上安装 Git、curl、rsync、pkg-config、带 `venv` 的 Python 3、C 编译器和 Node.js 20，再克隆仓库。
 
 ```bash
-git clone --recurse-submodules https://github.com/Hiwonder/wonderduck.git
-# 或者：git clone --recurse-submodules https://gitee.com/hiwonder_official/wonderduck.git
+git clone --branch main --recurse-submodules https://gitee.com/hiwonder_official/wonderduck.git
 cd wonderduck
 ```
 
-如需开发分支，在克隆命令中加入 `-b develop`。安装 Rust、ARM64 目标、cargo-zigbuild 和 Zig：
+安装 Rust、ARM64 目标、cargo-zigbuild 和 Zig。
 
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
@@ -96,54 +87,79 @@ ssh "$robot" 'sudo systemctl restart wonderduck-prompt-sounds && sudo systemctl 
 
 ## 在实机上编译和部署
 
-以下命令在已配置 WonderDuck 镜像的 RK3566 实机上执行。设备正在使用的程序位于 `~/wonderduck`。克隆成功后会创建独立的编译目录 `~/wonderduck-src`。
-
-```bash
-git clone --branch main --recurse-submodules https://gitee.com/hiwonder_official/wonderduck.git "$HOME/wonderduck-src" &&
-  cd "$HOME/wonderduck-src"
-```
-
-也可以将克隆地址换成 `https://github.com/Hiwonder/wonderduck.git`。如果克隆失败，请先处理 Git 的报错。主仓和 Studio 子模块都已克隆到该目录时，可以直接开始编译。
-
-请安装 ARM64 的 Node.js 20 或更高版本。Ubuntu 20.04 默认软件源的 `nodejs` 版本过旧。1 GB 内存的设备可用 `free -h` 检查可用内存，必要时先启用交换空间。以下 Rust 命令只使用一个并行任务。 [Node.js 下载](https://nodejs.org/en/download)
+在 RK3566 实机上，从 Gitee 更新现有的 `~/wonderduck` 仓库及 Studio 子模块。
 
 ```bash
 (
 set -euo pipefail
-cd "$HOME/wonderduck-src"
-sudo apt-get update
-sudo apt-get install -y build-essential pkg-config libudev-dev git curl rsync
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-. "$HOME/.cargo/env"
-rustup toolchain install 1.99.0 --profile minimal
-export DUCK_REVISION="$(git rev-parse HEAD)"
-cargo +1.99.0 build --release --locked -j 1 -p robotd -p padd -p robotctl --bins
-cargo +1.99.0 build --release --locked -j 1 --manifest-path extensions/wonderduck_studio/webpadd/Cargo.toml --bin webpadd
-npm ci --prefix extensions/wonderduck_studio/console/web
-npm run build --prefix extensions/wonderduck_studio/console/web
+cd "$HOME/wonderduck"
+test -z "$(git status --porcelain --untracked-files=no --ignore-submodules=all)"
+test -z "$(git -C extensions/wonderduck_studio status --porcelain --untracked-files=no)"
+git remote set-url origin https://gitee.com/hiwonder_official/wonderduck.git
+git fetch --no-tags --no-recurse-submodules origin main
+git merge --ff-only --no-overwrite-ignore FETCH_HEAD
+git submodule sync --recursive
+git submodule update --init --recursive --checkout
 )
 ```
 
-编译完成后，在网页点击「休息」并等待完成，再执行部署命令。部署使用镜像已安装的运行库，并保留设备模型、动作组和标定。
+如果任一仓库有已跟踪文件的本地修改，或主仓无法快进，命令会停止更新。
+
+首次编译前，安装系统依赖、Rust 1.99.0，以及带 npm 的 ARM64 Node.js 22。 [Node.js 下载](https://nodejs.org/en/download)
+
+```bash
+sudo apt-get update && sudo apt-get install -y build-essential pkg-config libudev-dev rsync
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.99.0
+```
+
+将程序和 Studio 网页编译到 `target/native-build`。内存为 1 GB 且未启用交换空间的设备，执行时会启用 2 GiB 临时交换空间并在结束时清理。
 
 ```bash
 (
 set -euo pipefail
-cd "$HOME/wonderduck-src"
-installed="$HOME/wonderduck"
+cd "$HOME/wonderduck"
+. "$HOME/.cargo/env"
+export CARGO_TARGET_DIR="$PWD/target/native-build"
+export DUCK_REVISION="$(git rev-parse HEAD)"
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
+if [ "$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)" -le 1048576 ] &&
+   [ "$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)" -eq 0 ]; then
+  mkdir -p "$CARGO_TARGET_DIR"
+  swap_file=$(mktemp "$CARGO_TARGET_DIR/.swap.XXXXXX")
+  fallocate -l 2G "$swap_file"
+  sudo chown root:root "$swap_file"
+  sudo mkswap "$swap_file"
+  sudo swapon "$swap_file"
+  trap 'sudo swapoff "$swap_file" && unlink "$swap_file"' EXIT
+fi
+cargo +1.99.0 build --release --locked -j 1 -p robotd -p padd -p robotctl --bins
+cargo +1.99.0 build --release --locked -j 1 --manifest-path extensions/wonderduck_studio/webpadd/Cargo.toml --bin webpadd
+cd extensions/wonderduck_studio/console/web
+npm ci
+./node_modules/.bin/vite build --outDir "$CARGO_TARGET_DIR/web" --emptyOutDir
+)
+```
+
+编译成功后，在网页点击「休息」并等待完成，再执行下方命令部署程序和网页。此步骤使用系统镜像已有的媒体运行库。
+
+```bash
+(
+set -euo pipefail
+cd "$HOME/wonderduck"
+build="$PWD/target/native-build"
+for program in robotd padd robotctl webpadd; do test -x "$build/release/$program"; done
+test -s "$build/web/index.html"
 sudo systemctl stop robotd
-git ls-files scripts/ assets/prompt-sounds/network/ | rsync -a --files-from=- ./ "$installed/"
-git -C extensions/wonderduck_studio ls-files console/ webpadd/web/ | rsync -a --files-from=- extensions/wonderduck_studio/ "$installed/extensions/wonderduck_studio/"
-rsync -a extensions/wonderduck_studio/console/web/build/ "$installed/extensions/wonderduck_studio/console/web/build/"
-install -m 0755 target/release/{robotd,padd,robotctl} extensions/wonderduck_studio/webpadd/target/release/webpadd "$installed/target/release/"
-install -m 0644 assets/prompt-sounds/{startup,low_battery}.wav "$installed/target/prompt-sounds/"
+install -m 0755 "$build"/release/{robotd,padd,robotctl,webpadd} target/release/
+rsync -a --delete "$build/web/" extensions/wonderduck_studio/console/web/build/
+install -m 0644 assets/prompt-sounds/{startup,low_battery}.wav target/prompt-sounds/
 sudo systemctl restart wonderduck-prompt-sounds
 sudo systemctl start robotd
 systemctl is-active robotd
 )
 ```
 
-打开 Studio 验证部署。测试完成后，可清理这次使用的 `~/wonderduck-src` 源码目录和临时交换文件。运行的程序位于 `~/wonderduck`。
+打开 Studio 验证部署，再清理 `target/native-build` 中的编译产物。
 
 ## 恢复状态读取故障
 
