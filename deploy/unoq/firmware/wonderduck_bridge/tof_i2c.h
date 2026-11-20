@@ -118,11 +118,29 @@ public:
     }
 
     static bool transfer(const uint8_t *output, size_t written, uint8_t *input, size_t read) {
-        const uint8_t channel = 1u << 0;  // ToF responded on channel 0 on the assembled board.
-        if (!bus().transfer(0x71, &channel, 1, nullptr, 0)) {
+        constexpr uint8_t mux = 0x71;
+        constexpr uint32_t probe_interval_ms = 1000;
+        static uint8_t channel = 0;
+        static uint32_t last_probe = millis() - probe_interval_ms;
+        if (channel == 0 && millis() - last_probe >= probe_interval_ms) {
+            last_probe = millis();
+            const uint8_t detected = probe_channels(mux);
+            for (uint8_t mask = 1; mask <= 8; mask <<= 1) {
+                if (detected & mask) {
+                    channel = mask;
+                    break;
+                }
+            }
+        }
+        if (channel == 0) {
             return false;
         }
-        return bus().transfer(0x29, output, written, input, read);
+        if (bus().transfer(mux, &channel, 1, nullptr, 0) &&
+            bus().transfer(0x29, output, written, input, read)) {
+            return true;
+        }
+        channel = 0;
+        return false;
     }
 
     static uint8_t probe_muxes() {
