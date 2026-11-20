@@ -94,6 +94,46 @@ ssh "$robot" 'sudo systemctl restart wonderduck-prompt-sounds && sudo systemctl 
 
 If a command fails, the robot service may remain stopped; resolve the error and run the deployment again. This developer deployment does not update firmware, drivers or system service configuration. It can leave the device's Git checkout modified; resolve any conflicts reported by the official updater before installing a release.
 
+## Build and deploy on the robot
+
+Run these commands on an RK3566 robot with a configured WonderDuck image. Install Node.js 20 or later for ARM64 from the [Node.js downloads](https://nodejs.org/en/download). The Ubuntu 20.04 image's default `nodejs` package is too old. On a 1 GB board, check `free -h` and enable swap before building if needed. The build below uses one Rust job to limit memory use.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libudev-dev git curl rsync
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+. "$HOME/.cargo/env"
+rustup toolchain install 1.99.0 --profile minimal
+git clone --branch main --recurse-submodules https://github.com/Hiwonder/wonderduck.git ~/wonderduck-src
+# Alternatively, use https://gitee.com/hiwonder_official/wonderduck.git.
+cd ~/wonderduck-src
+export DUCK_REVISION="$(git rev-parse HEAD)"
+cargo +1.99.0 build --release --locked -j 1 -p robotd -p padd -p robotctl --bins
+cargo +1.99.0 build --release --locked -j 1 --manifest-path extensions/wonderduck_studio/webpadd/Cargo.toml --bin webpadd
+npm ci --prefix extensions/wonderduck_studio/console/web
+npm run build --prefix extensions/wonderduck_studio/console/web
+```
+
+After the build completes, select **Rest** and wait for it to finish. Run the following from `~/wonderduck-src`. It uses the runtime libraries already installed by the system image and preserves device models, action groups and calibration.
+
+```bash
+(
+set -euo pipefail
+installed="$HOME/wonderduck"
+sudo systemctl stop robotd
+git ls-files scripts/ assets/prompt-sounds/network/ | rsync -a --files-from=- ./ "$installed/"
+git -C extensions/wonderduck_studio ls-files console/ webpadd/web/ | rsync -a --files-from=- extensions/wonderduck_studio/ "$installed/extensions/wonderduck_studio/"
+rsync -a extensions/wonderduck_studio/console/web/build/ "$installed/extensions/wonderduck_studio/console/web/build/"
+install -m 0755 target/release/{robotd,padd,robotctl} extensions/wonderduck_studio/webpadd/target/release/webpadd "$installed/target/release/"
+install -m 0644 assets/prompt-sounds/{startup,low_battery}.wav "$installed/target/prompt-sounds/"
+sudo systemctl restart wonderduck-prompt-sounds
+sudo systemctl start robotd
+systemctl is-active robotd
+)
+```
+
+Open Studio to verify the deployment. After testing, you can remove the `~/wonderduck-src` clone and any swap file created for this build. The installed program lives under `~/wonderduck`.
+
 ## Recover from a device status read failure
 
 If a device status read encounters a serial fault, motion control is disabled while the robot attempts to restore communication and verify each servo is released. If the fault persists, check the servo and MCU connections and power, then reopen the device status page. Contact support if recovery still fails.

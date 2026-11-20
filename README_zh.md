@@ -94,6 +94,46 @@ ssh "$robot" 'sudo systemctl restart wonderduck-prompt-sounds && sudo systemctl 
 
 如果执行失败，机器人服务可能保持停止；请排除错误后重新执行部署。此开发部署不会更新固件、驱动或系统服务配置，也可能使设备的 Git 工作区出现修改；之后安装正式版时，请先处理更新程序提示的文件冲突。
 
+## 在实机上编译和部署
+
+以下命令在已配置 WonderDuck 镜像的 RK3566 实机上执行。请从 [Node.js 官网](https://nodejs.org/en/download)安装 ARM64 的 Node.js 20 或更高版本。Ubuntu 20.04 默认软件源的 `nodejs` 版本过旧。1 GB 内存的设备可用 `free -h` 检查可用内存，必要时先启用交换空间。以下 Rust 命令只使用一个并行任务。
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config libudev-dev git curl rsync
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+. "$HOME/.cargo/env"
+rustup toolchain install 1.99.0 --profile minimal
+git clone --branch main --recurse-submodules https://github.com/Hiwonder/wonderduck.git ~/wonderduck-src
+# 也可以将仓库地址换成 https://gitee.com/hiwonder_official/wonderduck.git。
+cd ~/wonderduck-src
+export DUCK_REVISION="$(git rev-parse HEAD)"
+cargo +1.99.0 build --release --locked -j 1 -p robotd -p padd -p robotctl --bins
+cargo +1.99.0 build --release --locked -j 1 --manifest-path extensions/wonderduck_studio/webpadd/Cargo.toml --bin webpadd
+npm ci --prefix extensions/wonderduck_studio/console/web
+npm run build --prefix extensions/wonderduck_studio/console/web
+```
+
+编译完成后，在网页点击「休息」并等待完成，再从 `~/wonderduck-src` 执行下方命令。部署使用镜像已安装的运行库，并保留设备模型、动作组和标定。
+
+```bash
+(
+set -euo pipefail
+installed="$HOME/wonderduck"
+sudo systemctl stop robotd
+git ls-files scripts/ assets/prompt-sounds/network/ | rsync -a --files-from=- ./ "$installed/"
+git -C extensions/wonderduck_studio ls-files console/ webpadd/web/ | rsync -a --files-from=- extensions/wonderduck_studio/ "$installed/extensions/wonderduck_studio/"
+rsync -a extensions/wonderduck_studio/console/web/build/ "$installed/extensions/wonderduck_studio/console/web/build/"
+install -m 0755 target/release/{robotd,padd,robotctl} extensions/wonderduck_studio/webpadd/target/release/webpadd "$installed/target/release/"
+install -m 0644 assets/prompt-sounds/{startup,low_battery}.wav "$installed/target/prompt-sounds/"
+sudo systemctl restart wonderduck-prompt-sounds
+sudo systemctl start robotd
+systemctl is-active robotd
+)
+```
+
+打开 Studio 验证部署。测试完成后，可清理这次使用的 `~/wonderduck-src` 源码目录和临时交换文件。运行的程序位于 `~/wonderduck`。
+
 ## 恢复状态读取故障
 
 设备状态读取发生串口故障时，机器人会关闭运动控制，尝试恢复通信并逐个确认舵机卸力。如果故障持续，请检查舵机和 MCU 的连接及供电，再重新打开设备状态页；仍无法恢复时请联系技术支持。
