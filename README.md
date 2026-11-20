@@ -96,29 +96,40 @@ If a command fails, the robot service may remain stopped; resolve the error and 
 
 ## Build and deploy on the robot
 
-Run these commands on an RK3566 robot with a configured WonderDuck image. Install Node.js 20 or later for ARM64 from the [Node.js downloads](https://nodejs.org/en/download). The Ubuntu 20.04 image's default `nodejs` package is too old. On a 1 GB board, check `free -h` and enable swap before building if needed. The build below uses one Rust job to limit memory use.
+Run these commands on an RK3566 robot with a configured WonderDuck image. The installed application is under `~/wonderduck`. A successful clone creates a separate build directory at `~/wonderduck-src`.
 
 ```bash
+git clone --branch main --recurse-submodules https://gitee.com/hiwonder_official/wonderduck.git "$HOME/wonderduck-src" &&
+  cd "$HOME/wonderduck-src"
+```
+
+You can also use `https://github.com/Hiwonder/wonderduck.git` as the clone URL. If cloning fails, resolve the Git error before building. If you already cloned both repositories into this directory, you can proceed to the build.
+
+Install Node.js 20 or later for ARM64. The Ubuntu 20.04 image's default `nodejs` package is too old. On a 1 GB board, check `free -h` and enable swap before building if needed. The build uses one Rust job to limit memory use. [Node.js downloads](https://nodejs.org/en/download)
+
+```bash
+(
+set -euo pipefail
+cd "$HOME/wonderduck-src"
 sudo apt-get update
 sudo apt-get install -y build-essential pkg-config libudev-dev git curl rsync
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 . "$HOME/.cargo/env"
 rustup toolchain install 1.99.0 --profile minimal
-git clone --branch main --recurse-submodules https://github.com/Hiwonder/wonderduck.git ~/wonderduck-src
-# Alternatively, use https://gitee.com/hiwonder_official/wonderduck.git.
-cd ~/wonderduck-src
 export DUCK_REVISION="$(git rev-parse HEAD)"
 cargo +1.99.0 build --release --locked -j 1 -p robotd -p padd -p robotctl --bins
 cargo +1.99.0 build --release --locked -j 1 --manifest-path extensions/wonderduck_studio/webpadd/Cargo.toml --bin webpadd
 npm ci --prefix extensions/wonderduck_studio/console/web
 npm run build --prefix extensions/wonderduck_studio/console/web
+)
 ```
 
-After the build completes, select **Rest** and wait for it to finish. Run the following from `~/wonderduck-src`. It uses the runtime libraries already installed by the system image and preserves device models, action groups and calibration.
+After the build completes, select **Rest** and wait for it to finish. Deployment uses the runtime libraries already installed by the system image and preserves device models, action groups and calibration.
 
 ```bash
 (
 set -euo pipefail
+cd "$HOME/wonderduck-src"
 installed="$HOME/wonderduck"
 sudo systemctl stop robotd
 git ls-files scripts/ assets/prompt-sounds/network/ | rsync -a --files-from=- ./ "$installed/"

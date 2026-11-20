@@ -96,29 +96,40 @@ ssh "$robot" 'sudo systemctl restart wonderduck-prompt-sounds && sudo systemctl 
 
 ## 在实机上编译和部署
 
-以下命令在已配置 WonderDuck 镜像的 RK3566 实机上执行。请从 [Node.js 官网](https://nodejs.org/en/download)安装 ARM64 的 Node.js 20 或更高版本。Ubuntu 20.04 默认软件源的 `nodejs` 版本过旧。1 GB 内存的设备可用 `free -h` 检查可用内存，必要时先启用交换空间。以下 Rust 命令只使用一个并行任务。
+以下命令在已配置 WonderDuck 镜像的 RK3566 实机上执行。设备正在使用的程序位于 `~/wonderduck`。克隆成功后会创建独立的编译目录 `~/wonderduck-src`。
 
 ```bash
+git clone --branch main --recurse-submodules https://gitee.com/hiwonder_official/wonderduck.git "$HOME/wonderduck-src" &&
+  cd "$HOME/wonderduck-src"
+```
+
+也可以将克隆地址换成 `https://github.com/Hiwonder/wonderduck.git`。如果克隆失败，请先处理 Git 的报错。主仓和 Studio 子模块都已克隆到该目录时，可以直接开始编译。
+
+请安装 ARM64 的 Node.js 20 或更高版本。Ubuntu 20.04 默认软件源的 `nodejs` 版本过旧。1 GB 内存的设备可用 `free -h` 检查可用内存，必要时先启用交换空间。以下 Rust 命令只使用一个并行任务。 [Node.js 下载](https://nodejs.org/en/download)
+
+```bash
+(
+set -euo pipefail
+cd "$HOME/wonderduck-src"
 sudo apt-get update
 sudo apt-get install -y build-essential pkg-config libudev-dev git curl rsync
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
 . "$HOME/.cargo/env"
 rustup toolchain install 1.99.0 --profile minimal
-git clone --branch main --recurse-submodules https://github.com/Hiwonder/wonderduck.git ~/wonderduck-src
-# 也可以将仓库地址换成 https://gitee.com/hiwonder_official/wonderduck.git。
-cd ~/wonderduck-src
 export DUCK_REVISION="$(git rev-parse HEAD)"
 cargo +1.99.0 build --release --locked -j 1 -p robotd -p padd -p robotctl --bins
 cargo +1.99.0 build --release --locked -j 1 --manifest-path extensions/wonderduck_studio/webpadd/Cargo.toml --bin webpadd
 npm ci --prefix extensions/wonderduck_studio/console/web
 npm run build --prefix extensions/wonderduck_studio/console/web
+)
 ```
 
-编译完成后，在网页点击「休息」并等待完成，再从 `~/wonderduck-src` 执行下方命令。部署使用镜像已安装的运行库，并保留设备模型、动作组和标定。
+编译完成后，在网页点击「休息」并等待完成，再执行部署命令。部署使用镜像已安装的运行库，并保留设备模型、动作组和标定。
 
 ```bash
 (
 set -euo pipefail
+cd "$HOME/wonderduck-src"
 installed="$HOME/wonderduck"
 sudo systemctl stop robotd
 git ls-files scripts/ assets/prompt-sounds/network/ | rsync -a --files-from=- ./ "$installed/"
