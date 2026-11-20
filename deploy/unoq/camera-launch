@@ -1,0 +1,31 @@
+#!/bin/sh
+set -eu
+
+board=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH= cd -- "$board/../.." && pwd)
+runtime=${MEDIA_RUNTIME_DIR:-"$root/media-runtime-candidate"}
+backend=${WONDERDUCK_CAMERA_BACKEND:-libcamera}
+
+case "$backend" in
+    libcamera) set -- "$@" --libcamera ;;
+    v4l2) set -- "$@" --generic-camera --camera-device "${WONDERDUCK_CAMERA_DEVICE:?Set the V4L2 capture device}" ;;
+    *) printf 'Unsupported camera backend %s\n' "$backend" >&2; exit 2 ;;
+esac
+
+if [ "${1:-}" = --check ]; then
+    lock="$runtime/webpadd-media.sock.lock"
+    if [ -e "$lock" ] && ! flock -n "$lock" true; then
+        exit 3
+    fi
+    if [ "$backend" = libcamera ]; then
+        cameras=$(cam --list) || exit 2
+        printf '%s\n' "$cameras" | awk '$1 ~ /^[0-9]+:$/ { found=1 } END { exit !found }'
+    else
+        v4l2-ctl -d "$WONDERDUCK_CAMERA_DEVICE" --list-formats >/dev/null
+    fi
+    exit $?
+fi
+
+exec "$runtime/run" mediad --no-remote --rotate "${WONDERDUCK_CAMERA_ROTATION:-0}" \
+    --config "${WONDERDUCK_ROBOT_PARAMS:-/etc/robot/robotd.toml}" \
+    --frame-socket "$runtime/webpadd-media.sock" "$@"
