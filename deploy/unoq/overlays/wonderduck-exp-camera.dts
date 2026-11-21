@@ -1,0 +1,70 @@
+/dts-v1/;
+/plugin/;
+
+&{/} {
+    wonderduck_camera_power: regulator-wonderduck-camera {
+        compatible = "regulator-fixed";
+        regulator-name = "wonderduck-camera-enable";
+        gpio = <&tlmm 99 0>;
+        enable-active-high;
+        startup-delay-us = <100000>;
+    };
+
+    wonderduck_camera_clock: clock-wonderduck-camera {
+        compatible = "fixed-clock";
+        #clock-cells = <0>;
+        clock-frequency = <24000000>;
+    };
+};
+
+&cci {
+    status = "okay";
+};
+
+&cci_i2c0 {
+    status = "disabled";
+};
+
+&cci_i2c1 {
+    status = "okay";
+    #address-cells = <1>;
+    #size-cells = <0>;
+
+    imx219@10 {
+        compatible = "sony,imx219";
+        reg = <0x10>;
+        clocks = <&wonderduck_camera_clock>;
+        VANA-supply = <&wonderduck_camera_power>;
+        VDIG-supply = <&wonderduck_camera_power>;
+        VDDL-supply = <&wonderduck_camera_power>;
+
+        port {
+            wonderduck_camera_out: endpoint {
+                remote-endpoint = <&wonderduck_csi1_in>;
+                clock-lanes = <0>;
+                data-lanes = <1 2>;
+                link-frequencies = /bits/ 64 <456000000>;
+            };
+        };
+    };
+};
+
+&camss {
+    status = "okay";
+    vdda-csiphy-1p2-supply = <&pm4125_l5>;
+    vdda-pll-1p8-supply = <&pm4125_l13>;
+
+    ports {
+        #address-cells = <1>;
+        #size-cells = <0>;
+
+        port@1 {
+            reg = <1>;
+
+            wonderduck_csi1_in: endpoint {
+                remote-endpoint = <&wonderduck_camera_out>;
+                data-lanes = <0 1>;
+            };
+        };
+    };
+};
