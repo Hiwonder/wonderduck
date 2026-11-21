@@ -21,14 +21,20 @@ HX_BAUD = 1_000_000
 TCGETS2 = 0x802C542A
 TIOCGPTPEER = 0x5441
 TERMIOS2 = struct.Struct("=IIIIB19BII")
+RPC_LOCK_DIRECTORY = Path("/run/lock/wonderduck-unoq")
 
 
 class Router:
     def __init__(self, path=None, timeout=.1):
+        endpoint = path or os.environ["WONDERDUCK_UNOQ_ROUTER"]
+        self.prioritize_hx = (
+            Path(endpoint).resolve() == Path("/run/arduino-router.sock").resolve()
+            and RPC_LOCK_DIRECTORY.is_dir()
+        )
         self.socket = socket.socket(socket.AF_UNIX)
         try:
             self.socket.settimeout(timeout)
-            self.socket.connect(path or os.environ["WONDERDUCK_UNOQ_ROUTER"])
+            self.socket.connect(endpoint)
         except BaseException:
             self.socket.close()
             raise
@@ -36,6 +42,30 @@ class Router:
         self.ids = itertools.count(1)
 
     def call(self, method, *args):
+        if not self.prioritize_hx:
+            return self._exchange(method, args)
+
+        with (RPC_LOCK_DIRECTORY / "admission").open("rb") as admission, \
+             (RPC_LOCK_DIRECTORY / "wire").open("rb") as wire:
+            if method == "servo":
+                # Keep the admission lock while HX waits for an in-flight
+                # transaction. No new sensor exchange can overtake HX.
+                fcntl.flock(admission, fcntl.LOCK_EX)
+                fcntl.flock(wire, fcntl.LOCK_EX)
+            else:
+                while True:
+                    fcntl.flock(admission, fcntl.LOCK_EX)
+                    try:
+                        fcntl.flock(wire, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        pass
+                    finally:
+                        fcntl.flock(admission, fcntl.LOCK_UN)
+                    time.sleep(.001)
+            return self._exchange(method, args)
+
+    def _exchange(self, method, args):
         request_id = next(self.ids)
         self.socket.sendall(msgpack.packb([0, request_id, "wonderduck/" + method, args],
                                           use_bin_type=True))
