@@ -24,8 +24,7 @@ secret*
 # Playground and scratch state (see updater/examples/playground.rs).
 /verify
 
-# Local simulation/training checkouts. They are pinned and documented in
-# docs/development/environment-setup.md, but are independent repositories.
+# Local simulation and training checkouts are separate repositories.
 /microduck_rl/
 /mjlab/
 /bam/
