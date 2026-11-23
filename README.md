@@ -6,6 +6,8 @@ WonderDuck provides robot control software and WonderDuck Studio. It is based on
 
 ## Update and deployment
 
+On a configured device, open **System settings → Software version → Check for updates** in Studio. The English interface checks GitHub and the Chinese interface checks Gitee. Confirm the version to start the update. Studio shows download progress, installation, and recovery if installation or startup fails.
+
 On a device with a configured system image, select **Rest** and wait for it to finish. Run the following command in the device terminal.
 
 ```bash
@@ -19,6 +21,8 @@ Installation updates the startup configuration and preserves device calibration,
 Studio provides control over the local network. Connect the robot to a trusted network.
 
 ## Cross-compile on a computer
+
+When adding or changing user-facing text, maintain and verify the Simplified Chinese and English versions together. Include control labels, dialogs, status messages, and error explanations.
 
 These steps are for an x86-64 Ubuntu computer and a robot with a configured WonderDuck image. On the computer, install Git, curl, rsync, pkg-config, Python 3 with `venv`, a C compiler and Node.js 20, then clone the repository.
 

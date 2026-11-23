@@ -292,7 +292,7 @@ def verify_signature(public_key, manifest, signature):
         raise ValueError('发布清单签名校验失败')
 
 
-def download(url, destination, limit, expected_size=None, progress=False):
+def download(url, destination, limit, expected_size=None, progress=False, progress_callback=None):
     if progress and (expected_size is None or expected_size <= 0):
         raise ValueError('下载进度需要有效的文件大小')
     total = 0
@@ -300,6 +300,8 @@ def download(url, destination, limit, expected_size=None, progress=False):
     last_report = time.monotonic()
 
     def report(final=False):
+        if progress_callback:
+            progress_callback(total, expected_size)
         message = '下载进度：{:3d}% ({:.1f}/{:.1f} MiB)'.format(
             total * 100 // expected_size, total / (1024 * 1024), expected_size / (1024 * 1024))
         print(('\r' if terminal else '') + message,

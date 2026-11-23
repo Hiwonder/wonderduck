@@ -1,0 +1,23 @@
+{
+  "microphone": "alsa_input.platform-sound-audio.stereo-fallback",
+  "kws": {
+    "tokens": "kws-vad/wenetspeech/tokens.txt",
+    "encoder": "kws-vad/wenetspeech/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+    "decoder": "kws-vad/wenetspeech/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+    "joiner": "kws-vad/wenetspeech/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+    "keywords_file": "kws-vad/keywords-wonderduck.txt"
+  },
+  "vad": "kws-vad/official-silero-vad.onnx",
+  "asr": {
+    "tokens": "asr/zipformer14/tokens.txt",
+    "encoder": "asr/zipformer14/encoder-epoch-99-avg-1.int8.onnx",
+    "decoder": "asr/zipformer14/decoder-epoch-99-avg-1.int8.onnx",
+    "joiner": "asr/zipformer14/joiner-epoch-99-avg-1.int8.onnx",
+    "model_type": "zipformer"
+  },
+  "tts": {
+    "type": "vits",
+    "model": "tts/models/vits-piper-zh_CN-huayan-medium/zh_CN-huayan-medium.onnx",
+    "tokens": "tts/models/vits-piper-zh_CN-huayan-medium/tokens.txt"
+  }
+}

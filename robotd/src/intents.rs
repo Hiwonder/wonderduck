@@ -97,6 +97,7 @@ struct MotionTrackingIntent {
     epoch: u64,
     sequence: u64,
     target: Option<[f64; 2]>,
+    line_speed: Option<f64>,
     reference_area: f64,
     deadzone: [f64; 2],
     gains: [[f64; 3]; 2],
@@ -106,6 +107,7 @@ struct MotionTrackingIntent {
 pub struct MotionTrackingSnapshot {
     pub initial_pitch: Option<u16>,
     pub target: Option<[f64; 2]>,
+    pub line_speed: Option<f64>,
     pub reference_area: f64,
     pub deadzone: [f64; 2],
     pub gains: [[f64; 3]; 2],
@@ -120,6 +122,7 @@ struct CoordinatedTrackingIntent {
     epoch: u64,
     sequence: u64,
     params: Option<duck_ipc_proto::CoordinatedTrackingParams>,
+    pickup_after_active: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +132,7 @@ pub struct CoordinatedTrackingSnapshot {
     pub sequence: u64,
     pub fresh: bool,
     pub age_us: u64,
+    pub pickup_stage: Option<duck_ipc_proto::PickupStage>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -262,7 +266,7 @@ pub struct Intents {
     precision: ArcSwapOption<PrecisionRequest>,
     last_precision: ArcSwapOption<PrecisionRequest>,
     precision_running: AtomicBool,
-    head: ArcSwap<Stamped<[f64; 4]>>,
+    head: ArcSwap<Stamped<duck_ipc_proto::HeadParams>>,
     head_generation: std::sync::atomic::AtomicU64,
     head_tracking: ArcSwap<HeadTrackingIntent>,
     head_tracking_epoch: std::sync::atomic::AtomicU64,
@@ -403,6 +407,7 @@ pub struct Snapshot {
     pub abandon_head_generation: u64,
     /// Age of the most recent head intent, so idle yawning yields to its owner.
     pub head_age: Duration,
+    pub head_position_raw: Option<[u16; 2]>,
     pub head_generation: u64,
     pub head_tracking: Option<HeadTrackingSnapshot>,
     pub head_position_handoff: Option<u16>,
@@ -475,7 +480,7 @@ impl Intents {
             last_precision: ArcSwapOption::empty(),
             precision_running: AtomicBool::new(false),
             head: ArcSwap::from_pointee(Stamped {
-                value: [0.0; 4],
+                value: duck_ipc_proto::HeadParams::default(),
                 at_us: 0,
             }),
             head_generation: std::sync::atomic::AtomicU64::new(0),
@@ -592,7 +597,7 @@ impl Intents {
         });
     }
 
-    pub fn set_head(&self, head: [f64; 4]) {
+    pub fn set_head(&self, head: duck_ipc_proto::HeadParams) {
         if self.head.load().value != head {
             self.head_generation.fetch_add(1, Ordering::AcqRel);
         }
@@ -603,7 +608,7 @@ impl Intents {
     }
 
     pub fn clear_head(&self) {
-        self.head.store(Arc::new(Stamped { value: [0.0; 4], at_us: self.now_us() }));
+        self.head.store(Arc::new(Stamped { value: duck_ipc_proto::HeadParams::default(), at_us: self.now_us() }));
     }
 
     pub fn motion_tracking_active(&self) -> bool {
@@ -709,7 +714,9 @@ impl Intents {
             let valid = previous.params.is_some() && previous.epoch == epoch;
             let allow = match params.action {
                 MotionTrackingAction::Start => !valid || previous.owner == owner,
-                MotionTrackingAction::Update => valid && previous.owner == owner,
+                MotionTrackingAction::Update => valid && previous.owner == owner
+                    && previous.params.as_ref().is_some_and(|old|
+                        old.pickup_after.is_some() == params.pickup_after.is_some()),
                 MotionTrackingAction::Stop => !valid || previous.owner == owner,
             };
             accepted.store(allow, Ordering::Relaxed);
@@ -733,6 +740,8 @@ impl Intents {
                                 previous.sequence.wrapping_add(1)
                             } else { previous.sequence },
                             params: Some(params.clone()),
+                            pickup_after_active: params.action == MotionTrackingAction::Update
+                                && previous.pickup_after_active,
                         };
                     }
                     MotionTrackingAction::Stop => next.params = None,
@@ -743,6 +752,26 @@ impl Intents {
         let accepted = accepted.load(Ordering::Relaxed);
         if accepted && params.action == MotionTrackingAction::Start { self.clear_head_position_handoff(owner); }
         accepted
+    }
+
+    pub fn advance_pickup(&self, sequence: u64, stop_generation: u64) {
+        let epoch = self.coordinated_tracking_epoch.load(Ordering::Acquire);
+        self.coordinated_tracking.rcu(|previous| {
+            if self.stop_generation.load(Ordering::Acquire) != stop_generation
+                || previous.epoch != epoch
+                || self.coordinated_tracking_epoch.load(Ordering::Acquire) != epoch
+                || previous.sequence != sequence || previous.pickup_after_active
+                || self.now_us().saturating_sub(previous.at_us) > MOTION_TRACKING_TIMEOUT_US
+                || previous.params.as_ref().is_none_or(|params|
+                    params.pickup_after.is_none() || params.camera.is_none())
+            {
+                return Arc::clone(previous);
+            }
+            let mut next = (**previous).clone();
+            next.pickup_after_active = true;
+            next.sequence = sequence.wrapping_add(1);
+            Arc::new(next)
+        });
     }
 
     pub fn maze_active(&self) -> bool {
@@ -811,7 +840,8 @@ impl Intents {
                         next = MotionTrackingIntent { owner, active: true, at_us: now, epoch,
                             initial_pitch: if params.action == MotionTrackingAction::Start { initial_pitch } else { previous.initial_pitch },
                             sequence: if params.action == MotionTrackingAction::Start { previous.sequence.wrapping_add(1) } else { previous.sequence },
-                            target: params.target, reference_area: params.reference_area, deadzone: params.deadzone, gains: params.gains };
+                            target: params.target, line_speed: params.line_speed,
+                            reference_area: params.reference_area, deadzone: params.deadzone, gains: params.gains };
                     }
                     MotionTrackingAction::Stop => next.active = false,
                 }
@@ -1267,7 +1297,7 @@ impl Intents {
                 } else {
                     twist.value
                 },
-                head: head.value,
+                head: [head.value.neck_pitch, head.value.head_pitch, head.value.head_yaw, head.value.head_roll],
                 // The loop owns the smoothing that turns the pose intent into this block;
                 // the raw target travels in `pose` below. Nominal zero is the trained
                 // encoding, not a placeholder.
@@ -1280,6 +1310,7 @@ impl Intents {
             abandon_generation: self.abandon_generation.load(Ordering::Acquire),
             abandon_head_generation: self.abandon_head_generation.load(Ordering::Relaxed),
             head_age: Duration::from_micros(now.saturating_sub(head.at_us)),
+            head_position_raw: head.value.raw_position,
             head_generation: self.head_generation.load(Ordering::Acquire),
             head_tracking: (head_tracking.active && now.saturating_sub(head_tracking.at_us) <= MOTION_TRACKING_TIMEOUT_US
                 && head_tracking.epoch == self.head_tracking_epoch.load(Ordering::Acquire))
@@ -1290,15 +1321,33 @@ impl Intents {
                 .then_some(head_tracking.pitch_position).flatten(),
             motion_tracking: (tracking.active && now.saturating_sub(tracking.at_us) <= MOTION_TRACKING_TIMEOUT_US
                 && tracking.epoch == self.motion_tracking_epoch.load(Ordering::Acquire))
-                .then_some(MotionTrackingSnapshot { initial_pitch: tracking.initial_pitch, target: tracking.target, reference_area: tracking.reference_area, deadzone: tracking.deadzone, gains: tracking.gains, sequence: tracking.sequence }),
+                .then_some(MotionTrackingSnapshot { initial_pitch: tracking.initial_pitch, target: tracking.target,
+                    line_speed: tracking.line_speed, reference_area: tracking.reference_area,
+                    deadzone: tracking.deadzone, gains: tracking.gains, sequence: tracking.sequence }),
             coordinated_tracking: (coordinated.epoch == self.coordinated_tracking_epoch.load(Ordering::Acquire))
                 .then(|| coordinated.params.clone()).flatten()
-                .map(|params| CoordinatedTrackingSnapshot {
-                    initial_pitch: coordinated.initial_pitch,
-                    params,
-                    sequence: coordinated.sequence,
-                    fresh: now.saturating_sub(coordinated.at_us) <= MOTION_TRACKING_TIMEOUT_US,
-                    age_us: now.saturating_sub(coordinated.at_us),
+                .map(|mut params| {
+                    use duck_ipc_proto::PickupStage;
+                    let mut initial_pitch = coordinated.initial_pitch;
+                    let pickup_stage = if coordinated.pickup_after_active {
+                        if let Some(after) = params.pickup_after.take() {
+                            let mut after = *after;
+                            after.camera = params.camera;
+                            after.target = params.target;
+                            initial_pitch = after.initial_pitch;
+                            params = after;
+                        }
+                        Some(PickupStage::After)
+                    } else if params.pickup_after.is_some() {
+                        Some(PickupStage::Before)
+                    } else {
+                        None
+                    };
+                    CoordinatedTrackingSnapshot {
+                        initial_pitch, params, pickup_stage, sequence: coordinated.sequence,
+                        fresh: now.saturating_sub(coordinated.at_us) <= MOTION_TRACKING_TIMEOUT_US,
+                        age_us: now.saturating_sub(coordinated.at_us),
+                    }
                 }),
             maze: (now.saturating_sub(maze.at_us) <= MOTION_TRACKING_TIMEOUT_US
                 && maze.epoch == self.maze_epoch.load(Ordering::Acquire))
@@ -1307,5 +1356,53 @@ impl Intents {
             pose,
             mouth: f64::from_bits(self.mouth.load(std::sync::atomic::Ordering::Relaxed)),
         }
+    }
+}
+
+#[cfg(test)]
+mod pickup_tests {
+    use super::Intents;
+    use duck_ipc_proto::{CoordinatedTrackingParams, MotionTrackingAction, PickupStage, TrackingCamera};
+
+    #[test]
+    fn pickup_switch_preserves_live_vision_and_rejects_an_expired_handoff() {
+        let config = CoordinatedTrackingParams {
+            action: MotionTrackingAction::Start, initial_pitch: Some(1400), target: None, camera: None,
+            head_deadzone: [0.05; 2], head_gains: [[1.0, 0.0, 0.0]; 2], body_gains: [1.0, 0.0, 0.0],
+            final_body_gains: [1.0, 0.0, 0.0], approach_linear_limit: None, final_linear_limit: 0.1,
+            final_lateral_limit: 0.1, final_point: [160.0, 100.0], final_tolerance: [10.0; 2],
+            stop_area_px: None, stop_area_deadzone_px: 0, stop_distance_mm: None, stop_distance_deadzone_mm: 0,
+            arrival_delay_s: 0.0, arrival_skill: String::new(), mouth_before: Default::default(),
+            mouth_after: Default::default(), pickup_after: None,
+        };
+        let mut first = config.clone();
+        first.camera = Some(TrackingCamera {
+            width: 1280, height: 720, rotate: 0, fx: 900.0, fy: 900.0, cx: 640.0, cy: 360.0,
+            distortion: [0.0; 5],
+        });
+        first.initial_pitch = Some(2100);
+        first.arrival_skill = "ground_pick".into();
+        first.pickup_after = Some(Box::new(config));
+        let intents = Intents::new();
+        assert!(intents.update_coordinated_tracking(1, first.clone()));
+        let first_snapshot = intents.snapshot();
+        let sequence = first_snapshot.coordinated_tracking.unwrap().sequence;
+        intents.stop();
+        intents.advance_pickup(sequence, first_snapshot.stop_generation);
+        assert_eq!(intents.snapshot().coordinated_tracking.unwrap().pickup_stage, Some(PickupStage::Before));
+
+        let generation = intents.snapshot().stop_generation;
+        intents.advance_pickup(sequence, generation);
+        let second = intents.snapshot().coordinated_tracking.unwrap();
+        assert_eq!(second.pickup_stage, Some(PickupStage::After));
+        assert_eq!(second.initial_pitch, Some(1400));
+        assert_eq!(second.params.camera, first.camera);
+        intents.advance_pickup(second.sequence, generation);
+        assert_eq!(intents.snapshot().coordinated_tracking.unwrap().sequence, second.sequence);
+        first.action = MotionTrackingAction::Update;
+        first.initial_pitch = None;
+        first.pickup_after = None;
+        assert!(!intents.update_coordinated_tracking(1, first));
+        assert_eq!(intents.snapshot().coordinated_tracking.unwrap().pickup_stage, Some(PickupStage::After));
     }
 }

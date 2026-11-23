@@ -614,7 +614,7 @@ pub enum Step {
 }
 
 pub struct InitialHead {
-    initial_pitch: u16,
+    initial_pitch: Option<u16>,
     target: Option<[f64; 2]>,
     last_command: Option<[f64; 2]>,
     correction: Option<HeadReturn>,
@@ -625,11 +625,27 @@ pub struct InitialHead {
 }
 
 impl Default for InitialHead {
-    fn default() -> Self { Self::new(INITIAL_PITCH) }
+    fn default() -> Self { Self::new(Some(INITIAL_PITCH)) }
+}
+
+#[cfg(test)]
+mod initial_head_tests {
+    use super::*;
+
+    #[test]
+    fn missing_initial_pitch_holds_the_first_feedback_position() {
+        let pitch = duck_control::hx::decode_position(6, &2100_u16.to_le_bytes()).unwrap();
+        let measured = [0.0, pitch, 0.2, 0.0];
+        let mut initial_head = InitialHead::new(None);
+        assert!(matches!(initial_head.step(measured, 0.02), Ok(Some(Step::Holding { .. }))));
+        assert_eq!(initial_head.take_handoff(), Some([pitch, 0.2]));
+        assert!(matches!(initial_head.step([0.0, 0.0, 0.3, 0.0], 0.02), Ok(None)));
+        assert_eq!(initial_head.fixed_head(), Some([pitch, 0.2]));
+    }
 }
 
 impl InitialHead {
-    pub fn new(initial_pitch: u16) -> Self {
+    pub fn new(initial_pitch: Option<u16>) -> Self {
         Self { initial_pitch, target: None, last_command: None, correction: None, settle_s: 0.0, wait_report_s: 0.0,
             arrived: false, handed_off: false }
     }
@@ -643,17 +659,18 @@ impl InitialHead {
         }
         let pitch = duck_control::hx::encode_position(6, joints[1])
             .map_err(|_| Error::InvalidParameters)?;
-        let initial_pitch = duck_control::hx::decode_position(6, &self.initial_pitch.to_le_bytes())
+        let requested_pitch = *self.initial_pitch.get_or_insert(pitch);
+        let initial_pitch = duck_control::hx::decode_position(6, &requested_pitch.to_le_bytes())
             .map_err(|_| Error::InvalidParameters)?;
         let target = *self.target.get_or_insert([initial_pitch, joints[2]]);
-        self.arrived = pitch.abs_diff(self.initial_pitch) <= INITIAL_PITCH_TOLERANCE;
+        self.arrived = pitch.abs_diff(requested_pitch) <= INITIAL_PITCH_TOLERANCE;
         if self.arrived {
-            tracing::info!(servo = 31, position = pitch, target = self.initial_pitch,
+            tracing::info!(servo = 31, position = pitch, target = requested_pitch,
                 "coordinated tracking initial head position reached");
         } else {
             self.wait_report_s += dt;
             if self.wait_report_s >= 5.0 {
-                tracing::warn!(servo = 31, position = pitch, target = self.initial_pitch,
+                tracing::warn!(servo = 31, position = pitch, target = requested_pitch,
                     tolerance = INITIAL_PITCH_TOLERANCE,
                     "coordinated tracking waiting for initial head position");
                 self.wait_report_s = 0.0;
@@ -1018,6 +1035,10 @@ impl Tracker {
         self.arrival.is_some_and(|arrival| arrival.action == ArrivalAction::Running)
     }
 
+    pub fn arrival_action_finished(&self) -> bool {
+        self.arrival.is_some_and(|arrival| arrival.action == ArrivalAction::Finished)
+    }
+
     pub fn resolve_arrival_action(&mut self, started: bool) {
         if let Some(arrival) = self.arrival.as_mut()
             && arrival.action == ArrivalAction::Ready
@@ -1142,7 +1163,9 @@ impl Tracker {
                 return Ok(hold());
             }
         }
-        if arrival.action == ArrivalAction::Running { return Ok(hold()); }
+        if arrival.action == ArrivalAction::Running || params.pickup_after.is_some() {
+            return Ok(hold());
+        }
         let Some(target) = params.target else { return Ok(hold()); };
         if target.captured_at_unix_us <= arrival.home_after_us.expect("home was confirmed")
             || target.captured_at_unix_us <= arrival.last_checked_us

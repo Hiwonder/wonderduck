@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::Duration;
 
-use duck_control::hx::HxIo;
+use duck_control::hx::{HxIo, decode_position};
+use duck_control::io::{JointTargets, RobotIo};
 
 const IDS: [u8; 15] = [20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14];
 
@@ -79,6 +80,14 @@ fn respond(bus: &mut Bus, frame: &[u8]) -> Vec<u8> {
 }
 
 fn run_startup(missing: Option<u8>, failed_verification: Option<u8>) -> (duck_control::io::Result<usize>, Bus) {
+    run_bus(missing, failed_verification, HxIo::check_registers)
+}
+
+fn run_bus<T>(
+    missing: Option<u8>,
+    failed_verification: Option<u8>,
+    run: impl FnOnce(&mut HxIo) -> T,
+) -> (T, Bus) {
     let mut master = -1;
     let mut slave = -1;
     assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(),
@@ -127,7 +136,7 @@ fn run_startup(missing: Option<u8>, failed_verification: Option<u8>) -> (duck_co
             thread::sleep(Duration::from_millis(1));
         }
     });
-    let result = io.check_registers();
+    let result = run(&mut io);
     running.store(false, Ordering::Relaxed);
     worker.join().unwrap();
     drop(io);
@@ -168,4 +177,34 @@ fn healthy_servos_are_configured_before_the_control_stream_probe() {
     assert_eq!(sync_reads.len(), 1);
     assert_eq!((sync_reads[0][5], sync_reads[0][6]), (56, 12));
     assert_eq!(bus.requests.last().unwrap()[4], 0x82);
+}
+
+#[test]
+fn timed_frames_send_goal_and_duration_together_and_restore_policy_timing() {
+    let (_, bus) = run_bus(None, None, |io| {
+        io.set_torque(true).unwrap();
+        let mut positions = [None; IDS.len()];
+        positions[5] = Some(decode_position(5, &2691u16.to_le_bytes()).unwrap());
+        positions[6] = Some(decode_position(6, &1336u16.to_le_bytes()).unwrap());
+        assert!(io.write_timed_positions(&positions, 4000).unwrap());
+        positions.fill(None);
+        positions[6] = Some(decode_position(6, &1820u16.to_le_bytes()).unwrap());
+        assert!(io.write_timed_positions(&positions, 2000).unwrap());
+        io.set_torque(false).unwrap();
+        let targets = JointTargets::new([0.0; IDS.len()]);
+        io.write(&targets).unwrap();
+        io.set_torque(true).unwrap();
+        io.write(&targets).unwrap();
+    });
+    let writes: Vec<_> = bus.requests.iter().filter(|frame| frame[4] == 0x83).collect();
+    assert_eq!(writes.len(), 3);
+    assert_eq!(&writes[0][5..writes[0].len() - 1], &[
+        41, 7, 30, 0, 0x83, 0x0a, 0xa0, 0x0f, 0, 0,
+        31, 0, 0x38, 0x05, 0xa0, 0x0f, 0, 0,
+    ]);
+    assert_eq!(&writes[1][5..writes[1].len() - 1], &[
+        41, 7, 31, 0, 0x1c, 0x07, 0xd0, 0x07, 0, 0,
+    ]);
+    assert_eq!(bus.registers[&30][44..48], [0; 4]);
+    assert_eq!(bus.registers[&31][44..48], [0; 4]);
 }

@@ -267,6 +267,11 @@ impl<T: RobotIo> Safety<T> {
         self.fallen
     }
 
+    pub fn reset_fall(&mut self) {
+        self.falling_for = Duration::ZERO;
+        self.fallen = false;
+    }
+
     /// Power the joints, so the positions this writes can actually be held.
     ///
     /// Through here because [`Safety`] owns the only [`RobotIo`] handle — the same reason
@@ -444,7 +449,27 @@ impl<T: RobotIo> Safety<T> {
         self.deadman_armed && self.runs.deadman <= 1
     }
 
-    /// The only path to the motors.
+    /// Dispatch one action frame with the hardware's timing, when available.
+    pub fn apply_timed_frame(
+        &mut self,
+        positions: &[Option<f64>; NUM_JOINTS],
+        duration_ms: u16,
+        goal: [f64; NUM_JOINTS],
+        hold: [f64; NUM_JOINTS],
+        gain: u16,
+    ) -> Result<Applied, IoError> {
+        if !(1..=30_000).contains(&duration_ms) || positions.iter().zip(JOINT_LIMITS).any(
+            |(position, (lower, upper))| position.is_some_and(|value| !(lower..=upper).contains(&value)),
+        ) {
+            return Err(IoError::Bus("invalid timed joint frame".into()));
+        }
+        if self.io.write_timed_positions(positions, duration_ms)? {
+            return Ok(Applied::default());
+        }
+        self.apply(goal, hold, gain)
+    }
+
+    /// Apply ordinary control-loop targets.
     ///
     /// `hold` is what to command when the policy must not drive — normally the pose the
     /// robot is already in.

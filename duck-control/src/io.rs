@@ -319,6 +319,11 @@ pub trait RobotIo {
     fn end_device_observation(&mut self) {}
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 
+    /// Dispatch a timed frame to the servos. Returns false if the backend has no native timing.
+    fn write_timed_positions(&mut self, _positions: &[Option<f64>; NUM_JOINTS], _duration_ms: u16) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Transfer the motor bus to or from a connection-bound maintenance session.
     /// Neither operation may send motor commands.
     fn maintenance_handoff(&mut self, _release: bool) -> Result<()> {
