@@ -13,7 +13,7 @@ use duck_control::io::RobotIo;
 use duck_control::model::JOINT_IDS;
 
 #[derive(Clone, Copy, PartialEq)]
-enum RawReply { Normal, TimeoutOnce, Error, InvalidPayload, InvalidFrame }
+enum RawReply { Normal, ImuOffline, TimeoutOnce, Error, InvalidPayload, InvalidFrame }
 
 struct BusState { missing_servo: Option<u8>, raw_reply: RawReply, raw_requests: usize }
 struct SimBus { io: HxIo, state: Arc<Mutex<BusState>>, running: Arc<AtomicBool>, worker: Option<JoinHandle<()>> }
@@ -53,6 +53,7 @@ fn respond(state: &mut BusState, request: &[u8]) -> Vec<u8> {
     let (id, address, length) = (request[2], request[5], request[6]);
     if id == 200 {
         return match (address, length) {
+            (56, 12) if state.raw_reply == RawReply::ImuOffline => Vec::new(),
             (56, 12) => {
                 let mut data = [0; 12];
                 data[6..].copy_from_slice(&[0x00, 0x80, 0x91, 0xbe, 0xde, 0x4f]);
@@ -127,11 +128,17 @@ impl SimBus {
     }
 
     fn scan(&mut self) -> duck_control::io::Result<duck_control::io::DeviceObservation> {
-        let mut latest = None;
-        for _ in 0..=JOINT_IDS.len() {
-            latest = self.io.sample_individual_device_observation(Instant::now() + Duration::from_secs(2))?;
+        let start_ns = duck_ipc_proto::clock::monotonic_ns();
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            if let Some(data) = self.io.sample_individual_device_observation(deadline)? {
+                let fresh = |stamp: Option<u64>| stamp.is_some_and(|t| t >= start_ns);
+                if data.servos.iter().all(|servo| fresh(servo.observed_t_ns)) && fresh(data.imu.observed_t_ns) {
+                    return Ok(data);
+                }
+            }
         }
-        Ok(latest.unwrap())
+        panic!("individual scan did not revisit every servo and the IMU");
     }
 }
 
@@ -160,6 +167,14 @@ fn missing_servo_does_not_hide_other_servos_or_raw_imu() {
     bus.state.lock().unwrap().missing_servo = None;
     let reconnected = bus.scan().unwrap();
     assert!(reconnected.servos.iter().all(|servo| servo.valid && servo.error.is_none()));
+}
+
+#[test]
+fn offline_imu_does_not_starve_servo_reads() {
+    let mut bus = SimBus::new(None, RawReply::ImuOffline);
+    let data = bus.scan().unwrap();
+    assert!(!data.imu.valid);
+    assert!(data.servos.iter().all(|servo| servo.valid));
 }
 
 #[test]
