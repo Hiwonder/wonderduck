@@ -6,6 +6,8 @@ WonderDuck 提供机器人控制程序和 WonderDuck Studio。本项目基于 Po
 
 ## 更新与部署
 
+已配置的设备可在 Studio 打开「系统设置 → 软件版本 → 检查更新」。中文界面检查 Gitee，英文界面检查 GitHub。确认版本后开始更新。页面显示下载进度、安装状态，以及安装或启动失败后的恢复结果。
+
 适用于已烧录并完成配置的设备镜像。先在网页点击「休息」并等待完成，然后在设备终端执行下方命令。
 
 ```bash
@@ -19,6 +21,8 @@ python3 <(curl -fsSL --connect-timeout 10 https://gitee.com/hiwonder_official/wo
 Studio 提供局域网控制功能；使用时请将机器人接入可信网络。
 
 ## 在电脑上交叉编译
+
+新增或修改面向用户的文字时，同步维护并验证简体中文和英文，包括控件名称、弹窗、状态提示和错误说明。
 
 以下步骤适用于 x86-64 Ubuntu 电脑，以及已配置 WonderDuck 镜像的设备。在电脑上安装 Git、curl、rsync、pkg-config、带 `venv` 的 Python 3、C 编译器和 Node.js 20，再克隆仓库。
 

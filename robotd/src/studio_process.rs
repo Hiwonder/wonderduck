@@ -8,7 +8,7 @@ use tokio::process::{Child, Command};
 
 pub struct StudioProcess { child: Child }
 
-fn script_path(executable: &Path) -> Option<PathBuf> {
+pub(crate) fn script_path(executable: &Path) -> Option<PathBuf> {
     let environment = executable.parent()?.parent()?.parent()?;
     Some(environment.join("extensions/wonderduck_studio/console/server.py"))
 }

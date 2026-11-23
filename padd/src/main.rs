@@ -26,8 +26,8 @@
 //! Left stick      forward / back / strafe
 //! Right stick     turn left / right
 //! Start           short press initializes and enables the policy
-//! Start, 5 s      switch between drive and drive + head control
-//! Start + Select  request rest
+//! Start, 3 s      request rest
+//! Select + Start  toggle between drive and drive + head control
 //! ```
 //!
 //! Smoothing lives in `robotd` (`[control] cmd_alpha` / `head_alpha`), not here: this
@@ -49,7 +49,7 @@
 //! within a tick.
 //!
 //! Waiting with no pad sends no stick commands. Losing the controlling pad stops its motion.
-//! Start and Select together request rest when the gamepad can acquire control.
+//! Holding Start for three seconds requests rest when the gamepad can acquire control.
 //!
 //! Pairing is **not** done here: bonding a device needs root and BlueZ, and a `padd` holding
 //! either would stop being the unprivileged client whose whole value is having no special
@@ -78,6 +78,8 @@ mod connection;
 mod control;
 mod precision_drive;
 mod precision_input;
+
+use control::StartAction;
 
 use precision_drive::{
     PrecisionDrive, poll_precision_status, precision_axes, precision_request, reset_precision,
@@ -215,101 +217,6 @@ struct Args {
 /// again is a wakeup every 20 ms, forever, for nothing. Half a second is imperceptible when someone
 /// switches a pad on and is not a background load.
 const IDLE_POLL: Duration = Duration::from_millis(500);
-
-const START_TAP_MAX: Duration = Duration::from_millis(1500);
-const START_MODE_HOLD: Duration = Duration::from_secs(5);
-
-#[derive(Default)]
-struct StartButton {
-    held_since: Option<Instant>,
-    mode_toggled: bool,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum StartAction {
-    None,
-    Initialize,
-    ToggleHeadDrive,
-}
-
-impl StartButton {
-    fn update(&mut self, pressed: bool, tapped_this_tick: bool, now: Instant) -> StartAction {
-        if pressed {
-            let since = *self.held_since.get_or_insert(now);
-            if !self.mode_toggled && now.saturating_duration_since(since) >= START_MODE_HOLD {
-                self.mode_toggled = true;
-                return StartAction::ToggleHeadDrive;
-            }
-            return StartAction::None;
-        }
-
-        let elapsed = self
-            .held_since
-            .take()
-            .map(|since| now.saturating_duration_since(since));
-        if std::mem::take(&mut self.mode_toggled) {
-            return StartAction::None;
-        }
-        match elapsed {
-            Some(duration) if duration >= START_MODE_HOLD => StartAction::ToggleHeadDrive,
-            Some(duration) if duration < START_TAP_MAX => StartAction::Initialize,
-            None if tapped_this_tick => StartAction::Initialize,
-            _ => StartAction::None,
-        }
-    }
-}
-
-#[cfg(test)]
-mod start_button_tests {
-    use super::*;
-
-    #[test]
-    fn long_hold_toggles_once_until_released() {
-        let now = Instant::now();
-        let mut start = StartButton::default();
-        assert_eq!(start.update(true, false, now), StartAction::None);
-        assert_eq!(
-            start.update(true, false, now + START_MODE_HOLD - Duration::from_millis(1)),
-            StartAction::None
-        );
-        assert_eq!(
-            start.update(true, false, now + START_MODE_HOLD),
-            StartAction::ToggleHeadDrive
-        );
-
-        let later = now + START_MODE_HOLD * 2;
-        assert_eq!(start.update(true, false, later), StartAction::None);
-        assert_eq!(start.update(false, false, later), StartAction::None);
-        assert_eq!(start.update(true, false, later), StartAction::None);
-        assert_eq!(
-            start.update(true, false, later + START_MODE_HOLD),
-            StartAction::ToggleHeadDrive
-        );
-    }
-
-    #[test]
-    fn only_short_releases_initialize_and_canceled_holds_are_ignored() {
-        let now = Instant::now();
-        let mut start = StartButton::default();
-        assert_eq!(start.update(false, true, now), StartAction::Initialize);
-        assert_eq!(start.update(true, false, now), StartAction::None);
-        assert_eq!(
-            start.update(false, false, now + Duration::from_millis(200)),
-            StartAction::Initialize
-        );
-        assert_eq!(start.update(true, false, now), StartAction::None);
-        assert_eq!(
-            start.update(false, false, now + START_TAP_MAX),
-            StartAction::None
-        );
-        assert_eq!(start.update(true, false, now), StartAction::None);
-        start = StartButton::default();
-        assert_eq!(
-            start.update(false, false, now + START_MODE_HOLD),
-            StartAction::None
-        );
-    }
-}
 
 /// The prototype's roller-mode stick shaping: push and brake are asymmetric, there is no
 /// strafe, and heading is capped at 0.3 rad/s regardless of the walking limits — the
@@ -633,9 +540,8 @@ fn main() -> std::process::ExitCode {
         }
     };
 
-    let mut rest_chord = control::RestChord::default();
     loop {
-        let _ = run_session(&args, &mut gilrs, tap.as_ref(), &mut rest_chord);
+        let _ = run_session(&args, &mut gilrs, tap.as_ref());
         if let Some(tap) = tap.as_ref() {
             tap.idle();
         }
@@ -648,7 +554,6 @@ fn run_session(
     args: &Args,
     gilrs: &mut Gilrs,
     tap: Option<&tap::Tap>,
-    rest_chord: &mut control::RestChord,
 ) -> std::process::ExitCode {
     let mut stream = match connection::connect(&args.socket) {
         Ok(stream) => stream,
@@ -691,7 +596,7 @@ fn run_session(
         hz = args.hz,
         roller,
         "driving — sticks and D-pad move, X/B turn, Y ground pick, A sit, LB/RB kicks, \
-         L2 mouth; Start initializes and enables, hold Start for 5 s to switch head control, Start + Select rests"
+         L2 mouth; Start initializes and enables, hold Start for 3 s to rest, Select + Start toggles head control"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -707,7 +612,7 @@ fn run_session(
     // Whether a pad was there last tick, so appearing and disappearing are each logged once.
     let mut driving = false;
     let mut active_pad_id = None;
-    let mut start = StartButton::default();
+    let mut start = control::StartControls::default();
     let mut head_drive = false;
     let mut imu_reference = None;
     let mut center_sticks = false;
@@ -767,8 +672,6 @@ fn run_session(
         // Which bindable buttons went down this tick, by their config name. A list rather than
         // a flag apiece, because what each one runs is config now and this loop no longer knows.
         let mut pressed: Vec<&'static str> = Vec::new();
-        let mut start_pressed = false;
-        let mut start_released = false;
         let mut button_activity = false;
         let mut pad_disconnected = false;
         while let Some(event) = gilrs.next_event() {
@@ -782,18 +685,15 @@ fn run_session(
                 pad_disconnected = true;
             }
             match event.event {
-                gilrs::EventType::ButtonPressed(button, _) => rest_chord.button(button, true),
-                gilrs::EventType::ButtonReleased(button, _) => rest_chord.button(button, false),
+                gilrs::EventType::ButtonPressed(button, _) => start.button(button, true, tick),
+                gilrs::EventType::ButtonReleased(button, _) => start.button(button, false, tick),
                 _ => {}
             }
             match event.event {
-                // Retain both edges when a tap starts and ends between polls.
-                gilrs::EventType::ButtonReleased(Button::Start, _) => start_released = true,
                 gilrs::EventType::ButtonPressed(button, _) => match button {
                     // gilrs names the *bumpers* `LeftTrigger`/`RightTrigger`; the analog
                     // triggers are `LeftTrigger2`/`RightTrigger2`. Getting that backwards binds
                     // a skill to a control nobody presses.
-                    Button::Start => start_pressed = true,
                     Button::South => pressed.push("a"),
                     Button::North => pressed.push("y"),
                     Button::LeftTrigger => pressed.push("lb"),
@@ -817,7 +717,6 @@ fn run_session(
             // Logged once per transition, at `warn` so it survives `RUST_LOG=warn` on a board.
             // "The pad went away" is the single most useful line in the journal when the robot
             // stops responding mid-drive, and one line per tick would bury it.
-            rest_chord.disconnected();
             pick_mouth.cancel();
             gate.expire(Instant::now());
             let cancellation = reset_precision(
@@ -852,7 +751,7 @@ fn run_session(
                 driving = false;
                 active_pad_id = None;
             }
-            start = StartButton::default();
+            start = control::StartControls::default();
             imu_reference = None;
             buttons_were_driving = false;
             rest_rearm_required = false;
@@ -870,11 +769,12 @@ fn run_session(
             tracing::error!("classic layout requires a normalized gamepad mapping");
             return std::process::ExitCode::FAILURE;
         }
-        let chord_action = rest_chord.finish(
+        let (start_action, suppress_motion) = start.finish(
             pad.is_pressed(Button::Start),
             pad.is_pressed(Button::Select),
+            tick,
         );
-        if chord_action.rest {
+        if start_action == Some(StartAction::Rest) {
             gate.expire(Instant::now());
             if !gate.driving() {
                 let requested_at = Instant::now();
@@ -909,10 +809,10 @@ fn run_session(
                 match request(&mut stream, &mut next_id, &proto::Call::RobotRest) {
                     Ok(response) => {
                         if intent_accepted(response) {
-                            tracing::warn!("Start and Select — rest requested");
+                            tracing::warn!("Start held for three seconds — rest requested");
                             rest_rearm_required = true;
                         } else {
-                            tracing::warn!("Start and Select — rest refused");
+                            tracing::warn!("Start held for three seconds — rest refused");
                         }
                     }
                     Err(error) => {
@@ -922,12 +822,11 @@ fn run_session(
                 }
             }
         }
-        if chord_action.suppress || (rest_rearm_required && !pad_neutral(&pad, args.deadzone, head_drive)) {
+        if suppress_motion || (rest_rearm_required && !pad_neutral(&pad, args.deadzone, head_drive)) {
             if let Some(precision) = precision.as_mut() {
                 precision.reset();
                 precision.awaiting_completion = false;
             }
-            start = StartButton::default();
             imu_reference = None;
             buttons_were_driving = false;
             if let Err(error) = maintain_control(&mut stream, &mut next_id, &mut gate) {
@@ -985,7 +884,6 @@ fn run_session(
                     precision.gesture.step(now, [0.0; 3], [0.0; 3]);
                 }
             }
-            start = StartButton::default();
             imu_reference = None;
             buttons_were_driving = false;
             if let Some(tap) = tap.as_ref() {
@@ -1011,15 +909,7 @@ fn run_session(
             driving = true;
         }
 
-        // Every tick rather than on the transition above: a pad that drops and comes back between
-        // two ticks never clears `driving`, and it comes back as a different event node often
-        // enough that a tap following the old one would report the rest of the session as silence.
-        let start_action = start.update(
-            pad.is_pressed(Button::Start),
-            start_pressed && start_released,
-            tick,
-        );
-        let mode_changed = start_action == StartAction::ToggleHeadDrive;
+        let mode_changed = start_action == Some(StartAction::ToggleHeadDrive);
         if mode_changed {
             if let Err(error) = reset_precision(&mut precision, &mut stream, &mut next_id, true) {
                 tracing::error!(%error, "precision cancellation on mode change failed");
@@ -1028,9 +918,10 @@ fn run_session(
             head_drive = !head_drive;
             imu_reference = None;
             center_sticks = true;
-            tracing::info!(head_drive, "Start held five seconds — gamepad mode switched");
+            tracing::info!(head_drive, "Select and Start — gamepad mode switched");
         }
 
+        // A reconnected pad can have a new event node even when it returns between polls.
         let attitude = tap.and_then(|tap| {
             tap.watch(&pad);
             tap.imu_control(head_drive && imu_head.enabled);
@@ -1044,7 +935,7 @@ fn run_session(
             head_from_pad(pad_imu::relative(reference, attitude), imu_head.gain, args.max_head)
         });
 
-        if start_action == StartAction::Initialize {
+        if start_action == Some(StartAction::Initialize) {
             match explicit_low_voltage_rearm(&mut stream, &mut next_id, &mut gate) {
                 Ok(true) => {}, Ok(false) => continue,
                 Err(error) => { tracing::warn!(%error, "low-voltage recovery result unknown; reconnecting and requiring neutral controls"); return std::process::ExitCode::FAILURE; }

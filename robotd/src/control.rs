@@ -529,10 +529,14 @@ impl Controller {
         self.policy.has_sitstand()
     }
 
-    /// How long the policy holds the shutdown sit before the joints ease into the rest pose:
-    /// the seat's settle time, then a second sitting still.
+    /// Duration of the configured sit transition.
+    pub fn sit_ramp_secs(&self) -> f64 {
+        self.skills.sitstand_ramp_s
+    }
+
+    /// The sit transition followed by a second of holding the seat.
     pub fn shutdown_sit_secs(&self) -> f64 {
-        self.skills.sitstand_ramp_s + 1.0
+        self.sit_ramp_secs() + 1.0
     }
 
     pub fn is_sitting(&self) -> bool {

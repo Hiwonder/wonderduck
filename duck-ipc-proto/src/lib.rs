@@ -722,10 +722,9 @@ pub mod method {
     /// or `robot.enable` brings it up from a known state. Discrete; send as a request.
     pub const ROBOT_REBOOT_MOTORS: &str = "robot.rebootMotors";
 
-    /// Put the robot down for a rest: [`ROBOT_SHUTDOWN`]'s sequence without the power-off. A
-    /// driving robot sits with the sitstand policy, eases into the rest pose, then has torque cut
-    /// and every servo rebooted ([`ROBOT_REBOOT_MOTORS`]); a robot that cannot sit is rebooted
-    /// where it is. Ends limp, ready for `robot.init`. Discrete; send as a request.
+    /// Put the robot down for a rest. After the sitstand policy seats the robot, it plays
+    /// the Studio rest action on HX, or eases into the rest pose on other buses. It then releases
+    /// torque and stays powered on, ready for `robot.init`. Send as a request.
     pub const ROBOT_REST: &str = "robot.rest";
 
     // ── skills ───────────────────────────────────────────────────────────────
@@ -1116,7 +1115,7 @@ pub enum Call {
     RobotEmergencyRelax,
     /// Reboot servos (all of them, or the ids named), then limp. See [`method::ROBOT_REBOOT_MOTORS`].
     RobotRebootMotors(RebootMotorsParams),
-    /// Sit, ease into the rest pose, then torque off and reboot. See [`method::ROBOT_REST`].
+    /// Sit, perform the rest movement, then release torque. See [`method::ROBOT_REST`].
     RobotRest,
     /// Run a one-shot skill, or toggle sit↔stand.
     RobotDo(DoParams),
@@ -2414,6 +2413,9 @@ pub struct HeadParams {
     pub head_pitch: f64,
     pub head_yaw: f64,
     pub head_roll: f64,
+    /// Optional HX encoder targets for head pitch (ID 31) and yaw (ID 32).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_position: Option<[u16; 2]>,
 }
 
 /// Session-bound movement tracking. Target is horizontal offset and image-area fraction.
@@ -2456,7 +2458,12 @@ pub struct MotionTrackingParams {
     /// Optional raw head pitch handed over when tracking starts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_pitch: Option<u16>,
+    /// Horizontal offset and relative area. For line following the second value
+    /// is the upright image width divided by its height.
     pub target: Option<[f64; 2]>,
+    /// Fixed forward velocity in m/s for line following.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_speed: Option<f64>,
     pub reference_area: f64,
     /// Relative area error and horizontal error as fractions of image width.
     pub deadzone: [f64; 2],
@@ -2570,6 +2577,9 @@ pub struct CoordinatedTrackingParams {
     /// Mouth positions before and after the arrival action.
     pub mouth_before: TimedMouthPosition,
     pub mouth_after: TimedMouthPosition,
+    /// The second pickup and carry configuration, entered after the first arrival action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup_after: Option<Box<CoordinatedTrackingParams>>,
 }
 
 impl CoordinatedTrackingParams {
@@ -2600,6 +2610,11 @@ impl CoordinatedTrackingParams {
             && self.final_tolerance.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.arrival_delay_s.is_finite() && self.arrival_delay_s >= 0.0
             && self.mouth_before.valid() && self.mouth_after.valid()
+            && self.pickup_after.as_ref().is_none_or(|after| self.stop_area_px.is_none()
+                && (self.action != MotionTrackingAction::Start || !self.arrival_skill.is_empty())
+                && after.pickup_after.is_none()
+                && after.action == MotionTrackingAction::Start && after.stop_area_px.is_none()
+                && after.target.is_none() && after.camera.is_none() && after.valid())
     }
 }
 
@@ -2633,10 +2648,11 @@ impl MazeParams {
 impl MotionTrackingParams {
     pub fn valid(&self) -> bool {
         self.initial_pitch.is_none_or(|value| self.action == MotionTrackingAction::Start && (1024..=2250).contains(&value))
+            && self.line_speed.is_none_or(|value| (0.0..=0.4).contains(&value))
             && self.reference_area.is_finite() && (0.0..=1.0).contains(&self.reference_area)
             && self.reference_area > 0.0
-            && self.target.is_none_or(|[x, area]| x.is_finite() && x.abs() <= 1.0
-                && area.is_finite() && (0.0..=1.0).contains(&area) && area > 0.0)
+            && self.target.is_none_or(|[x, secondary]| x.abs() <= 1.0 && secondary > 0.0
+                && if self.line_speed.is_some() { secondary.is_finite() } else { secondary <= 1.0 })
             && self.deadzone.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.gains.iter().all(|axis| axis.iter()
                 .all(|value| value.is_finite() && (0.0..=10.0).contains(value)))
@@ -4394,6 +4410,8 @@ pub struct RobotState {
     /// Actual coordinated tracking phase, absent while that mode is inactive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracking_phase: Option<CoordinatedTrackingPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup_stage: Option<PickupStage>,
     pub safety: SafetyState,
     #[serde(rename = "loop")]
     pub control_loop: LoopState,
@@ -4512,6 +4530,10 @@ pub enum CoordinatedTrackingPhase {
     WaitingRobot,
     Fallen,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickupStage { Before, After }
 
 /// The trunk IMU, in [`RobotState::imu`]. Trunk frame: x forward, y left, z up.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]

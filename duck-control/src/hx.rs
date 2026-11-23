@@ -1255,6 +1255,38 @@ impl RobotIo for HxIo {
         Ok(())
     }
 
+    fn write_timed_positions(&mut self, positions: &[Option<f64>; NUM_JOINTS], duration_ms: u16) -> Result<bool> {
+        if self.recovery_imu_pending || self.torque_enabled != Some(true) {
+            return Err(IoError::Bus("cannot play a timed HX frame without confirmed torque and bus readiness".into()));
+        }
+        let mut ids = Vec::new();
+        let mut data = Vec::new();
+        let duration = duration_ms.to_le_bytes();
+        let mut counts = self.last_sent_goals.map(|goals| goals.position_counts);
+        for (index, position) in positions.iter().enumerate() {
+            let Some(position) = position else { continue };
+            let raw = encode_position(index, *position)?;
+            let goal = raw.to_le_bytes();
+            ids.push(JOINT_IDS[index]);
+            data.push(vec![0, goal[0], goal[1], duration[0], duration[1], 0, 0]);
+            if let Some(counts) = counts.as_mut() {
+                counts[index] = raw;
+            }
+        }
+        if !ids.is_empty() {
+            // Restore ordinary untimed motion with the next control-loop target.
+            self.motion_restore_pending = true;
+            self.sync_write_ids(ACCELERATION, 7, &ids, &data)?;
+            if self.record_feedback {
+                self.last_sent_goals = counts.map(|position_counts| SentGoals {
+                    position_counts,
+                    sent_t_ns: duck_ipc_proto::clock::monotonic_ns(),
+                });
+            }
+        }
+        Ok(true)
+    }
+
     fn set_torque(&mut self, on: bool) -> Result<()> {
         HxIo::set_torque(self, on)
     }
