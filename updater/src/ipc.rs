@@ -807,6 +807,7 @@ impl Server {
             | Call::RobotSoundClip(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
+            | Call::RobotAccessoryTrigger(_)
             | Call::RobotTheremin(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe
