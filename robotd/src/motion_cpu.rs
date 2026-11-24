@@ -112,8 +112,8 @@ mod tests {
         let mut params = Params::default();
         params.policy.enabled = false;
         let config = dir.join("robotd.toml");
-        let state = Arc::new(RobotState::new(&params, &config));
         let intents = Arc::new(Intents::new());
+        let state = Arc::new(RobotState::new(&params, &config, Arc::clone(&intents)));
         let period = Duration::from_millis(20);
         let controller = crate::control_loop(
             FakeIo::at(DEFAULT_POSITION),

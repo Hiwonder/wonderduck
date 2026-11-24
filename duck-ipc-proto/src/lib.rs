@@ -2425,6 +2425,9 @@ pub struct HeadParams {
     pub raw_position: Option<[u16; 2]>,
 }
 
+/// End an autonomous session after this long without its client heartbeat.
+pub const AUTONOMOUS_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Session-bound movement tracking. Target is horizontal offset and image-area fraction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -3027,6 +3030,12 @@ pub struct PoliciesResult {
     /// show what is loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// A one-shot skill that is currently executing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_skill: Option<String>,
+    /// Most recent skill timeout, identified once per daemon session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_skill_timeout: Option<SkillTimeout>,
     /// Whether the robot has reached its home pose, or `None` from a robot too old to say.
     ///
     /// **A skill is refused while this is false, and the refusal expires on its own.** That makes
@@ -3071,6 +3080,12 @@ pub struct PoliciesResult {
     /// throughout — a failed change swaps nothing — so this is *degraded*, never unhealthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillTimeout {
+    pub sequence: u64,
+    pub skill: String,
 }
 
 /// One policy slot's state, for [`PoliciesResult`].

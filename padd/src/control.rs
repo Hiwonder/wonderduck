@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use duck_ipc_proto as proto;
 
 pub const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+pub const IDLE_RELEASE: Duration = Duration::from_millis(250);
 const LEASE_TTL: Duration = Duration::from_millis(750);
 
 pub fn stop_on_pad_loss(present: bool, owns: bool) -> bool {

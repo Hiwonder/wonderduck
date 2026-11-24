@@ -54,6 +54,13 @@ struct Stamped<T> {
 }
 
 #[derive(Clone, Copy)]
+struct HeadIntent {
+    target: duck_ipc_proto::HeadParams,
+    at_us: u64,
+    hold: bool,
+}
+
+#[derive(Clone, Copy)]
 struct TwistIntent {
     value: [f64; 3],
     at_us: u64,
@@ -63,6 +70,8 @@ struct TwistIntent {
 }
 
 const MOTION_TRACKING_TIMEOUT_US: u64 = 500_000;
+const AUTONOMOUS_SESSION_TIMEOUT_US: u64 =
+    duck_ipc_proto::AUTONOMOUS_SESSION_TIMEOUT.as_micros() as u64;
 // The preview and tracking start share one web control lease.
 const HEAD_HANDOFF_TIMEOUT_US: u64 = 700_000;
 
@@ -201,6 +210,13 @@ impl SkillRequests {
     }
 }
 
+/// A one-shot request that must report the control loop's actual start decision.
+pub(crate) struct ManualSkillRequest {
+    pub name: String,
+    pub deadline: Instant,
+    pub reply: tokio::sync::oneshot::Sender<duck_ipc_proto::IntentResult>,
+}
+
 // Bit positions for the two skills that are not in the configurable list.
 const SKILL_GROUND_PICK: u32 = 1 << 0;
 const SKILL_SIT_TOGGLE: u32 = 1 << 1;
@@ -266,7 +282,7 @@ pub struct Intents {
     precision: ArcSwapOption<PrecisionRequest>,
     last_precision: ArcSwapOption<PrecisionRequest>,
     precision_running: AtomicBool,
-    head: ArcSwap<Stamped<duck_ipc_proto::HeadParams>>,
+    head: ArcSwap<HeadIntent>,
     head_generation: std::sync::atomic::AtomicU64,
     head_tracking: ArcSwap<HeadTrackingIntent>,
     head_tracking_epoch: std::sync::atomic::AtomicU64,
@@ -310,6 +326,7 @@ pub struct Intents {
     /// Pending skill requests, a bitmask taken (swapped to zero) once per tick. A mask
     /// rather than one slot so two different buttons in the same tick both arrive.
     skills: std::sync::atomic::AtomicU32,
+    manual_skill: Mutex<Option<ManualSkillRequest>>,
     /// A shutdown was requested. A level, not an edge: once asked, the sequence runs.
     shutdown: AtomicBool,
     confirmed_shutdown: AtomicBool,
@@ -409,6 +426,7 @@ pub struct Snapshot {
     /// Age of the most recent head intent, so idle yawning yields to its owner.
     pub head_age: Duration,
     pub head_position_raw: Option<[u16; 2]>,
+    pub head_position_held: bool,
     pub head_generation: u64,
     pub head_tracking: Option<HeadTrackingSnapshot>,
     pub head_position_handoff: Option<u16>,
@@ -480,9 +498,10 @@ impl Intents {
             precision: ArcSwapOption::empty(),
             last_precision: ArcSwapOption::empty(),
             precision_running: AtomicBool::new(false),
-            head: ArcSwap::from_pointee(Stamped {
-                value: duck_ipc_proto::HeadParams::default(),
+            head: ArcSwap::from_pointee(HeadIntent {
+                target: duck_ipc_proto::HeadParams::default(),
                 at_us: 0,
+                hold: false,
             }),
             head_generation: std::sync::atomic::AtomicU64::new(0),
             head_tracking: ArcSwap::from_pointee(HeadTrackingIntent::default()),
@@ -503,6 +522,7 @@ impl Intents {
             chorale_piece: AtomicU8::new(0),
             chorale_heard: std::sync::Mutex::new(Vec::new()),
             skills: std::sync::atomic::AtomicU32::new(0),
+            manual_skill: Mutex::new(None),
             shutdown: AtomicBool::new(false),
             confirmed_shutdown: AtomicBool::new(false),
             rest: AtomicBool::new(false),
@@ -600,24 +620,36 @@ impl Intents {
     }
 
     pub fn set_head(&self, head: duck_ipc_proto::HeadParams) {
-        if self.head.load().value != head {
+        if self.head.load().target != head {
             self.head_generation.fetch_add(1, Ordering::AcqRel);
         }
-        self.head.store(Arc::new(Stamped {
-            value: head,
+        self.head.store(Arc::new(HeadIntent {
+            target: head,
             at_us: self.now_us(),
+            hold: false,
         }));
     }
 
     pub fn clear_head(&self) {
-        self.head.store(Arc::new(Stamped { value: duck_ipc_proto::HeadParams::default(), at_us: self.now_us() }));
+        self.head.store(Arc::new(HeadIntent {
+            target: duck_ipc_proto::HeadParams::default(),
+            at_us: self.now_us(),
+            hold: false,
+        }));
+    }
+
+    pub fn hold_manual_head_on_release(&self) {
+        let head = **self.head.load();
+        if head.target.raw_position.is_some() && self.now_us().saturating_sub(head.at_us) <= 250_000 {
+            self.head.store(Arc::new(HeadIntent { hold: true, ..head }));
+        } else {
+            self.clear_head();
+        }
     }
 
     pub fn motion_tracking_active(&self) -> bool {
         let tracking = self.motion_tracking.load();
-        tracking.active
-            && self.now_us().saturating_sub(tracking.at_us) <= MOTION_TRACKING_TIMEOUT_US
-            && tracking.epoch == self.motion_tracking_epoch.load(Ordering::Acquire)
+        tracking.active && tracking.epoch == self.motion_tracking_epoch.load(Ordering::Acquire)
     }
 
     pub fn head_tracking_active(&self) -> bool {
@@ -778,7 +810,7 @@ impl Intents {
 
     pub fn maze_active(&self) -> bool {
         let maze = self.maze.load();
-        maze.params.is_some() && self.now_us().saturating_sub(maze.at_us) <= MOTION_TRACKING_TIMEOUT_US
+        maze.params.is_some() && self.now_us().saturating_sub(maze.at_us) <= AUTONOMOUS_SESSION_TIMEOUT_US
             && maze.epoch == self.maze_epoch.load(Ordering::Acquire)
     }
 
@@ -793,7 +825,8 @@ impl Intents {
         let epoch = self.maze_epoch.load(Ordering::Acquire);
         let accepted = AtomicBool::new(false);
         self.maze.rcu(|previous| {
-            let valid = previous.params.is_some() && now.saturating_sub(previous.at_us) <= MOTION_TRACKING_TIMEOUT_US
+            let valid = previous.params.is_some()
+                && now.saturating_sub(previous.at_us) <= AUTONOMOUS_SESSION_TIMEOUT_US
                 && previous.epoch == epoch;
             let mut next = **previous;
             let allow = match params.action {
@@ -827,8 +860,9 @@ impl Intents {
         let initial_pitch = params.initial_pitch.or_else(|| self.head_position_handoff(owner, now));
         let accepted = AtomicBool::new(false);
         self.motion_tracking.rcu(|previous| {
-            let valid = previous.active && now.saturating_sub(previous.at_us) <= MOTION_TRACKING_TIMEOUT_US
-                && previous.epoch == epoch;
+            // A stale sample stops movement in snapshot(). The same owner can
+            // supply a fresh sample as long as the tracking session still exists.
+            let valid = previous.active && previous.epoch == epoch;
             let mut next = **previous;
             let allow = match params.action {
                 MotionTrackingAction::Start => !valid || previous.owner == owner,
@@ -879,6 +913,13 @@ impl Intents {
         if let Some(pending) = self.precision.swap(None) {
             pending.finish();
         }
+        if let Some(pending) = self.take_manual_skill() {
+            let _ = pending.reply.send(duck_ipc_proto::IntentResult::refused("the skill request was stopped"));
+        }
+    }
+
+    pub fn stop_generation(&self) -> u64 {
+        self.stop_generation.load(Ordering::Acquire)
     }
 
     pub fn abandon_head_return(&self) {
@@ -988,6 +1029,19 @@ impl Intents {
             sit_toggle: bits & SKILL_SIT_TOGGLE != 0,
             skills: bits >> SKILL_BITS,
         }
+    }
+
+    pub(crate) fn request_manual_skill(&self, request: ManualSkillRequest) -> Result<(), &'static str> {
+        let mut pending = self.manual_skill.lock().expect("manual skill mutex");
+        if pending.as_ref().is_some_and(|pending| !pending.reply.is_closed()) {
+            return Err("the skill request is already pending");
+        }
+        *pending = Some(request);
+        Ok(())
+    }
+
+    pub(crate) fn take_manual_skill(&self) -> Option<ManualSkillRequest> {
+        self.manual_skill.lock().expect("manual skill mutex").take()
     }
 
     /// Queue a sound for the loop's next tick. The wheee is the exception — it is a level,
@@ -1311,7 +1365,7 @@ impl Intents {
                 } else {
                     twist.value
                 },
-                head: [head.value.neck_pitch, head.value.head_pitch, head.value.head_yaw, head.value.head_roll],
+                head: [head.target.neck_pitch, head.target.head_pitch, head.target.head_yaw, head.target.head_roll],
                 // The loop owns the smoothing that turns the pose intent into this block;
                 // the raw target travels in `pose` below. Nominal zero is the trained
                 // encoding, not a placeholder.
@@ -1324,7 +1378,8 @@ impl Intents {
             abandon_generation: self.abandon_generation.load(Ordering::Acquire),
             abandon_head_generation: self.abandon_head_generation.load(Ordering::Relaxed),
             head_age: Duration::from_micros(now.saturating_sub(head.at_us)),
-            head_position_raw: head.value.raw_position,
+            head_position_raw: head.target.raw_position,
+            head_position_held: head.hold,
             head_generation: self.head_generation.load(Ordering::Acquire),
             head_tracking: (head_tracking.active && now.saturating_sub(head_tracking.at_us) <= MOTION_TRACKING_TIMEOUT_US
                 && head_tracking.epoch == self.head_tracking_epoch.load(Ordering::Acquire))
@@ -1370,6 +1425,112 @@ impl Intents {
             pose,
             mouth: f64::from_bits(self.mouth.load(std::sync::atomic::Ordering::Relaxed)),
         }
+    }
+}
+
+#[cfg(test)]
+mod autonomous_timeout_tests {
+    use super::*;
+    use duck_ipc_proto::{MazeParams, MotionTrackingAction as Action, MotionTrackingParams};
+
+    #[test]
+    fn line_resumes_on_a_new_sample_after_the_previous_sample_expires() {
+        let mut intents = Intents::new();
+        intents.epoch = Instant::now() - Duration::from_secs(2);
+        let mut params = MotionTrackingParams {
+            action: Action::Start, initial_pitch: None, target: Some([0.2, 1.0]),
+            line_speed: Some(0.15), reference_area: 0.01, deadzone: [0.0; 2],
+            gains: [[0.0; 3]; 2],
+        };
+        assert!(intents.update_motion_tracking(1, params));
+        let mut old = **intents.motion_tracking.load();
+        old.at_us -= MOTION_TRACKING_TIMEOUT_US + 1;
+        intents.motion_tracking.store(Arc::new(old));
+        assert!(intents.snapshot().motion_tracking.is_none());
+        assert!(intents.motion_tracking_active());
+
+        params.action = Action::Update;
+        assert!(!intents.update_motion_tracking(2, params));
+        assert!(intents.update_motion_tracking(1, params));
+        assert_eq!(intents.snapshot().motion_tracking.unwrap().target, params.target);
+        intents.cancel_motion_tracking();
+        assert!(!intents.update_motion_tracking(1, params));
+    }
+
+    #[test]
+    fn maze_pauses_motion_before_it_expires_the_session() {
+        let mut intents = Intents::new();
+        intents.epoch = Instant::now() - Duration::from_secs(2);
+        let mut params = MazeParams {
+            action: Action::Start, threshold_mm: 400, head_step_deg: 10.0,
+            settle_ms: 1000, sample_ms: 200, turn_initial_ms: 200,
+            turn_final_ms: 200, restore_ms: 200, linear_speed: 0.15, angular_speed: 1.0,
+        };
+        assert!(intents.update_maze(1, params));
+        let mut old = **intents.maze.load();
+        old.at_us -= MOTION_TRACKING_TIMEOUT_US + 50_000;
+        intents.maze.store(Arc::new(old));
+        assert!(intents.snapshot().maze.is_none());
+        assert!(intents.maze_active());
+
+        params.action = Action::Update;
+        assert!(!intents.update_maze(2, params));
+        assert!(intents.update_maze(1, params));
+        assert!(intents.snapshot().maze.is_some());
+
+        let mut expired = **intents.maze.load();
+        expired.at_us -= AUTONOMOUS_SESSION_TIMEOUT_US + 1;
+        intents.maze.store(Arc::new(expired));
+        assert!(!intents.maze_active());
+        assert!(!intents.update_maze(1, params));
+    }
+}
+
+#[cfg(test)]
+mod manual_skill_tests {
+    use super::{Intents, ManualSkillRequest};
+    use duck_ipc_proto::IntentResult;
+    use std::time::{Duration, Instant};
+    use tokio::sync::oneshot;
+
+    fn request(name: &str) -> (ManualSkillRequest, oneshot::Receiver<IntentResult>) {
+        let (reply, response) = oneshot::channel();
+        let request = ManualSkillRequest {
+            name: name.to_owned(),
+            deadline: Instant::now() + Duration::from_millis(350),
+            reply,
+        };
+        (request, response)
+    }
+
+    #[test]
+    fn repeated_skill_is_refused_instead_of_queued() {
+        let intents = Intents::new();
+        let (first, mut response) = request("kick_left");
+        let (duplicate, _) = request("kick_left");
+        assert!(intents.request_manual_skill(first).is_ok());
+        assert_eq!(intents.request_manual_skill(duplicate),
+            Err("the skill request is already pending"));
+        assert!(matches!(response.try_recv(), Err(oneshot::error::TryRecvError::Empty)));
+
+        let pending = intents.take_manual_skill().expect("first request");
+        assert_eq!(pending.name, "kick_left");
+        pending.reply.send(IntentResult::accepted()).expect("waiting client");
+        assert!(response.try_recv().expect("control loop response").accepted);
+        assert!(intents.take_manual_skill().is_none());
+    }
+
+    #[test]
+    fn stop_refuses_the_pending_skill_before_it_can_start() {
+        let intents = Intents::new();
+        let (pending, mut response) = request("kick_right");
+        assert!(intents.request_manual_skill(pending).is_ok());
+        intents.stop();
+
+        let result = response.try_recv().expect("stop response");
+        assert!(!result.accepted);
+        assert_eq!(result.reason.as_deref(), Some("the skill request was stopped"));
+        assert!(intents.take_manual_skill().is_none());
     }
 }
 

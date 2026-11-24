@@ -2,6 +2,9 @@
 """Interactively install an official WonderDuck release."""
 
 import argparse
+from contextlib import contextmanager
+import fcntl
+from html.parser import HTMLParser
 import importlib.util
 import inspect
 import json
@@ -20,6 +23,15 @@ import urllib.request
 
 ROOT = Path('/home/wonderduck/wonderduck')
 STATUS_FILE = '.software-update-status.json'
+RECOVERY_FILE = '.software-update-recovery.json'
+RECOVERY_HELPER = '.software-update-recovery'
+UPDATE_LOCK = '.software-update.lock'
+ROBOT_SOCKET = '/run/robotd.sock'
+RECOVERY_HOOK = (
+    "ExecStartPre=+/bin/sh -c 'if test -f /home/wonderduck/wonderduck/.software-update-recovery.json; "
+    "then exec /usr/bin/sudo -n -u wonderduck -- /usr/bin/python3 -B "
+    "/home/wonderduck/wonderduck/.software-update-recovery/update.py --recover-at-start; fi'"
+)
 VERSION_NUMBER = r'(0|[1-9][0-9]*)'
 VERSION = r'\.'.join([VERSION_NUMBER] * 3)
 VERSION_PATTERNS = {
@@ -95,9 +107,9 @@ def parse_version(value, channel):
     return value if VERSION_PATTERNS[channel].fullmatch(value) else None
 
 
-def read_url(url, limit):
+def read_url(url, limit, timeout=15):
     request = urllib.request.Request(url, headers={'User-Agent': 'WonderDuck-Updater', 'Accept': 'application/json'})
-    with urllib.request.urlopen(request, timeout=15) as response:
+    with urllib.request.urlopen(request, timeout=timeout) as response:
         data = response.read(limit + 1)
     if not data or len(data) > limit:
         raise ValueError('invalid release response')
@@ -174,8 +186,8 @@ def command(args, **kwargs):
     return subprocess.run(args, cwd=ROOT, env=env, check=True, **kwargs)
 
 
-def load_installer():
-    spec = importlib.util.spec_from_file_location('runtime_release', ROOT / 'scripts/runtime_release.py')
+def load_installer(source=None):
+    spec = importlib.util.spec_from_file_location('runtime_release', source or ROOT / 'scripts/runtime_release.py')
     runtime = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(runtime)
     return runtime
@@ -208,15 +220,32 @@ def prepare_release(runtime, source, version, directory, report):
     return data
 
 
-def report_status(version, phase, **details):
-    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=str(ROOT), delete=False) as stream:
-        temporary = Path(stream.name)
-        json.dump(dict(version=version, phase=phase, **details), stream)
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
-        os.replace(str(temporary), str(ROOT / STATUS_FILE))
+        os.fsync(descriptor)
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        os.close(descriptor)
+
+
+def write_update_json(path, data, *, durable=False):
+    pending = tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent, delete=False)
+    temporary = Path(pending.name)
+    try:
+        with pending as stream:
+            json.dump(data, stream)
+            stream.flush()
+            if durable:
+                os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        if durable:
+            sync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def report_status(version, phase, **details):
+    write_update_json(ROOT / STATUS_FILE, dict(version=version, phase=phase, **details))
 
 
 def error_text(error):
@@ -275,6 +304,9 @@ def create_checkpoint(runtime, archive):
     present = [str(path.relative_to('/')) for path in paths if runtime.exists(path)]
     with archive.open('wb') as stream:
         command(['sudo', '-n', 'tar', '-C', '/', '-cpf', '-', '--', *present], stdout=stream, timeout=180)
+        stream.flush()
+        os.fsync(stream.fileno())
+    sync_directory(archive.parent)
     return worktrees, submodule_url, paths
 
 
@@ -285,7 +317,7 @@ def restore_git_setting(repo, name, value):
         command(['git', '-C', str(repo), 'config', '--local', '--unset', name], timeout=10)
 
 
-def restore_checkpoint(runtime, archive, checkpoint, restore_runtime):
+def restore_checkpoint(runtime, archive, checkpoint, restore_runtime, *, boot=False):
     worktrees, submodule_url, paths = checkpoint
     for repo, revision, branch, origin in worktrees:
         checkout = [branch] if branch else ['--detach', revision]
@@ -303,13 +335,208 @@ def restore_checkpoint(runtime, archive, checkpoint, restore_runtime):
     with archive.open('rb') as stream:
         command(['sudo', '-n', 'tar', '-C', '/', '--numeric-owner', '-xpf', '-'], stdin=stream, timeout=180)
     command(['sudo', '-n', 'systemctl', 'daemon-reload'], timeout=20)
+    if boot:
+        return
     if runtime.PROMPT_SERVICE_TARGET.is_file():
         command(['sudo', '-n', 'systemctl', 'restart', runtime.PROMPT_SERVICE_TARGET.name], timeout=30)
     else:
         command(['sudo', '-n', 'systemctl', 'stop', runtime.PROMPT_SERVICE_TARGET.name], timeout=30)
 
 
-def wait_robot_ready(expected_revision=None, studio_port=None):
+def record_recovery(stage, version, checkpoint, job_id, *, phase='stopping'):
+    worktrees, submodule_url, paths = checkpoint
+    record = dict(stage=stage.name, version=version, job_id=job_id, phase=phase,
+                  worktrees=[(str(repo), revision, branch, origin) for repo, revision, branch, origin in worktrees],
+                  submodule_url=submodule_url, paths=list(map(str, paths)))
+    write_update_json(ROOT / RECOVERY_FILE, record, durable=True)
+
+
+def prepare_recovery_helper(runtime, revision):
+    helper = ROOT / RECOVERY_HELPER
+    helper.mkdir(mode=0o700, exist_ok=True)
+    source = Path(__file__).resolve()
+    update = source.read_bytes() if source.is_file() else runtime.git_blob(ROOT, revision, Path('scripts/update.py'))
+    if b'--recover-at-start' not in update:
+        raise ValueError('发布版本缺少软件更新恢复程序')
+    for name, content in (('update.py', update),
+                          ('runtime_release.py', (ROOT / 'scripts/runtime_release.py').read_bytes())):
+        temporary = helper / (name + '.pending')
+        with temporary.open('wb') as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, helper / name)
+    sync_directory(helper)
+    sync_directory(ROOT)
+
+
+def ensure_recovery_hook(runtime):
+    path = runtime.SYSTEMD_DROPIN.with_name('wonderduck-update-recovery.conf')
+    contents = ('[Service]\n' + RECOVERY_HOOK + '\n').encode()
+    if path.is_file() and path.read_bytes() == contents:
+        return
+    with tempfile.NamedTemporaryFile() as stream:
+        stream.write(contents)
+        stream.flush()
+        pending = path.with_suffix('.pending')
+        command(['sudo', '-n', '/usr/bin/install', '-m', '0644', stream.name, str(pending)], timeout=10)
+        command(['sudo', '-n', '/usr/bin/mv', '--', str(pending), str(path)], timeout=10)
+        command(['sudo', '-n', '/usr/bin/sync', '-f', str(path)], timeout=10)
+    runtime.reload_systemd()
+
+
+def clear_recovery():
+    (ROOT / RECOVERY_FILE).unlink(missing_ok=True)
+    sync_directory(ROOT)
+    helper = ROOT / RECOVERY_HELPER
+    try:
+        if helper.is_dir():
+            for name in ('update.py', 'runtime_release.py'):
+                (helper / name).unlink(missing_ok=True)
+            helper.rmdir()
+    except OSError as error:
+        print(error_text(error), file=sys.stderr)
+
+
+def recovery_checkpoint(runtime, record):
+    stage_name = record['stage']
+    if record['phase'] not in ('stopping', 'applying', 'starting'):
+        raise ValueError('软件更新恢复阶段无效')
+    if not isinstance(stage_name, str) or not re.fullmatch(r'\.software-update-[A-Za-z0-9_]+', stage_name):
+        raise ValueError('软件更新恢复目录无效')
+    stage = ROOT / stage_name
+    archive = stage / 'previous.tar'
+    if stage.is_symlink() or archive.is_symlink() or not archive.is_file():
+        raise ValueError('没有找到软件更新恢复文件')
+    worktrees = [(Path(repo), revision, branch, origin) for repo, revision, branch, origin in record['worktrees']]
+    if [item[0] for item in worktrees] != [ROOT, ROOT / 'extensions/wonderduck_studio']:
+        raise ValueError('软件更新恢复仓库无效')
+    if any(not re.fullmatch(r'[0-9a-f]{40}', revision) for _, revision, _, _ in worktrees):
+        raise ValueError('软件更新恢复版本无效')
+    allowed = set(checkpoint_paths(runtime)) | {ROOT / runtime.OBJECT_MODEL}
+    paths = list(map(Path, record['paths']))
+    if not paths or not set(paths) <= allowed:
+        raise ValueError('软件更新恢复文件清单无效')
+    return stage, archive, (worktrees, record['submodule_url'], paths)
+
+
+def recover_at_start():
+    journal = ROOT / RECOVERY_FILE
+    if not journal.exists():
+        return
+    descriptor = os.open(ROOT / UPDATE_LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # Only the live updater may start the newly installed service.
+            if journal.exists() and json.loads(journal.read_text(encoding='utf-8')).get('phase') != 'starting':
+                raise RuntimeError('软件更新正在安装，暂不能启动机器人')
+            return
+        if not journal.exists():
+            return
+        runtime = load_installer(ROOT / RECOVERY_HELPER / 'runtime_release.py')
+        record = json.loads(journal.read_text(encoding='utf-8'))
+        stage, archive, checkpoint = recovery_checkpoint(runtime, record)
+        details = dict(job_id=record['job_id'], failed_phase=record['phase'],
+                       error='软件更新在完成前中断')
+        report_status(record['version'], 'rollback', **details)
+        try:
+            runtime.ensure_robot_lock()
+            with runtime.exclusive_lock(runtime.ROBOT_LOCK):
+                runtime.check_processes()
+                restore_checkpoint(runtime, archive, checkpoint, record['phase'] != 'stopping', boot=True)
+                for directory, transaction in runtime.pending(ROOT):
+                    if transaction.get('version') == record['version']:
+                        runtime.discard_pending(directory, ROOT, transaction, record['version'])
+        except Exception as error:
+            report_status(record['version'], 'failed', rollback='failed', rollback_error=error_text(error), **details)
+            raise
+        report_status(record['version'], 'failed', rollback='done', **details)
+        clear_recovery()
+        shutil.rmtree(stage)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def installation_lease(runtime, socket_path):
+    state = command(['systemctl', 'show', 'robotd', '-p', 'ActiveState', '--value'],
+                    stdout=subprocess.PIPE, timeout=10).stdout.strip()
+    if state in (b'inactive', b'failed'):
+        runtime.ensure_robot_lock()
+        with runtime.exclusive_lock(runtime.ROBOT_LOCK):
+            runtime.check_processes()
+            yield
+        return
+    sys.path.insert(0, str(ROOT / 'extensions/wonderduck_studio/console'))
+    try:
+        from app.robot.studio import MaintenanceLease
+        from app.robot.workspace_rest import ensure_rest, rest_status
+    finally:
+        sys.path.pop(0)
+
+    ensure_rest(socket_path)
+    lease = MaintenanceLease(socket_path)
+    try:
+        lease.request('acquire')
+        # Start may have arrived before we took the bus. Check again once no
+        # controller can change the state, then hold the lease through stop.
+        if rest_status(socket_path) != ('rested', False) or not lease.alive():
+            raise RuntimeError('安装前无法确认机器人已休息并锁定控制')
+        yield
+    finally:
+        lease.close()
+
+
+class StudioAssets(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.paths = set()
+        self.has_script = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == 'script':
+            path = attrs.get('src')
+        elif tag == 'link' and attrs.get('rel') in ('stylesheet', 'modulepreload'):
+            path = attrs.get('href')
+        else:
+            return
+        if isinstance(path, str) and re.fullmatch(r'/assets/[A-Za-z0-9_.-]+\.(js|css)', path):
+            self.paths.add(path)
+            self.has_script |= tag == 'script'
+
+
+def check_studio(port, *, allow_legacy=False):
+    base = f'http://127.0.0.1:{port}'
+    if not json.loads(read_url(base + '/api/info', 256 * 1024, timeout=2)).get('studio'):
+        raise ValueError('Studio 服务尚未就绪')
+    paths = set()
+    for page in ('/', '/debug.html'):
+        assets = StudioAssets()
+        assets.feed(read_url(base + page, 256 * 1024, timeout=2).decode('utf-8'))
+        if not assets.has_script:
+            raise ValueError('Studio 页面缺少构建资源')
+        paths.update(assets.paths)
+    for path in paths:
+        with urllib.request.urlopen(base + path, timeout=2) as response:
+            expected = ('text/javascript', 'application/javascript') if path.endswith('.js') else ('text/css',)
+            if response.headers.get_content_type() not in expected or not response.read(1):
+                raise ValueError('Studio 静态资源无效')
+    try:
+        with urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=2) as response:
+            if json.loads(response.read(4096)).get('ready') is not True:
+                raise ValueError('网页操控服务尚未就绪')
+    except urllib.error.HTTPError as error:
+        if error.code != 404 or not allow_legacy:
+            raise
+        with urllib.request.urlopen('http://127.0.0.1:8081/controls.js', timeout=2) as response:
+            if not response.read(1):
+                raise ValueError('网页操控服务尚未就绪')
+
+
+def wait_robot_ready(expected_revision=None, studio_port=8090, socket_path=ROBOT_SOCKET):
     deadline = time.monotonic() + 40
     reason = '没有收到机器人健康状态'
     while time.monotonic() < deadline:
@@ -320,17 +547,13 @@ def wait_robot_ready(expected_revision=None, studio_port=None):
                     raise ValueError('运行程序与发布版本不一致')
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(2)
-                connection.connect('/run/robotd.sock')
+                connection.connect(str(socket_path))
                 connection.sendall(b'{"jsonrpc":"2.0","id":1,"method":"robot.health"}\n')
                 with connection.makefile('rb') as stream:
                     response = json.loads(stream.readline(65536))
             health = response.get('result') or {}
             if health.get('healthy') is True:
-                if studio_port is not None:
-                    address = 'http://127.0.0.1:{}/api/info'.format(studio_port)
-                    with urllib.request.urlopen(address, timeout=2) as response:
-                        if not json.loads(response.read(256 * 1024)).get('studio'):
-                            raise ValueError('Studio 服务尚未就绪')
+                check_studio(studio_port, allow_legacy=expected_revision is None)
                 return
             reason = health.get('reason') or '机器人健康检查失败'
         except (OSError, ValueError) as error:
@@ -349,17 +572,21 @@ def check_worktrees(text):
             raise ValueError(text['dirty'].format(label))
 
 
-def install(source, version, text, channel, unattended=False, job_id=None, studio_port=None):
+def install(source, version, text, channel, unattended=False, job_id=None, studio_port=8090,
+            socket_path=ROBOT_SOCKET):
     try:
         runtime = load_installer()
-        with runtime.exclusive_lock(ROOT / '.software-update.lock', create=True):
-            return install_release(runtime, source, version, text, channel, unattended, job_id, studio_port)
+        with runtime.exclusive_lock(ROOT / UPDATE_LOCK, create=True):
+            if (ROOT / RECOVERY_FILE).exists():
+                raise ValueError('上次软件更新尚未恢复，请启动机器人服务以完成恢复')
+            return install_release(runtime, source, version, text, channel, unattended, job_id, studio_port, socket_path)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(error_text(error), file=sys.stderr)
         return 1
 
 
-def install_release(runtime, source, version, text, channel, unattended, job_id=None, studio_port=None):
+def install_release(runtime, source, version, text, channel, unattended, job_id=None, studio_port=8090,
+                    socket_path=ROBOT_SOCKET):
     channel_args = ['--channel', channel] if channel == 'develop' else []
     phase = 'prepare'
 
@@ -409,23 +636,33 @@ def install_release(runtime, source, version, text, channel, unattended, job_id=
         if reload_needed == b'yes':
             print(text['reload'], flush=True)
             command(['sudo', '-n', 'systemctl', 'daemon-reload'], timeout=20)
-        phase = 'install'
-        report(phase)
-        print(text['stop'], flush=True)
-        service_touched = True
-        command(['sudo', '-n', 'systemctl', 'stop', 'robotd'], timeout=35)
+        prepare_recovery_helper(runtime, revision)
+        ensure_recovery_hook(runtime)
+        report('rest')
+        with installation_lease(runtime, socket_path):
+            report('install')
+            record_recovery(stage, version, checkpoint, job_id)
+            print(text['stop'], flush=True)
+            service_touched = True
+            command(['sudo', '-n', 'systemctl', 'stop', 'robotd'], timeout=35)
         command([sys.executable, '-', version, *channel_args], input=source_script, timeout=180)
         print(text['install'], flush=True)
         existing_transactions = {directory for directory, _ in runtime.pending(ROOT)}
+        record_recovery(stage, version, checkpoint, job_id, phase='applying')
         runtime_touched = True
         command([sys.executable, 'scripts/runtime_release.py', 'install', '--version', version,
                  '--base-url', stage.as_uri(), *channel_args], timeout=480)
         phase = 'restart'
         report(phase)
+        record_recovery(stage, version, checkpoint, job_id, phase='starting')
         print(text['start'], flush=True)
         command(['sudo', '-n', 'systemctl', 'start', 'robotd'], timeout=35)
-        wait_robot_ready(revision, studio_port)
-        report('done')
+        wait_robot_ready(revision, studio_port, socket_path)
+        clear_recovery()
+        try:
+            report('done')
+        except OSError as error:
+            print(error_text(error), file=sys.stderr)
         print(text['done'], flush=True)
         return 0
     except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError, KeyboardInterrupt) as error:
@@ -435,15 +672,25 @@ def install_release(runtime, source, version, text, channel, unattended, job_id=
             try:
                 report('rollback', **result)
                 if service_touched:
-                    command(['sudo', '-n', 'systemctl', 'stop', 'robotd'], timeout=35)
-                restore_checkpoint(runtime, archive, checkpoint, runtime_touched)
-                if runtime_touched:
-                    for directory, record in runtime.pending(ROOT):
-                        if directory not in existing_transactions and record.get('version') == version:
-                            runtime.discard_pending(directory, ROOT, record, version)
+                    with installation_lease(runtime, socket_path):
+                        record_recovery(stage, version, checkpoint, job_id,
+                                        phase='applying' if runtime_touched else 'stopping')
+                        command(['sudo', '-n', 'systemctl', 'stop', 'robotd'], timeout=35)
                 if service_touched:
+                    with runtime.exclusive_lock(runtime.ROBOT_LOCK):
+                        runtime.check_processes()
+                        restore_checkpoint(runtime, archive, checkpoint, runtime_touched)
+                        if runtime_touched:
+                            for directory, record in runtime.pending(ROOT):
+                                if directory not in existing_transactions and record.get('version') == version:
+                                    runtime.discard_pending(directory, ROOT, record, version)
+                else:
+                    restore_checkpoint(runtime, archive, checkpoint, False)
+                if service_touched:
+                    record_recovery(stage, version, checkpoint, job_id, phase='starting')
                     command(['sudo', '-n', 'systemctl', 'start', 'robotd'], timeout=35)
-                    wait_robot_ready(studio_port=studio_port)
+                    wait_robot_ready(studio_port=studio_port, socket_path=socket_path)
+                    clear_recovery()
                 result['rollback'] = 'done'
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as rollback_error:
                 keep_checkpoint = True
@@ -471,9 +718,18 @@ def main():
     mode.add_argument('--check', action='store_true')
     mode.add_argument('--version')
     mode.add_argument('--preflight', action='store_true')
+    mode.add_argument('--recover-at-start', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--job-id', help=argparse.SUPPRESS)
-    parser.add_argument('--studio-port', type=int, help=argparse.SUPPRESS)
+    parser.add_argument('--studio-port', type=int, default=8090, help=argparse.SUPPRESS)
+    parser.add_argument('--robot-socket', default=ROBOT_SOCKET, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.recover_at_start:
+        try:
+            recover_at_start()
+            return 0
+        except (OSError, KeyError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            print(error_text(error), file=sys.stderr)
+            return 1
     text = TEXT[args.lang]
     prefix = 'dev_' if args.channel == 'develop' else ''
     if not (ROOT / '.git').exists():
@@ -499,7 +755,7 @@ def main():
             if args.studio_port is not None and not 1 <= args.studio_port <= 65535:
                 raise ValueError('Studio 端口无效')
             return install(source, version, text, args.channel, unattended=True,
-                           job_id=args.job_id, studio_port=args.studio_port)
+                           job_id=args.job_id, studio_port=args.studio_port, socket_path=args.robot_socket)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             print(str(error), file=sys.stderr)
             return 1
