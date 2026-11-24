@@ -10,12 +10,16 @@ use std::time::{Duration, Instant};
 
 use duck_control::hx::{HxIo, ImuSource};
 use duck_control::io::RobotIo;
-use duck_control::model::JOINT_IDS;
 
 #[derive(Clone, Copy, PartialEq)]
 enum RawReply { Normal, ImuOffline, TimeoutOnce, Error, InvalidPayload, InvalidFrame }
 
-struct BusState { missing_servo: Option<u8>, raw_reply: RawReply, raw_requests: usize }
+struct BusState {
+    missing_servo: Option<u8>,
+    raw_reply: RawReply,
+    raw_requests: usize,
+    accessory_requests: [usize; 2],
+}
 struct SimBus { io: HxIo, state: Arc<Mutex<BusState>>, running: Arc<AtomicBool>, worker: Option<JoinHandle<()>> }
 
 fn packet(id: u8, error: u8, payload: &[u8]) -> Vec<u8> {
@@ -78,6 +82,9 @@ fn respond(state: &mut BusState, request: &[u8]) -> Vec<u8> {
         };
     }
     assert_eq!((address, length), (0, 71));
+    if let 35..=36 = id {
+        state.accessory_requests[usize::from(id - 35)] += 1;
+    }
     if state.missing_servo == Some(id) { return Vec::new(); }
     let mut data = [0; 71];
     data[5] = id;
@@ -101,7 +108,7 @@ impl SimBus {
         io.set_individual_device_observation(true);
         assert_eq!(unsafe { libc::fcntl(master, libc::F_SETFL, libc::O_NONBLOCK) }, 0);
         let mut master = unsafe { File::from_raw_fd(master) };
-        let state = Arc::new(Mutex::new(BusState { missing_servo, raw_reply, raw_requests: 0 }));
+        let state = Arc::new(Mutex::new(BusState { missing_servo, raw_reply, raw_requests: 0, accessory_requests: [0; 2] }));
         let running = Arc::new(AtomicBool::new(true));
         let worker_state = Arc::clone(&state);
         let worker_running = Arc::clone(&running);
@@ -167,6 +174,36 @@ fn missing_servo_does_not_hide_other_servos_or_raw_imu() {
     bus.state.lock().unwrap().missing_servo = None;
     let reconnected = bus.scan().unwrap();
     assert!(reconnected.servos.iter().all(|servo| servo.valid && servo.error.is_none()));
+}
+
+#[test]
+fn native_bus_reports_connected_accessories_and_skips_missing_ones_until_reentry() {
+    let mut bus = SimBus::new(Some(36), RawReply::Normal);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let Some(data) = bus.io.sample_individual_device_observation(deadline).unwrap() else {
+            continue;
+        };
+        if bus.state.lock().unwrap().accessory_requests[0] >= 3 {
+            assert!(data.servos.iter().all(|servo| servo.valid));
+            assert!(data.imu.valid);
+            assert_eq!(data.optional_servos.len(), 1);
+            assert_eq!(data.optional_servos[0].id, 35);
+            assert_eq!(bus.state.lock().unwrap().accessory_requests[1], 1);
+            bus.state.lock().unwrap().missing_servo = None;
+            bus.io.set_individual_device_observation(false);
+            bus.io.set_individual_device_observation(true);
+            let deadline = Instant::now() + Duration::from_secs(4);
+            while Instant::now() < deadline {
+                let data = bus.io.sample_individual_device_observation(deadline).unwrap();
+                if data.is_some_and(|data| data.optional_servos.len() == 2) {
+                    return;
+                }
+            }
+            panic!("reentering status scan did not probe the connected servo");
+        }
+    }
+    panic!("accessory scan did not revisit the connected servo");
 }
 
 #[test]

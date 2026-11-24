@@ -660,7 +660,7 @@ fn run_session(
     // not parse is not a reason to leave somebody without a pad: the default mapping is the
     // fallback, and the reason is logged.
     let (mut bindings, mut drive, mut imu_head, bus_protocol) = read_bindings(&args.config);
-    let accessory_trigger = bus_protocol == BusProtocol::Hx && std::env::var_os("WONDERDUCK_UNOQ_ROUTER").is_some();
+    let accessory_trigger = bus_protocol == BusProtocol::Hx;
     // When the file was last written, so a change is picked up without a restart.
     let mut bindings_at = config_mtime(&args.config);
     let mut bindings_checked = Instant::now();

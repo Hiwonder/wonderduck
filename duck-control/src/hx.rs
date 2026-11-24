@@ -1397,9 +1397,6 @@ impl RobotIo for HxIo {
         }
         let mut next_motion = self.accessory_motion;
         if let Some((positions, duration_ms)) = next_motion.update(pressure, Instant::now()) {
-            if !self.uses_unoq_bridge() {
-                return Ok(());
-            }
             let duration = duration_ms.to_le_bytes();
             let data = positions.map(|position| {
                 let goal = position.to_le_bytes();

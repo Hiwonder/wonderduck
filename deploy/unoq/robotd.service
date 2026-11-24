@@ -8,8 +8,6 @@ RequiresMountsFor=/home/arduino/wonderduck
 Type=exec
 WorkingDirectory=/home/arduino/wonderduck
 Group=arduino
-CPUAffinity=0 1 2 3
-Environment=WONDERDUCK_CONTROL_CPU=3
 Environment=WONDERDUCK_UNOQ_FEEDBACK=1
 Environment=WONDERDUCK_MOTION_CPU_MIN_KHZ=1612800
 ExecStart=/bin/sh /home/arduino/wonderduck/deploy/unoq/run-robotd.sh

@@ -17,6 +17,7 @@ pub(super) struct ObservationScan {
     next_joint: usize,
     next_optional_servo: usize,
     next_optional_at: Instant,
+    absent_optional_servos: [bool; ACCESSORY_SERVO_IDS.len()],
     next_imu: Instant,
     last_read_was_imu: bool,
     absent_servo_retry: [Option<Instant>; JOINT_IDS.len()],
@@ -38,6 +39,7 @@ impl ObservationScan {
             next_joint: 0,
             next_optional_servo: 0,
             next_optional_at: Instant::now() + OPTIONAL_SERVO_INTERVAL,
+            absent_optional_servos: [false; ACCESSORY_SERVO_IDS.len()],
             next_imu: Instant::now(),
             last_read_was_imu: false,
             absent_servo_retry: [None; JOINT_IDS.len()],
@@ -80,6 +82,7 @@ impl HxIo {
         scan.next_joint = 0;
         scan.next_optional_servo = 0;
         scan.next_optional_at = Instant::now() + OPTIONAL_SERVO_INTERVAL;
+        scan.absent_optional_servos.fill(false);
         scan.latest.optional_servos.clear();
         scan.next_imu = Instant::now();
         scan.last_read_was_imu = false;
@@ -222,7 +225,6 @@ impl HxIo {
         if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(3) {
             return Ok(None);
         }
-        let optional_supported = self.uses_unoq_bridge();
         let scan = self.observation.get_or_insert_with(ObservationScan::new);
         scan.enabled = true;
         if !scan.individual { return Ok(Some(scan.latest.clone())); }
@@ -242,12 +244,15 @@ impl HxIo {
             }
             return Ok(sample);
         }
-        if optional_supported && now >= scan.next_optional_at {
-            let id = ACCESSORY_SERVO_IDS[scan.next_optional_servo];
-            scan.next_optional_servo = (scan.next_optional_servo + 1) % ACCESSORY_SERVO_IDS.len();
+        if now >= scan.next_optional_at
+            && let Some(index) = (0..ACCESSORY_SERVO_IDS.len())
+                .map(|offset| (scan.next_optional_servo + offset) % ACCESSORY_SERVO_IDS.len())
+                .find(|&index| !scan.absent_optional_servos[index])
+        {
+            scan.next_optional_servo = (index + 1) % ACCESSORY_SERVO_IDS.len();
             scan.next_optional_at = now + OPTIONAL_SERVO_INTERVAL;
             scan.last_read_was_imu = false;
-            return self.sample_optional_servo(id);
+            return self.sample_optional_servo(index);
         }
         let Some(joint) = joint else { return Ok(None); };
         scan.last_read_was_imu = false;
@@ -294,10 +299,15 @@ impl HxIo {
         }
     }
 
-    fn sample_optional_servo(&mut self, id: u8) -> Result<Option<DeviceObservation>> {
+    fn sample_optional_servo(&mut self, index: usize) -> Result<Option<DeviceObservation>> {
+        let id = ACCESSORY_SERVO_IDS[index];
+        let bridged = self.uses_unoq_bridge();
         let reply = self.read_status_one(id, 0, 71)?;
         let stamp = duck_ipc_proto::clock::monotonic_ns();
         let scan = self.observation.as_mut().expect("status scan exists");
+        // A missing native-bus servo needs a quiet drain after its timeout.
+        // Retry on the next status session so absent accessories do not slow the scan.
+        scan.absent_optional_servos[index] = !bridged && reply.is_none();
         let optional = &mut scan.latest.optional_servos;
         optional.retain(|servo| servo.id != id);
         if let Some(frame) = reply.filter(|frame| !frame.data.is_empty()) {
