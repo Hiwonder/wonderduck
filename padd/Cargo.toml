@@ -18,6 +18,7 @@ description = "Gamepad → robot intents"
 # it reads the same device node gilrs reads, for `src/tap.rs`, and brings no C with it.
 
 [dependencies]
+duck-control = { path = "../duck-control" }
 duck-ipc-proto = { path = "../duck-ipc-proto" }
 # Which button runs which skill, from the same `robotd.toml` everything else is configured in —
 # so `robotctl configure` stays the one editor, and a robot's configuration is one file to back

@@ -49,7 +49,7 @@ impl ReadFailure {
     pub fn write_reason(&self, writer: &mut impl fmt::Write) -> fmt::Result {
         match &self.reason {
             ReadFailureReason::Timeout => write!(writer, "HX {} timeout; missing IDs {:?}",
-                if self.tx[4] == 0x82 { "sync_read" } else { "read" }, self.missing_ids),
+                if matches!(self.tx[4], 0x82 | 0x93) { "sync_read" } else { "read" }, self.missing_ids),
             ReadFailureReason::Response(error) => write!(writer, "HX read response: {error}"),
             ReadFailureReason::Status { id, status, payload_len, expected_len } => {
                 write!(writer, "HX ID {id} status=0x{status:02X}")?;

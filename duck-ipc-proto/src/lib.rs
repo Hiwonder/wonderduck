@@ -722,10 +722,9 @@ pub mod method {
     /// or `robot.enable` brings it up from a known state. Discrete; send as a request.
     pub const ROBOT_REBOOT_MOTORS: &str = "robot.rebootMotors";
 
-    /// Put the robot down for a rest: [`ROBOT_SHUTDOWN`]'s sequence without the power-off. A
-    /// driving robot sits with the sitstand policy, eases into the rest pose, then has torque cut
-    /// and every servo rebooted ([`ROBOT_REBOOT_MOTORS`]); a robot that cannot sit is rebooted
-    /// where it is. Ends limp, ready for `robot.init`. Discrete; send as a request.
+    /// Put the robot down for a rest. After the sitstand policy seats the robot, it plays
+    /// the Studio rest action on HX, or eases into the rest pose on other buses. It then releases
+    /// torque and stays powered on, ready for `robot.init`. Send as a request.
     pub const ROBOT_REST: &str = "robot.rest";
 
     // ── skills ───────────────────────────────────────────────────────────────
@@ -746,6 +745,8 @@ pub mod method {
     /// Mouth opening, 0 (closed) to 1 (open). Continuous; send as a notification. The mouth
     /// is not part of any policy — this is the only thing that moves it.
     pub const ROBOT_MOUTH: &str = "robot.mouth";
+    /// Analog gamepad R2 pressure for the UNO Q accessory servos.
+    pub const ROBOT_ACCESSORY_TRIGGER: &str = "robot.accessoryTrigger";
     /// Play one of the robot's voice-bank sounds — chirp, greet, coo... `wheee` is the
     /// held ride: `hold: true` starts it and must keep arriving (a notification per tick,
     /// like the mouth) or the ride ends; `hold: false` releases it deliberately. The two
@@ -1116,7 +1117,7 @@ pub enum Call {
     RobotEmergencyRelax,
     /// Reboot servos (all of them, or the ids named), then limp. See [`method::ROBOT_REBOOT_MOTORS`].
     RobotRebootMotors(RebootMotorsParams),
-    /// Sit, ease into the rest pose, then torque off and reboot. See [`method::ROBOT_REST`].
+    /// Sit, perform the rest movement, then release torque. See [`method::ROBOT_REST`].
     RobotRest,
     /// Run a one-shot skill, or toggle sit↔stand.
     RobotDo(DoParams),
@@ -1124,6 +1125,7 @@ pub enum Call {
     RobotPose(PoseParams),
     /// Mouth opening. Continuous. Send as a notification.
     RobotMouth(MouthParams),
+    RobotAccessoryTrigger(AccessoryTriggerParams),
     /// Play a voice-bank sound.
     RobotSound(SoundParams),
     /// Play a named user clip once or while held.
@@ -1322,6 +1324,7 @@ impl Call {
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
+            Call::RobotAccessoryTrigger(_) => method::ROBOT_ACCESSORY_TRIGGER,
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotSoundClip(_) => method::ROBOT_SOUND_CLIP,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
@@ -1524,6 +1527,7 @@ impl Call {
             | Call::RobotDo(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
+            | Call::RobotAccessoryTrigger(_)
             | Call::RobotSound(_)
             | Call::RobotSoundClip(_)
             | Call::RobotTheremin(_)
@@ -1644,6 +1648,7 @@ impl Call {
             Call::RobotRebootMotors(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
+            Call::RobotAccessoryTrigger(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
             Call::RobotLoadPolicy(p) => encode(p),
             Call::RobotApplyModel(p) => encode(p),
@@ -1764,6 +1769,7 @@ impl Call {
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
+            method::ROBOT_ACCESSORY_TRIGGER => Call::RobotAccessoryTrigger(decode(params)?),
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_SOUND_CLIP => Call::RobotSoundClip(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
@@ -2414,7 +2420,13 @@ pub struct HeadParams {
     pub head_pitch: f64,
     pub head_yaw: f64,
     pub head_roll: f64,
+    /// Optional HX encoder targets for head pitch (ID 31) and yaw (ID 32).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_position: Option<[u16; 2]>,
 }
+
+/// End an autonomous session after this long without its client heartbeat.
+pub const AUTONOMOUS_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Session-bound movement tracking. Target is horizontal offset and image-area fraction.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -2456,7 +2468,12 @@ pub struct MotionTrackingParams {
     /// Optional raw head pitch handed over when tracking starts.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_pitch: Option<u16>,
+    /// Horizontal offset and relative area. For line following the second value
+    /// is the upright image width divided by its height.
     pub target: Option<[f64; 2]>,
+    /// Fixed forward velocity in m/s for line following.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_speed: Option<f64>,
     pub reference_area: f64,
     /// Relative area error and horizontal error as fractions of image width.
     pub deadzone: [f64; 2],
@@ -2559,7 +2576,7 @@ pub struct CoordinatedTrackingParams {
     pub stop_area_px: Option<u64>,
     /// Half-width of the pixel-area following deadzone, in pixels squared.
     pub stop_area_deadzone_px: u64,
-    /// Desired ToF distance in millimetres for continuous following.
+    /// Desired ToF distance in millimetres for continuous following. None uses pixel area alone.
     pub stop_distance_mm: Option<u32>,
     /// Half-width of the ToF following deadzone, in millimetres.
     pub stop_distance_deadzone_mm: u32,
@@ -2570,6 +2587,9 @@ pub struct CoordinatedTrackingParams {
     /// Mouth positions before and after the arrival action.
     pub mouth_before: TimedMouthPosition,
     pub mouth_after: TimedMouthPosition,
+    /// The second pickup and carry configuration, entered after the first arrival action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup_after: Option<Box<CoordinatedTrackingParams>>,
 }
 
 impl CoordinatedTrackingParams {
@@ -2587,7 +2607,7 @@ impl CoordinatedTrackingParams {
             })
             && self.stop_area_px.is_none_or(|area| area > 0)
             && self.stop_distance_mm.is_none_or(|distance| distance > 0)
-            && self.stop_area_px.is_some() == self.stop_distance_mm.is_some()
+            && (self.stop_distance_mm.is_none() || self.stop_area_px.is_some())
             && self.head_deadzone.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.head_gains.iter().flatten().all(|value| value.is_finite())
             && self.body_gains.iter().all(|value| value.is_finite())
@@ -2600,6 +2620,11 @@ impl CoordinatedTrackingParams {
             && self.final_tolerance.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.arrival_delay_s.is_finite() && self.arrival_delay_s >= 0.0
             && self.mouth_before.valid() && self.mouth_after.valid()
+            && self.pickup_after.as_ref().is_none_or(|after| self.stop_area_px.is_none()
+                && (self.action != MotionTrackingAction::Start || !self.arrival_skill.is_empty())
+                && after.pickup_after.is_none()
+                && after.action == MotionTrackingAction::Start && after.stop_area_px.is_none()
+                && after.target.is_none() && after.camera.is_none() && after.valid())
     }
 }
 
@@ -2633,10 +2658,11 @@ impl MazeParams {
 impl MotionTrackingParams {
     pub fn valid(&self) -> bool {
         self.initial_pitch.is_none_or(|value| self.action == MotionTrackingAction::Start && (1024..=2250).contains(&value))
+            && self.line_speed.is_none_or(|value| (0.0..=0.4).contains(&value))
             && self.reference_area.is_finite() && (0.0..=1.0).contains(&self.reference_area)
             && self.reference_area > 0.0
-            && self.target.is_none_or(|[x, area]| x.is_finite() && x.abs() <= 1.0
-                && area.is_finite() && (0.0..=1.0).contains(&area) && area > 0.0)
+            && self.target.is_none_or(|[x, secondary]| x.abs() <= 1.0 && secondary > 0.0
+                && if self.line_speed.is_some() { secondary.is_finite() } else { secondary <= 1.0 })
             && self.deadzone.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.gains.iter().all(|axis| axis.iter()
                 .all(|value| value.is_finite() && (0.0..=10.0).contains(value)))
@@ -2874,6 +2900,13 @@ pub struct MouthParams {
     pub open: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessoryTriggerParams {
+    /// Released at 0, fully pressed at 100.
+    pub pressure: u8,
+}
+
 /// Which mode to switch to, for [`Call::RobotSetMode`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -2997,6 +3030,12 @@ pub struct PoliciesResult {
     /// show what is loaded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<String>,
+    /// A one-shot skill that is currently executing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_skill: Option<String>,
+    /// Most recent skill timeout, identified once per daemon session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_skill_timeout: Option<SkillTimeout>,
     /// Whether the robot has reached its home pose, or `None` from a robot too old to say.
     ///
     /// **A skill is refused while this is false, and the refusal expires on its own.** That makes
@@ -3041,6 +3080,12 @@ pub struct PoliciesResult {
     /// throughout — a failed change swaps nothing — so this is *degraded*, never unhealthy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub change_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillTimeout {
+    pub sequence: u64,
+    pub skill: String,
 }
 
 /// One policy slot's state, for [`PoliciesResult`].
@@ -3344,6 +3389,9 @@ pub struct SubscribeParams {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeviceObservation {
     pub servos: Vec<ServoObservation>,
+    /// Read-only observations for detected servos outside the robot's joints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_servos: Vec<ServoObservation>,
     pub imu: ImuObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bus_error: Option<String>,
@@ -4394,6 +4442,8 @@ pub struct RobotState {
     /// Actual coordinated tracking phase, absent while that mode is inactive.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracking_phase: Option<CoordinatedTrackingPhase>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup_stage: Option<PickupStage>,
     pub safety: SafetyState,
     #[serde(rename = "loop")]
     pub control_loop: LoopState,
@@ -4512,6 +4562,10 @@ pub enum CoordinatedTrackingPhase {
     WaitingRobot,
     Fallen,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PickupStage { Before, After }
 
 /// The trunk IMU, in [`RobotState::imu`]. Trunk frame: x forward, y left, z up.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Serialize, Deserialize)]

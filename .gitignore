@@ -4,6 +4,11 @@ target/
 .runtime-install.lock
 .runtime-release.json
 .runtime-transaction-*/
+.software-update.lock
+.software-update-status.json
+.software-update-recovery.json
+.software-update-recovery/
+.software-update-*/
 
 # ── never commit signing material ────────────────────────────────────────────
 #

@@ -26,6 +26,7 @@ mod coordinated_tracking;
 mod gamepad_process;
 mod head_tracking;
 mod human_control;
+mod motion_cpu;
 mod motion_tracking;
 mod maze;
 mod managed_models;
@@ -57,6 +58,7 @@ mod control_scheduling;
 mod log_output;
 mod params;
 mod record;
+mod rest_action;
 mod soc;
 mod sound;
 mod studio_process;
@@ -1091,6 +1093,8 @@ struct RobotState {
     human_action_busy: AtomicBool,
     human_other_action_busy: AtomicBool,
     human_motion_busy: AtomicBool,
+    active_skill: ArcSwapOption<String>,
+    last_skill_timeout: ArcSwapOption<proto::SkillTimeout>,
     precision_policy: std::sync::Mutex<Option<PrecisionPolicy>>,
     precision_ready: AtomicBool,
     /// Fan-out for `robot.state`. Bounded and lossy by design — see [`STATE_BUFFER`].
@@ -1222,9 +1226,21 @@ struct RobotState {
 }
 
 impl RobotState {
+    fn record_skill_timeout(&self, skill: String) {
+        let sequence = self.last_skill_timeout.load().as_ref().map_or(1, |previous| previous.sequence.wrapping_add(1));
+        self.last_skill_timeout.store(Some(Arc::new(proto::SkillTimeout { sequence, skill })));
+    }
+
+    fn publish_active_skill(&self, name: Option<&str>) {
+        if self.active_skill.load().as_deref().map(String::as_str) != name {
+            self.active_skill.store(name.map(|name| Arc::new(name.to_owned())));
+        }
+    }
+
     fn new(
         params: &Params,
         config_path: &std::path::Path,
+        intents: Arc<Intents>,
     ) -> Self {
         Self {
             status_journal: PathBuf::new(),
@@ -1261,11 +1277,13 @@ impl RobotState {
             low_voltage_lock: low_voltage_lock::LowVoltageLock::open(None).expect("in-memory interlock"),
             startup_voltage_ready: AtomicBool::new(true),
             startup_read_only: AtomicBool::new(false),
-            human_control: human_control::Arbiter::default(),
+            human_control: human_control::Arbiter::new(intents),
             emergency_relax: emergency_relax::EmergencyRelax::default(),
             human_action_busy: AtomicBool::new(false),
             human_other_action_busy: AtomicBool::new(false),
             human_motion_busy: AtomicBool::new(false),
+            active_skill: ArcSwapOption::empty(),
+            last_skill_timeout: ArcSwapOption::empty(),
             precision_policy: std::sync::Mutex::new(None),
             precision_ready: AtomicBool::new(false),
             state_tx: tokio::sync::broadcast::Sender::new(STATE_BUFFER),
@@ -1561,7 +1579,12 @@ async fn main() -> ExitCode {
     if args.no_policy {
         params.policy.enabled = false;
     }
-    if args.motion_only {
+    let tof_enabled = std::env::var_os("WONDERDUCK_UNOQ_TOF_ENABLED")
+        .is_none_or(|value| value == "true");
+    if !tof_enabled {
+        tracing::info!("UNO Q ToF polling is disabled");
+    }
+    if args.motion_only || !tof_enabled {
         params.theremin.enabled = false;
     }
     if let Err(error) = args.policy_overrides.apply(&mut params.policy) {
@@ -1713,8 +1736,33 @@ async fn main() -> ExitCode {
         None
     };
 
+    let (max_linear, max_lateral, max_angular) = args.gamepad_limits.motion_caps();
+    if args.gamepad_precision && (args.gamepad_start_delay_ms.is_some() || args.gamepad_short_duration_ms.is_some()) {
+        tracing::warn!("--gamepad-precision uses its own timing; legacy gamepad timing options are inactive");
+    }
+    let gamepad_timing = if args.gamepad_precision {
+        velocity_command::GamepadTiming::default()
+    } else {
+        velocity_command::GamepadTiming {
+            start_delay: args.gamepad_start_delay_ms
+                .map(Duration::from_millis)
+                .unwrap_or(velocity_command::START_DELAY),
+            short_duration: args.gamepad_short_duration_ms
+                .map(Duration::from_millis)
+                .unwrap_or(velocity_command::SHORT_DURATION),
+        }
+    };
+    let intents = Arc::new(Intents::new_with_axis_limits(
+        max_linear,
+        max_lateral,
+        args.gamepad_limits.backward_cap(),
+        max_angular,
+        gamepad_timing,
+    ));
+
     let requires_voltage_recovery = physical_status_bus && low_voltage_lock.requires_rearm();
-    let mut state = RobotState::new(&params, &params_path);
+    let mut state = RobotState::new(&params, &params_path, Arc::clone(&intents));
+    state.obstacle = Arc::new(obstacle::Shared::new(tof_enabled));
     state.status_bus_fault.store(status_fault_at_startup, Ordering::Release);
     state.low_voltage_lock = low_voltage_lock;
     state.startup_voltage_ready.store(!requires_voltage_recovery, Ordering::Relaxed);
@@ -1740,30 +1788,6 @@ async fn main() -> ExitCode {
     } else {
         tracing::info!("initialization will enable torque at the current pose");
     }
-
-    let (max_linear, max_lateral, max_angular) = args.gamepad_limits.motion_caps();
-    if args.gamepad_precision && (args.gamepad_start_delay_ms.is_some() || args.gamepad_short_duration_ms.is_some()) {
-        tracing::warn!("--gamepad-precision uses its own timing; legacy gamepad timing options are inactive");
-    }
-    let gamepad_timing = if args.gamepad_precision {
-        velocity_command::GamepadTiming::default()
-    } else {
-        velocity_command::GamepadTiming {
-            start_delay: args.gamepad_start_delay_ms
-                .map(Duration::from_millis)
-                .unwrap_or(velocity_command::START_DELAY),
-            short_duration: args.gamepad_short_duration_ms
-                .map(Duration::from_millis)
-                .unwrap_or(velocity_command::SHORT_DURATION),
-        }
-    };
-    let intents = Arc::new(Intents::new_with_axis_limits(
-        max_linear,
-        max_lateral,
-        args.gamepad_limits.backward_cap(),
-        max_angular,
-        gamepad_timing,
-    ));
 
     let (record_sender, recorder) = match args.record.as_deref() {
         Some(path) => match record::Recorder::start(
@@ -1850,34 +1874,29 @@ async fn main() -> ExitCode {
 
     let (camera_enabled, sensor_enabled, web_enabled) = auxiliary_services(&args);
     let camera = camera_enabled.then(|| camera_process::CameraSupervisor::start(args.with_camera));
-    let sensor = obstacle::start_sensor(sensor_enabled, Arc::clone(&state.obstacle), obstacle::SensorConfig {
+    let sensor = obstacle::start_sensor(sensor_enabled && tof_enabled, Arc::clone(&state.obstacle), obstacle::SensorConfig {
         hz: args.tof_hz, timing_budget_ms: args.tof_timing_budget_ms,
         signal_rate_limit: args.tof_signal_rate_limit, record_raw: args.record_person_follow,
     });
-    let mut web = if web_enabled {
+    let start_web = || {
         match web_process::WebProcess::start(&args.socket, &params_path, args.record.as_deref(),
             args.record_person_follow, args.record_target_follow) {
-            Ok(web_process::WebStart::Started(client)) => Some(client),
+            Ok(web_process::WebStart::Started(client)) => Ok(Some(client)),
             Ok(web_process::WebStart::NotInstalled) => {
                 tracing::info!("web control is not installed; autostart skipped");
-                None
+                Ok(None)
             }
-            Err(error) => {
-                tracing::error!(%error, "web control startup failed; robot control remains active");
-                None
-            }
+            Err(error) => Err(error),
         }
-    } else {
-        None
     };
-    let mut studio = if web.is_some() && params.bus.protocol == BusProtocol::Hx && imu_source == ImuSource::Id200 {
-        match studio_process::StudioProcess::start(&args.socket, &params.bus.port) {
-            Ok(studio) => studio,
-            Err(error) => { tracing::error!(%error, "Studio startup failed"); None }
-        }
-    } else {
-        None
-    };
+    let start_studio = || studio_process::StudioProcess::start(&args.socket, &params.bus.port);
+    let studio_enabled = web_enabled && params.bus.protocol == BusProtocol::Hx && imu_source == ImuSource::Id200;
+    let mut web = None;
+    let mut studio = None;
+    let mut web_retry = web_enabled.then(ServiceRestart::new);
+    let mut studio_retry = studio_enabled.then(ServiceRestart::new);
+    let mut service_tick = tokio::time::interval(Duration::from_millis(250));
+    service_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     let mut serving = Box::pin(serve(
         Arc::clone(&state),
@@ -1915,6 +1934,9 @@ async fn main() -> ExitCode {
                     Err(error) => tracing::error!(%error, "web control monitoring failed; robot control remains active"),
                 }
                 drop(web.take());
+                if let Some(retry) = &mut web_retry {
+                    retry.exited(Instant::now());
+                }
             }
             status = studio_process::wait_for_exit(&mut studio) => {
                 match status {
@@ -1922,6 +1944,13 @@ async fn main() -> ExitCode {
                     Err(error) => tracing::error!(%error, "Studio monitoring failed; robot control remains active"),
                 }
                 drop(studio.take());
+                if let Some(retry) = &mut studio_retry {
+                    retry.exited(Instant::now());
+                }
+            }
+            _ = service_tick.tick(), if web_retry.is_some() || studio_retry.is_some() => {
+                restart_auxiliary("web control", &mut web_retry, &mut web, start_web);
+                restart_auxiliary("Studio", &mut studio_retry, &mut studio, start_studio);
             }
             _ = state.low_voltage.triggered.notified() => {
                 tracing::warn!("continuous low servo voltage; sitting and exiting");
@@ -2019,6 +2048,63 @@ async fn main() -> ExitCode {
     }
     let _ = std::fs::remove_file(&args.socket);
     code
+}
+
+struct ServiceRestart {
+    next_attempt: Instant,
+    started_at: Option<Instant>,
+    delay: Duration,
+}
+
+impl ServiceRestart {
+    fn new() -> Self {
+        Self { next_attempt: Instant::now(), started_at: None, delay: Duration::from_secs(1) }
+    }
+
+    fn exited(&mut self, now: Instant) {
+        if self.started_at.take().is_some_and(|start| now.duration_since(start) >= Duration::from_secs(30)) {
+            self.delay = Duration::from_secs(1);
+        }
+        self.next_attempt = now + self.delay;
+        self.delay = (self.delay * 2).min(Duration::from_secs(30));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn auxiliary_retry_caps_delay_and_resets_after_a_stable_run() {
+    let mut retry = ServiceRestart::new();
+    let now = Instant::now();
+    for seconds in [1, 2, 4, 8, 16, 30, 30] {
+        retry.exited(now);
+        assert_eq!(retry.next_attempt, now + Duration::from_secs(seconds));
+    }
+    retry.started_at = Some(now);
+    let later = now + Duration::from_secs(30);
+    retry.exited(later);
+    assert_eq!(retry.next_attempt, later + Duration::from_secs(1));
+}
+
+fn restart_auxiliary<T>(
+    service: &str,
+    restart: &mut Option<ServiceRestart>,
+    process: &mut Option<T>,
+    start: impl FnOnce() -> std::io::Result<Option<T>>,
+) {
+    let Some(retry) = restart.as_mut().filter(|retry| process.is_none() && Instant::now() >= retry.next_attempt) else {
+        return;
+    };
+    match start() {
+        Ok(Some(child)) => {
+            retry.started_at = Some(Instant::now());
+            *process = Some(child);
+        }
+        Ok(None) => *restart = None,
+        Err(error) => {
+            tracing::warn!(service, %error, retry_secs = retry.delay.as_secs(), "auxiliary service startup failed");
+            retry.exited(Instant::now());
+        }
+    }
 }
 
 fn auxiliary_services(args: &Args) -> (bool, bool, bool) {
@@ -2267,6 +2353,7 @@ fn spawn_control_thread(
                     period,
                     poweroff,
                     recorder.clone(),
+                    None,
                 ));
                 return;
             }
@@ -2287,6 +2374,7 @@ fn spawn_control_thread(
                     period,
                     poweroff,
                     recorder.clone(),
+                    None,
                 ));
                 return;
             }
@@ -2346,6 +2434,7 @@ fn spawn_control_thread(
                         period,
                         poweroff,
                         recorder,
+                        motion_cpu::MotionCpuFloor::configured(),
                     )
                     .await;
                 }
@@ -2690,6 +2779,13 @@ impl RobotIo for BusIo {
         }
     }
 
+    fn write_timed_positions(&mut self, positions: &[Option<f64>; NUM_JOINTS], duration_ms: u16) -> duck_control::io::Result<bool> {
+        match self {
+            Self::Dynamixel(io) => io.write_timed_positions(positions, duration_ms),
+            Self::Hx(io) => io.write_timed_positions(positions, duration_ms),
+        }
+    }
+
     fn set_gain(&mut self, kp: u16) -> duck_control::io::Result<()> {
         BusIo::set_gain(self, kp)
     }
@@ -2723,6 +2819,13 @@ impl RobotIo for BusIo {
         match self {
             Self::Dynamixel(io) => RobotIo::write_positions_raw(io, ids, positions),
             Self::Hx(io) => RobotIo::write_positions_raw(io, ids, positions),
+        }
+    }
+
+    fn write_accessory_trigger(&mut self, pressure: u8) -> duck_control::io::Result<()> {
+        match self {
+            Self::Hx(io) => io.write_accessory_trigger(pressure),
+            Self::Dynamixel(_) => Ok(()),
         }
     }
 
@@ -3337,6 +3440,27 @@ impl RestRamp {
     }
 }
 
+enum RestMotion {
+    Ramp(RestRamp),
+    Action { playback: rest_action::Playback, gain: u16 },
+}
+
+impl RestMotion {
+    fn targets(&self, now: Instant) -> ([f64; NUM_JOINTS], u16) {
+        match self {
+            Self::Ramp(ramp) => (ramp.target(now), ramp.gain),
+            Self::Action { playback, gain } => (playback.target(), *gain),
+        }
+    }
+
+    fn done(&self, now: Instant) -> bool {
+        match self {
+            Self::Ramp(ramp) => ramp.done(now),
+            Self::Action { playback, .. } => playback.done(),
+        }
+    }
+}
+
 /// One low-pass step toward `target`.
 ///
 /// A non-finite target is dropped, not folded in: `ema += α·(inf − ema)` is `inf` on this
@@ -3530,7 +3654,7 @@ mod partial_maintenance_tests {
                     valid: true, torque: Some(0), ..Default::default() }
             }
         }).collect();
-        proto::DeviceObservation { servos, imu: Default::default(), bus_error: None }
+        proto::DeviceObservation { servos, ..Default::default() }
     }
 
     #[test]
@@ -3556,7 +3680,7 @@ mod partial_maintenance_tests {
 
     #[test]
     fn unverified_release_keeps_movement_blocked_during_partial_maintenance() {
-        let arbiter = human_control::Arbiter::default();
+        let arbiter = human_control::Arbiter::new(Arc::new(Intents::new()));
         let session = human_control::Session::new();
         let mut guard = arbiter.lock();
         assert!(guard.begin_partial_maintenance(&session).is_err());
@@ -3571,7 +3695,7 @@ mod partial_maintenance_tests {
     #[test]
     fn failed_partial_handoff_and_disconnect_keep_motion_locked() {
         use proto::HumanControlSource;
-        let arbiter = human_control::Arbiter::default();
+        let arbiter = human_control::Arbiter::new(Arc::new(Intents::new()));
         let mut maintenance = human_control::Session::new();
         let mut gamepad = human_control::Session::new();
         let mut guard = arbiter.lock();
@@ -3596,8 +3720,7 @@ fn publish_status_fault(state: &RobotState, cached: Option<proto::DeviceObservat
     let mut observation = cached.unwrap_or_else(|| proto::DeviceObservation {
         servos: duck_control::model::JOINT_IDS.into_iter().map(|id|
             proto::ServoObservation { id, ..Default::default() }).collect(),
-        imu: proto::ImuObservation::default(),
-        bus_error: None,
+        ..Default::default()
     });
     observation.bus_error = Some("设备状态回复未确认；串口已隔离，控制和低压监测暂停".into());
     let _ = state.devices_tx.send(observation);
@@ -4616,6 +4739,7 @@ async fn control_loop<T: RobotIo>(
     period: Duration,
     poweroff: PowerOff,
     recorder: Option<record::RecordSender>,
+    mut motion_cpu: Option<motion_cpu::MotionCpuFloor>,
 ) {
     // Owned rather than borrowed from `params`, because neither the mode nor the slots stay
     // what the file said: `robot.setMode` replaces the mode, `robot.loadPolicy` replaces one
@@ -4814,6 +4938,7 @@ async fn control_loop<T: RobotIo>(
     let mut coordinated_mouth = coordinated_mouth::Sequence::default();
     let mut coordinated_initial_head = coordinated_tracking::InitialHead::default();
     let mut coordinated_tracking_sequence = None;
+    let mut pickup_action_completed = None;
     let mut coordinated_head_only_mode = None;
     let mut coordinated_feedback = coordinated_tracking::FeedbackHistory::default();
     let mut coordinated_tick: Option<Instant> = None;
@@ -4848,11 +4973,10 @@ async fn control_loop<T: RobotIo>(
     // The sit-then-power-off sequence: the policy sits, then `shutdown_rest` eases the joints
     // into the rest pose before torque is cut.
     let mut shutdown_sit: Option<Instant> = None;
-    // Whether the sequence under way ends in a power-off (`robot.shutdown`, an empty pack) or limp
-    // with the servos rebooted (`robot.rest`). Both sit and ease into the rest pose first.
     let mut shutdown_power_off = true;
-    let mut shutdown_rest: Option<RestRamp> = None;
-    let mut rest_reboot_pending = false;
+    let mut shutdown_rest: Option<RestMotion> = None;
+    let mut rest_action = None;
+    let mut rest_sit_remaining = Duration::ZERO;
     let mut exit_sit_started: Option<Instant> = None;
     let mut seat_transition_until: Option<Instant> = None;
     // What the previous tick commanded, which is where the rest ramp starts.
@@ -5008,6 +5132,16 @@ async fn control_loop<T: RobotIo>(
     while !state.shutdown.load(Ordering::Acquire) {
         ticker.tick().await;
         let tick_start = Instant::now();
+        if let Some(floor) = motion_cpu.as_mut() {
+            // Standing under policy control still needs timely feedback with zero twist.
+            // The moving flag includes homing, scripted motion and fall recovery.
+            let active = intents.enabled() || state.moving.load(Ordering::Relaxed)
+                || intents.rest_phase() == proto::RestPhase::Resting
+                || shutdown_sit.is_some() || shutdown_rest.is_some()
+                || matches!(state.exit_sit.load(Ordering::Acquire), EXIT_SIT_REQUESTED | EXIT_SIT_RUNNING);
+            floor.update(active && !powered_off && !maintenance_parked && !status_session_open
+                && !state.status_bus_fault.load(Ordering::Acquire), tick_start);
+        }
         read_timing.begin_tick(tick_start);
 
         if state.status_bus_fault.load(Ordering::Acquire) {
@@ -5119,7 +5253,7 @@ async fn control_loop<T: RobotIo>(
             }
             intents.cancel_pending_rest();
             intents.finish_rest(false);
-            rest_reboot_pending = false;
+            rest_action = None;
             maintenance_holding = true;
             hold = last_targets;
             bringup = Bringup::Limp;
@@ -5227,6 +5361,8 @@ async fn control_loop<T: RobotIo>(
             // The status page owns the bus while its guard is active. Do not run
             // the normal control read or issue policy targets in this branch.
             intents.set_enabled(false);
+            safety.reset_fall();
+            state.fallen.store(false, Ordering::Relaxed);
             if let Some(voice) = voice.as_mut() {
                 voice.theremin_settle();
                 match intents.sound_hold() {
@@ -5310,7 +5446,7 @@ async fn control_loop<T: RobotIo>(
                         telemetry.publish(telemetry::Snapshot {
                             captured_at: Instant::now(), t: state.started.elapsed().as_secs_f64(),
                             t_ns: sampled_ns, sensors, targets: hold, requested: [0.0; 3], applied: [0.0; 3],
-                            limited: [false; 3], head: [0.0; 4], policy, tracking_phase: None,
+                            limited: [false; 3], head: [0.0; 4], policy, tracking_phase: None, pickup_stage: None,
                             safety: proto::SafetyState { fallen: safety.fallen(),
                                 limp: safety.torque_release_verified() || intents.rest_phase() == proto::RestPhase::Rested,
                                 gravity: sensors.imu.gravity, gain: safety.gain() },
@@ -5431,7 +5567,7 @@ async fn control_loop<T: RobotIo>(
             {
                 intents.cancel_pending_rest();
                 intents.finish_rest(false);
-                rest_reboot_pending = false;
+                rest_action = None;
                 intents.set_enabled(false);
                 maintenance_holding = true;
                 hold = last_targets;
@@ -5640,8 +5776,17 @@ async fn control_loop<T: RobotIo>(
         if !coordinated_active || fresh.is_none() {
             coordinated_feedback.clear();
         }
+        // The automatic sit still uses a policy. After the handoff, the
+        // action owns the joints and has no fall verdict.
+        let policy_owns_motion = shutdown_rest.is_none()
+            && (intents.enabled() || shutdown_sit.is_some());
+        if !policy_owns_motion {
+            safety.reset_fall();
+        }
         if let Some(fresh) = fresh.as_ref() {
-            safety.observe(fresh, period);
+            if policy_owns_motion {
+                safety.observe(fresh, period);
+            }
             if coordinated_active {
                 let now_mono = proto::clock::monotonic_ns();
                 let now_real = proto::clock::realtime_ns();
@@ -5668,6 +5813,31 @@ async fn control_loop<T: RobotIo>(
         if snapshot.abandon_generation != previous_abandon_generation {
             // Do not combine tracking sampled before cancellation with its new generation.
             snapshot = intents.snapshot();
+        }
+        let now = Instant::now();
+        if let Some(controller) = controller.as_mut().filter(|controller| controller.skill_timed_out(now)) {
+            let _guard = state.human_control.lock();
+            snapshot = intents.snapshot();
+            if snapshot.enabled && state.exit_sit.load(Ordering::Acquire) == 0
+                && snapshot.stop_generation == previous_stop_generation
+                && let Some(skill) = controller.expire_skill(now, coast.known_positions(hold))
+            {
+                // Clear motion before any intent in this tick can use the old snapshot.
+                intents.stop();
+                intents.set_pose(intents::PoseIntent::default());
+                intents.clear_head();
+                intents.cancel_head_tracking();
+                intents.cancel_coordinated_tracking();
+                intents.cancel_motion_tracking();
+                intents.cancel_maze();
+                snapshot = intents.snapshot();
+                hold = coast.known_positions(hold);
+                state.human_other_action_busy.store(true, Ordering::Release);
+                state.human_action_busy.store(true, Ordering::Release);
+                state.publish_active_skill(Some(&skill));
+                state.record_skill_timeout(skill.clone());
+                tracing::warn!(%skill, "skill timed out after 5 seconds; recovering with zero motion");
+            }
         }
         if snapshot.enabled {
             maintenance_holding = false;
@@ -5792,15 +5962,19 @@ async fn control_loop<T: RobotIo>(
                 }
                 coordinated_tracker.reset();
                 target_head_tracker.reset();
+                let pickup_handoff = tracking.pickup_stage == Some(proto::PickupStage::After)
+                    && coordinated_tracking_sequence.is_some_and(|sequence|
+                        pickup_action_completed == Some((sequence, snapshot.stop_generation)));
+                pickup_action_completed = None;
                 target_follow_stability.reset();
                 target_head_rate.reset();
                 target_geometry_missing = false;
-                coordinated_mouth.reset();
-                let initial_pitch = tracking.initial_pitch.unwrap_or(coordinated_tracking::INITIAL_PITCH);
+                if !pickup_handoff { coordinated_mouth.reset(); }
+                let staged_target = !head_only && tracking.params.stop_area_px.is_none();
+                let initial_pitch = tracking.initial_pitch
+                    .or(staged_target.then_some(coordinated_tracking::INITIAL_PITCH));
                 coordinated_initial_head = coordinated_tracking::InitialHead::new(initial_pitch);
-                tracing::info!(servo = 31, target = initial_pitch,
-                    tolerance = coordinated_tracking::INITIAL_PITCH_TOLERANCE,
-                    "coordinated tracking positioning head");
+                tracing::info!(servo = 31, target = ?initial_pitch, "coordinated tracking initializing head");
                 coordinated_tracking_sequence = Some(tracking.sequence);
                 coordinated_head_only_mode = Some(head_only);
                 coordinated_tick = None;
@@ -5850,6 +6024,12 @@ async fn control_loop<T: RobotIo>(
                 coordinated_feedback_missing = false;
                 requested.twist = [0.0; 3];
                 tracking_stopped = true;
+            } else if coordinated_eligible && !coordinated_tracker.arrived()
+                && pickup_action_completed == Some((tracking.sequence, snapshot.stop_generation))
+            {
+                // Continue the handoff if a vision or feedback interruption cleared the arrival.
+                requested.twist = [0.0; 3];
+                tracking_stopped = true;
             } else if let Some(sensors) = fresh.as_ref().filter(|_| eligible) {
                 let joints = [sensors.positions[5], sensors.positions[6], sensors.positions[7], sensors.positions[8]];
                 if coordinated_tracker.arrival_action_running()
@@ -5858,6 +6038,9 @@ async fn control_loop<T: RobotIo>(
                     coordinated_mouth.action_finished(tracking.params.mouth_after,
                         sensors.positions[duck_control::model::MOUTH_INDEX]);
                     coordinated_tracker.finish_arrival_action([joints[1], joints[2]]);
+                    if tracking.params.pickup_after.is_some() {
+                        pickup_action_completed = Some((tracking.sequence, snapshot.stop_generation));
+                    }
                 }
                 let elapsed = coordinated_tick
                     .map(|previous| tick_start.saturating_duration_since(previous).as_secs_f64())
@@ -6014,6 +6197,7 @@ async fn control_loop<T: RobotIo>(
                 tracing::warn!("coordinated arrival action cancelled after tracking ended");
             }
             coordinated_tracker.reset();
+            pickup_action_completed = None;
             target_head_tracker.reset();
             coordinated_head_only_mode = None;
             target_follow_stability.reset();
@@ -6036,10 +6220,12 @@ async fn control_loop<T: RobotIo>(
                 && limp_fall == LimpFall::Idle
                 && snapshot.stop_generation == previous_stop_generation
                 && controller.as_ref().is_some_and(|controller| !controller.busy() && !controller.is_sitting());
-            let twist = motion_tracker.step(
-                if eligible { tracking.target } else { None },
-                tracking.reference_area, tracking.deadzone, tracking.gains, dt,
-            );
+            let target = if eligible { tracking.target } else { None };
+            let twist = if let Some(speed) = tracking.line_speed {
+                motion_tracker.follow_line(target, speed, tracking.deadzone[1], tracking.gains[1], dt)
+            } else {
+                motion_tracker.step(target, tracking.reference_area, tracking.deadzone, tracking.gains, dt)
+            };
             if let Some(output) = twist {
                 if output.twist.iter().all(|value| value.is_finite()) {
                     tracking_deadzone = [output.in_deadzone[0], false, output.in_deadzone[1]];
@@ -6158,21 +6344,31 @@ async fn control_loop<T: RobotIo>(
                     }
                 }
             }
-            Some(intents::PowerRequest::Relax) => match safety.set_torque(false) {
-                Ok(()) => {
-                    tracing::warn!("robot.relax: torque off");
-                    // Back to the start, so the next `init` or Start ramps from wherever the robot
-                    // ends up rather than assuming it is still at the home pose.
-                    bringup = Bringup::Limp;
-                    was_driving = false;
-                    if let Some(controller) = controller.as_mut() {
-                        controller.forget();
+            Some(intents::PowerRequest::Relax) => {
+                intents.cancel_pending_rest();
+                if !shutdown_power_off {
+                    intents.finish_rest(false);
+                    shutdown_sit = None;
+                    shutdown_rest = None;
+                    shutdown_power_off = true;
+                    rest_action = None;
+                }
+                match safety.set_torque(false) {
+                    Ok(()) => {
+                        tracing::warn!("robot.relax: torque off");
+                        // Back to the start, so the next `init` or Start ramps from wherever the robot
+                        // ends up rather than assuming it is still at the home pose.
+                        bringup = Bringup::Limp;
+                        was_driving = false;
+                        if let Some(controller) = controller.as_mut() {
+                            controller.forget();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "cannot cut torque; the robot is still powered")
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "cannot cut torque; the robot is still powered")
-                }
-            },
+            }
             None => {}
         }
 
@@ -6189,41 +6385,23 @@ async fn control_loop<T: RobotIo>(
             } else {
                 ids
             };
-            let torque_ok = match safety.set_torque(false) {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::warn!(error = %e, "robot.rebootMotors: torque off failed on a servo");
-                    false
-                }
-            };
-            // HX has no servo reboot command. A rest is complete once its torque-off
-            // readback succeeds; explicit reboot requests keep their existing error path.
-            let reboot_ok = if rest_reboot_pending && params.bus.protocol == BusProtocol::Hx {
-                tracing::info!("rest: HX servo reboot is not supported; use the torque-off result");
-                true
+            if let Err(error) = safety.set_torque(false) {
+                tracing::warn!(%error, "robot.rebootMotors: torque off failed on a servo");
+            }
+            if let Err(error) = safety.reboot_motors(&ids) {
+                tracing::warn!(%error, ?ids, "robot.rebootMotors: failed part-way");
             } else {
-                match safety.reboot_motors(&ids) {
-                    Ok(()) => {
-                        tracing::warn!(?ids, "robot.rebootMotors: rebooted; init or Start brings the robot up");
-                        true
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, ?ids, "robot.rebootMotors: failed part-way");
-                        false
-                    }
-                }
-            };
+                tracing::warn!(?ids, "robot.rebootMotors: rebooted; init or Start brings the robot up");
+            }
             bringup = Bringup::Limp;
             state.homed.store(false, Ordering::Release);
-            if intents.rest_phase() == proto::RestPhase::Resting {
-                intents.finish_rest(rest_reboot_pending && torque_ok && reboot_ok);
-                rest_reboot_pending = false;
-            }
+            intents.cancel_pending_rest();
+            intents.finish_rest(false);
+            rest_action = None;
             was_driving = false;
             if let Some(controller) = controller.as_mut() {
                 controller.forget();
             }
-            // A rest ends here: its sit and rest pose are done with.
             if !shutdown_power_off {
                 shutdown_sit = None;
                 shutdown_rest = None;
@@ -6233,9 +6411,47 @@ async fn control_loop<T: RobotIo>(
 
         // One-shot skill requests, taken once per tick like the power request. They need a
         // driving robot — the prototype's buttons likewise did nothing until the policy ran.
-        let requests = intents.take_skills();
         let mut manual_action_started = false;
-        if requests.any() && state.exit_sit.load(Ordering::Acquire) == 0 {
+        {
+            let guard = state.human_control.lock();
+            if let Some(request) = intents.take_manual_skill()
+                && !request.reply.is_closed()
+            {
+                let result = if Instant::now() >= request.deadline {
+                    Err("the skill request timed out before it could start")
+                } else if state.exit_sit.load(Ordering::Acquire) != 0
+                    || guard.maintenance_phase().is_some() || guard.emergency_release_active()
+                    || guard.status_blocked() || guard.maintenance_transition_blocked()
+                    || intents.stop_generation() != snapshot.stop_generation
+                {
+                    Err("the skill request was stopped")
+                } else if !intents.enabled() || bringup != Bringup::Ready || shutdown_sit.is_some()
+                    || resume_seated_policy || mode_change.is_some() || pending_swap.is_some()
+                    || !was_driving || fresh.is_none() || !safety.imu_ready()
+                    || limp_fall != LimpFall::Idle || powered_off
+                {
+                    Err("the policy is not ready")
+                } else if seat_transition_until.is_some_and(|until| tick_start < until) {
+                    Err("a scripted move is already running")
+                } else if let Some(controller) = controller.as_mut() {
+                    start_requested_skill(controller, &request.name, tick_start, &mut seat_transition_until)
+                } else {
+                    Err("the policy is not ready")
+                };
+                let result = match result {
+                    Ok(()) => {
+                        manual_action_started = true;
+                        state.publish_active_skill(Some(&request.name));
+                        tracing::info!(skill = request.name, "skill started");
+                        proto::IntentResult::accepted()
+                    }
+                    Err(reason) => proto::IntentResult::refused(reason),
+                };
+                let _ = request.reply.send(result);
+            }
+        }
+        let requests = intents.take_skills();
+        if !manual_action_started && requests.any() && state.exit_sit.load(Ordering::Acquire) == 0 {
             match controller.as_mut() {
                 Some(controller)
                     if snapshot.enabled && bringup == Bringup::Ready && shutdown_sit.is_none()
@@ -6745,15 +6961,10 @@ async fn control_loop<T: RobotIo>(
             && battery_v > 0.0
             && battery_v <= duck_control::model::BATTERY_EMPTY_V;
         //
-        // `robot.rest` runs the same sit and rest pose and ends limp, instead of powered off.
-        // A power-off asked for during a rest stays latched and runs once the rest
-        // has ended — on a limp robot, so straight to the power-off.
+        // Latch a power-off requested during a rest until the rest has ended.
         let (shutdown, rest) = if !powered_off && shutdown_sit.is_none()
             && state.exit_sit.load(Ordering::Acquire) == 0 {
-            (
-                intents.take_shutdown() || battery_empty,
-                intents.take_rest(),
-            )
+            (intents.take_shutdown() || battery_empty, intents.take_rest())
         } else {
             (false, false)
         };
@@ -6765,24 +6976,54 @@ async fn control_loop<T: RobotIo>(
             coordinated_action_cancelled = true;
             tracing::warn!("coordinated arrival action cancelled for shutdown or rest");
         }
-        if !shutdown && rest {
-            let can_sit = snapshot.enabled
-                && bringup == Bringup::Ready
-                && !safety.fallen()
-                && controller.as_ref().is_some_and(|c| c.has_sitstand());
-            if can_sit {
-                tracing::warn!("rest: sitting down, then easing into the rest pose");
-                controller
-                    .as_mut()
-                    .expect("can_sit checked the controller")
-                    .begin_shutdown_sit();
-                shutdown_sit = Some(tick_start);
-                shutdown_power_off = false;
+        let mut release_rest = None;
+        if rest && shutdown {
+            intents.finish_rest(false);
+        } else if rest {
+            if bringup == Bringup::Limp {
+                release_rest = Some(true);
+            } else if bringup == Bringup::Ready && !safety.fallen() && fresh.is_some()
+                && safety.imu_ready() && limp_fall == LimpFall::Idle
+                && let Some(controller) = controller.as_mut().filter(|controller| controller.has_sitstand())
+            {
+                let action = if params.bus.protocol == BusProtocol::Hx {
+                    match rest_action::RestAction::load() {
+                        Ok(action) => Ok(Some(action)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            tracing::info!("rest: no Studio rest.csv, using the built-in rest pose");
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    }
+                } else {
+                    Ok(None)
+                };
+                match action {
+                    Ok(action) => {
+                        let seated = controller.is_sitting()
+                            && seat_transition_until.is_none_or(|until| tick_start >= until);
+                        rest_sit_remaining = if seated {
+                            Duration::ZERO
+                        } else if action.is_some() {
+                            Duration::from_secs_f64(controller.sit_ramp_secs())
+                        } else {
+                            Duration::from_secs_f64(controller.shutdown_sit_secs())
+                        };
+                        rest_action = action;
+                        controller.cancel_scripted_actions();
+                        controller.begin_shutdown_sit();
+                        shutdown_sit = Some(tick_start);
+                        shutdown_power_off = false;
+                        tracing::info!("rest: entering seated pose");
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "rest: cannot load Studio rest.csv");
+                        intents.finish_rest(false);
+                    }
+                }
             } else {
-                // Nothing driving to sit with: what is left of a rest is its end.
-                tracing::warn!("rest: the robot cannot sit — finishing at the current pose");
-                rest_reboot_pending = true;
-                intents.request_reboot_motors(Vec::new());
+                tracing::warn!("rest: seated pose is unavailable");
+                intents.finish_rest(false);
             }
         }
         if shutdown {
@@ -6885,35 +7126,89 @@ async fn control_loop<T: RobotIo>(
         if let Some(started) = shutdown_sit
             && !powered_off && exit_sit_started.is_none()
         {
-            match shutdown_rest.as_ref() {
-                None if tick_start.duration_since(started) >= shutdown_sit_hold => {
-                    tracing::warn!("sit complete: easing into the rest pose");
-                    shutdown_rest = Some(RestRamp {
-                        from: last_targets,
-                        gain: safety.gain().unwrap_or(policy_cfg.gain),
-                        since: tick_start,
-                    });
+            if let Some(RestMotion::Action { playback, .. }) = shutdown_rest.as_mut() {
+                playback.advance(tick_start);
+            }
+            let interruption = match shutdown_rest.as_ref() {
+                _ if shutdown_power_off => None,
+                _ if bringup != Bringup::Ready => Some("robot is no longer ready"),
+                _ if sensors.is_none() => Some("lost control feedback"),
+                Some(_) => None,
+                None if !safety.imu_ready() => Some("IMU is no longer ready"),
+                None if safety.fallen() => Some("standing fall threshold exceeded"),
+                None => None,
+            };
+            if let Some(reason) = interruption {
+                let phase = match shutdown_rest.as_ref() {
+                    None => "sit",
+                    Some(RestMotion::Action { .. }) => "action",
+                    Some(RestMotion::Ramp(_)) => "ramp",
+                };
+                tracing::warn!(phase, reason, ?bringup, "rest: motion interrupted");
+                release_rest = Some(false);
+            } else {
+                let sit_complete = if shutdown_power_off {
+                    tick_start.duration_since(started) >= shutdown_sit_hold
+                } else {
+                    rest_sit_remaining.is_zero()
+                };
+                match shutdown_rest.as_ref() {
+                    None if sit_complete => {
+                        let gain = safety.gain().unwrap_or(policy_cfg.gain);
+                        if !shutdown_power_off {
+                            // Hand off at the last sit target while the servos still have torque.
+                            intents.set_enabled(false);
+                            snapshot.enabled = false;
+                            policy_was_enabled = false;
+                        }
+                        shutdown_rest = Some(if let Some(action) = rest_action.take() {
+                            tracing::info!("rest: seated pose complete, policy disabled, starting rest.csv");
+                            RestMotion::Action { playback: action.start(last_targets), gain }
+                        } else {
+                            RestMotion::Ramp(RestRamp { from: last_targets, gain, since: tick_start })
+                        });
+                    }
+                    Some(rest) if rest.done(tick_start) && !shutdown_power_off => {
+                        tracing::info!("rest: movement complete, releasing all servos");
+                        release_rest = Some(true);
+                    }
+                    Some(rest) if rest.done(tick_start) => {
+                        tracing::warn!("at rest: cutting torque and powering off");
+                        cut_torque_before_poweroff(&mut safety);
+                        intents.set_enabled(false);
+                        bringup = Bringup::Limp;
+                        powered_off = true;
+                        poweroff();
+                    }
+                    _ => {}
                 }
-                Some(rest) if rest.done(tick_start) && !shutdown_power_off => {
-                    // The rest's end: torque is cut on every joint and leaves the
-                    // robot limp — and forgets the seat — on the next tick. Held at the rest pose
-                    // until then, which is where the ramp just put it.
-                    tracing::warn!("at rest: finishing rest and cutting torque");
-                    rest_reboot_pending = true;
-                    intents.request_reboot_motors(Vec::new());
-                    // The rest stays in place, holding the rest pose, until the reboot above
-                    // takes it on the next tick and ends it: cleared here, the policy would have
-                    // the robot for the tick in between.
+            }
+        }
+        if let Some(completed) = release_rest {
+            intents.set_enabled(false);
+            let mut torque_released = false;
+            for attempt in 1..=POWEROFF_TORQUE_ATTEMPTS {
+                match safety.set_torque(false) {
+                    Ok(()) => {
+                        torque_released = true;
+                        break;
+                    }
+                    Err(error) => tracing::warn!(%error, attempt, "rest: torque release failed"),
                 }
-                Some(rest) if rest.done(tick_start) => {
-                    tracing::warn!("at rest: cutting torque and powering off");
-                    cut_torque_before_poweroff(&mut safety);
-                    intents.set_enabled(false);
-                    bringup = Bringup::Limp;
-                    powered_off = true;
-                    poweroff();
-                }
-                _ => {}
+            }
+            intents.finish_rest(completed && torque_released);
+            if !torque_released {
+                maintenance_holding = true;
+            }
+            bringup = Bringup::Limp;
+            state.homed.store(false, Ordering::Release);
+            was_driving = false;
+            shutdown_sit = None;
+            shutdown_rest = None;
+            shutdown_power_off = true;
+            rest_action = None;
+            if let Some(controller) = controller.as_mut() {
+                controller.forget();
             }
         }
 
@@ -6965,7 +7260,7 @@ async fn control_loop<T: RobotIo>(
                         // break a move that was working.
                         && controller
                             .as_ref()
-                            .is_some_and(|c| !c.busy() && !c.is_sitting());
+                            .is_some_and(|c| (!c.busy() || c.skill_recovering()) && !c.is_sitting());
                     match fresh.as_ref() {
                         Some(fresh) if eligible && safety.imu_ready() => {
                             if falling.observe(&fresh.imu, period) {
@@ -7117,13 +7412,14 @@ async fn control_loop<T: RobotIo>(
                 || snapshot.motion_tracking.is_some() || snapshot.coordinated_tracking.is_some() || snapshot.maze.is_some());
         previous_stop_generation = snapshot.stop_generation;
         previous_gamepad_twist = snapshot.gamepad_twist;
-        let twist_target = if in_limp_fall || cancel_velocity_motion || precision_active {
+        let skill_recovering = controller.as_ref().is_some_and(Controller::skill_recovering);
+        let twist_target = if in_limp_fall || cancel_velocity_motion || precision_active || skill_recovering {
             [0.0; 3]
         } else {
             gated.twist
         };
         if in_limp_fall || cancel_velocity_motion || (tracking_stopped && !status_quiescing)
-            || (maze_immediate_stop && !status_quiescing) || precision_active {
+            || (maze_immediate_stop && !status_quiescing) || precision_active || skill_recovering {
             twist_ema = [0.0; 3];
         }
         smooth_twist(
@@ -7375,7 +7671,8 @@ async fn control_loop<T: RobotIo>(
         // stop it: the policy keeps going and the humans stay in charge.
         let exit_policy_driving = exit_sit_started.is_some()
             && state.exit_sit.load(Ordering::Acquire) == EXIT_SIT_RUNNING;
-        let policy_enabled_for_tick = snapshot.enabled || exit_policy_driving;
+        let rest_sitting = shutdown_sit.is_some() && !shutdown_power_off && shutdown_rest.is_none();
+        let policy_enabled_for_tick = snapshot.enabled || exit_policy_driving || rest_sitting;
         if shutdown_sit.is_some() || shutdown_rest.is_some() || powered_off
             || state.exit_sit.load(Ordering::Acquire) != 0
         {
@@ -7468,6 +7765,7 @@ async fn control_loop<T: RobotIo>(
             Ordering::Relaxed,
         );
         was_driving = driving;
+        let mut pickup_seated = false;
         if let (Some(tracking), Some(sensors)) = (snapshot.coordinated_tracking.as_ref(), fresh.as_ref())
             && tracking.fresh && tracking.params.camera.is_some()
             && sensors.positions[duck_control::model::MOUTH_INDEX].is_finite()
@@ -7484,7 +7782,11 @@ async fn control_loop<T: RobotIo>(
                 && seat_transition_until.is_some_and(|until| tick_start >= until)
             {
                 coordinated_mouth.action_finished(tracking.params.mouth_after, mouth);
+                if tracking.params.pickup_after.is_some() {
+                    pickup_action_completed = Some((tracking.sequence, snapshot.stop_generation));
+                }
             }
+            pickup_seated = controller.as_ref().is_some_and(Controller::is_sitting);
             coordinated_mouth.update_after(tracking.params.mouth_after);
         } else if snapshot.coordinated_tracking.as_ref().is_none_or(|tracking|
             !tracking.fresh || tracking.params.camera.is_none())
@@ -7608,7 +7910,27 @@ async fn control_loop<T: RobotIo>(
         // the same pose before inference, in its HOME-relative command coordinates. The
         // tracked targets still go to the servos below: the policy alone may not reach the
         // precise position required by the camera and initial-position handoff.
-        if let Some([pitch, yaw]) = coordinated_head {
+        let manual_head = if params.bus.protocol == BusProtocol::Hx && driving
+            && !snapshot.pose.active && !safety.fallen() && !in_limp_fall
+            && shutdown_sit.is_none() && shutdown_rest.is_none()
+            && controller.as_ref().is_some_and(|controller| !controller.busy() && !controller.is_sitting())
+            && (snapshot.head_position_held || snapshot.head_age <= Duration::from_millis(250))
+            && snapshot.head_tracking.is_none() && snapshot.coordinated_tracking.is_none()
+            && snapshot.motion_tracking.is_none() && snapshot.maze.is_none()
+            && snapshot.head_position_handoff.is_none()
+            && let Some([pitch, yaw]) = snapshot.head_position_raw
+        {
+            duck_control::hx::decode_position(6, &pitch.to_le_bytes()).ok()
+                .zip(duck_control::hx::decode_position(7, &yaw.to_le_bytes()).ok())
+                .map(|(pitch, yaw)| {
+                    let (pitch_min, pitch_max) = duck_control::model::JOINT_LIMITS[6];
+                    let (yaw_min, yaw_max) = duck_control::model::JOINT_LIMITS[7];
+                    [pitch.clamp(pitch_min, pitch_max), yaw.clamp(yaw_min, yaw_max)]
+                })
+        } else {
+            None
+        };
+        if let Some([pitch, yaw]) = coordinated_head.or(manual_head) {
             command.head[1] = pitch - policy_home[6];
             command.head[2] = yaw - policy_home[7];
         }
@@ -7672,7 +7994,8 @@ async fn control_loop<T: RobotIo>(
             // runs, so the policy is not stepped under it.
             _ if !powered_off && shutdown_rest.is_some() => {
                 let rest = shutdown_rest.as_ref().expect("just checked it is Some");
-                (rest.target(tick_start), rest.gain, true, "rest".into())
+                let (targets, gain) = rest.targets(tick_start);
+                (targets, gain, true, "rest".into())
             }
             (true, Some(sensors)) => 'policy: {
                 let controller = controller.as_mut().expect("driving implies a controller");
@@ -7802,6 +8125,12 @@ async fn control_loop<T: RobotIo>(
             (recording && driving && !inference_failed && sensors.is_some()
                 && (!policy_overrides.policy_gravity_from_reference || policy_trace.is_some()))
                 .then(proto::clock::monotonic_ns);
+        if let Some(controller) = controller.as_mut() {
+            let recovery_imu = fresh.as_ref().filter(|_| {
+                driving && safety.imu_ready() && !inference_failed && !safety.fallen() && !in_limp_fall
+            }).map(|sensors| &sensors.imu);
+            controller.observe_skill_recovery(recovery_imu, period);
+        }
         state.moving.store(moving, Ordering::Relaxed);
         let other_action_busy = controller.as_ref().is_some_and(Controller::busy)
             || matches!(bringup, Bringup::Homing { .. })
@@ -7815,6 +8144,12 @@ async fn control_loop<T: RobotIo>(
         state.human_motion_busy.store(
             twist_ema.iter().any(|velocity| velocity.abs() > 0.005), Ordering::Release,
         );
+        let active_skill = controller.as_ref().and_then(Controller::active_skill_name)
+            .or(seat_transition_until.filter(|until| tick_start < *until).map(|_| "sit_toggle"));
+        let timeout = state.last_skill_timeout.load();
+        let recovery_skill = controller.as_ref().filter(|controller| controller.skill_recovering())
+            .and_then(|_| timeout.as_ref().map(|timeout| timeout.skill.as_str()));
+        state.publish_active_skill(active_skill.or(recovery_skill));
 
         // Explicit mouth intent also applies during startup hold and the home ramp.
         // An active instrument can replace it below; the safety layer bounds the travel.
@@ -8073,6 +8408,9 @@ async fn control_loop<T: RobotIo>(
         if preview_position.is_some() {
             head_override = None;
         }
+        if head_available && let Some(head) = manual_head {
+            head_override = Some(head);
+        }
         if let Some(head) = head_override {
             targets[6] = head[0];
             targets[7] = head[1];
@@ -8176,6 +8514,9 @@ async fn control_loop<T: RobotIo>(
             else { targets[5..10].copy_from_slice(&pose[5..10]); }
         }
 
+        if let Some(RestMotion::Action { playback, .. }) = shutdown_rest.as_ref() {
+            targets = playback.target();
+        }
         read_timing.mark_stage(4);
 
         last_targets = targets;
@@ -8193,7 +8534,16 @@ async fn control_loop<T: RobotIo>(
             let applied = limp_fall
                 .apply_position_p_gain(&mut safety, fall_position_gains)
                 .and_then(|()| {
-                    if status_pose_latched && status_actively_holding {
+                    if let Some(RestMotion::Action { playback, .. }) = shutdown_rest.as_mut() {
+                        let Some((positions, duration_ms)) = playback.pending_frame() else {
+                            return Ok(duck_control::safety::Applied::default());
+                        };
+                        let applied = safety.apply_timed_frame(positions, duration_ms, targets, hold, gain)?;
+                        if !applied.limited_by(duck_control::safety::Limit::NotFinite) {
+                            playback.confirm_sent(Instant::now());
+                        }
+                        Ok(applied)
+                    } else if status_pose_latched && status_actively_holding {
                         safety.hold_torque_only(targets, gain)
                     } else if torque_only_passive_hold {
                         safety.hold_torque_only(hold, gain)
@@ -8214,9 +8564,24 @@ async fn control_loop<T: RobotIo>(
                 }
             }
         };
+        // A due R2 reversal is a single write behind the main motor command.
+        // Skipping it when a tick has little spare time leaves a pause at the endpoint.
+        if wrote_targets && write_ok && gamepad_ready && !stop_changed && fresh.is_some()
+            && !status_page_active && !write_guard.maintenance_transition_blocked()
+            && shutdown_rest.is_none() && !state.stopping.load(Ordering::Acquire)
+            && state.exit_sit.load(Ordering::Acquire) == 0
+            && let Err(error) = safety.write_accessory_trigger(intents.accessory_trigger())
+        {
+            tracing::warn!(%error, "accessory servo write failed");
+        }
         drop(write_guard);
+        if wrote_targets && write_ok && !limits.contains(&duck_control::safety::Limit::NotFinite)
+            && rest_sitting && driving && !inference_failed && fresh.is_some() && policy_label.as_ref() == "sit"
+        {
+            rest_sit_remaining = rest_sit_remaining.saturating_sub(period);
+        }
         if let Some(position) = coordinated_mouth_command {
-            if write_ok && !limits.contains(&duck_control::safety::Limit::NotFinite) {
+            if wrote_targets && write_ok && !limits.contains(&duck_control::safety::Limit::NotFinite) {
                 coordinated_mouth.confirm(position, tick_start, snapshot.mouth);
             } else {
                 coordinated_mouth.pause();
@@ -8263,6 +8628,18 @@ async fn control_loop<T: RobotIo>(
         let apply_end_t_ns = proto::clock::monotonic_ns();
         read_timing.mark_stage(5);
 
+        if let Some(tracking) = snapshot.coordinated_tracking.as_ref()
+            && pickup_action_completed == Some((tracking.sequence, snapshot.stop_generation))
+            && (coordinated_eligible && head_available || pickup_seated)
+            && !unsafe_motion && !manual_action_started && !coordinated_action_cancelled
+            && state.exit_sit.load(Ordering::Acquire) == 0
+            && wrote_targets && write_ok && !inference_failed && driving
+            && !limits.contains(&duck_control::safety::Limit::NotFinite)
+            && !coordinated_mouth.finishing()
+            && (pickup_seated || !coordinated_tracker.arrived() || coordinated_tracker.arrival_action_finished())
+        {
+            intents.advance_pickup(tracking.sequence, snapshot.stop_generation);
+        }
         let tracking_phase = snapshot.coordinated_tracking.as_ref().map(|tracking| {
             use proto::CoordinatedTrackingPhase as Phase;
             if autonomous_paused || safety.fallen() || in_limp_fall { Phase::Fallen }
@@ -8417,6 +8794,7 @@ async fn control_loop<T: RobotIo>(
                 head: command.head,
                 policy,
                 tracking_phase,
+                pickup_stage: snapshot.coordinated_tracking.as_ref().and_then(|tracking| tracking.pickup_stage),
                 safety: proto::SafetyState {
                     fallen: safety.fallen(),
                     // Limp means "the robot is actually at limp gain" — which now happens
@@ -9135,11 +9513,7 @@ async fn serve(
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _ = lease_tick.tick() => {
-                let guard = state.human_control.lock();
-                if guard.expired() {
-                    clear_human_intents(&intents);
-                    tracing::warn!("human control lease expired; motion stopped");
-                }
+                drop(state.human_control.lock());
                 continue;
             }
         };
@@ -9177,6 +9551,11 @@ fn clear_human_intents(intents: &Intents) {
 }
 
 fn clear_human_intents_with_stop(intents: &Intents, smooth: bool) {
+    clear_human_motion(intents, smooth);
+    intents.clear_head();
+}
+
+fn clear_human_motion(intents: &Intents, smooth: bool) {
     intents.cancel_head_tracking();
     intents.cancel_coordinated_tracking();
     if smooth {
@@ -9188,7 +9567,6 @@ fn clear_human_intents_with_stop(intents: &Intents, smooth: bool) {
         intents.stop();
     }
     intents.set_pose(intents::PoseIntent::default());
-    intents.clear_head();
     intents.set_mouth(0.0);
     let _ = intents.take_skills();
     let _ = intents.take_sounds();
@@ -9207,7 +9585,8 @@ fn is_motion_intent(call: &proto::Call) -> bool {
         | proto::Call::RobotHead(_) | proto::Call::RobotHeadTracking(_) | proto::Call::RobotMotionTracking(_) | proto::Call::RobotCoordinatedTracking(_) | proto::Call::RobotMaze(_) | proto::Call::RobotLook(_) | proto::Call::RobotStop
         | proto::Call::RobotEnable(_) | proto::Call::RobotInit | proto::Call::RobotRelax
         | proto::Call::RobotRebootMotors(_) | proto::Call::RobotRest | proto::Call::RobotDo(_)
-        | proto::Call::RobotPose(_) | proto::Call::RobotMouth(_) | proto::Call::RobotSound(_)
+        | proto::Call::RobotPose(_) | proto::Call::RobotMouth(_) | proto::Call::RobotAccessoryTrigger(_)
+        | proto::Call::RobotSound(_)
         | proto::Call::RobotSoundClip(_)
         | proto::Call::RobotTheremin(_) | proto::Call::RobotChorale(_)
         | proto::Call::RobotShutdown | proto::Call::RobotSetMode(_)
@@ -9232,7 +9611,7 @@ async fn handle(
     let mut session = human_control::Session::new();
     let result = handle_session(Arc::clone(&state), Arc::clone(&intents), stream, is_gamepad, &mut session).await;
     intents.update_head_tracking(session.id(), proto::HeadTrackingParams { pitch_position: None, action: proto::MotionTrackingAction::Stop, target: None, deadzone: [0.0; 2], gains: [[0.0; 3]; 2] });
-    intents.update_motion_tracking(session.id(), proto::MotionTrackingParams { initial_pitch: None, action: proto::MotionTrackingAction::Stop, target: None, reference_area: 1.0, deadzone: [0.0; 2], gains: [[0.0; 3]; 2] });
+    intents.update_motion_tracking(session.id(), proto::MotionTrackingParams { initial_pitch: None, action: proto::MotionTrackingAction::Stop, target: None, line_speed: None, reference_area: 1.0, deadzone: [0.0; 2], gains: [[0.0; 3]; 2] });
     intents.update_coordinated_tracking(session.id(), proto::CoordinatedTrackingParams { initial_pitch: None,
         action: proto::MotionTrackingAction::Stop, target: None, camera: None,
         head_deadzone: [0.0; 2], head_gains: [[0.0; 3]; 2], body_gains: [0.0; 3],
@@ -9245,14 +9624,13 @@ async fn handle(
         arrival_skill: String::new(),
         mouth_before: proto::TimedMouthPosition::default(),
         mouth_after: proto::TimedMouthPosition::default(),
+        pickup_after: None,
     });
     intents.update_maze(session.id(), proto::MazeParams { action: proto::MotionTrackingAction::Stop, threshold_mm: 1,
         head_step_deg: 0.0, settle_ms: 0, sample_ms: 0, restore_ms: 0, turn_initial_ms: 0, turn_final_ms: 0, linear_speed: 0.0, angular_speed: 0.0 });
     {
         let mut guard = state.human_control.lock();
-        let expired = guard.expired();
-        let was_owner = guard.disconnect(&mut session);
-        if expired || was_owner {
+        if guard.disconnect(&mut session) {
             clear_human_intents(&intents);
             tracing::warn!("human control disconnected; motion stopped");
         }
@@ -9572,7 +9950,6 @@ async fn handle_session(
         if let Ok(proto::Call::RobotHeadTracking(params)) = &call {
             let result = {
                 let mut guard = state.human_control.lock();
-                if guard.expired() { clear_human_intents(&intents); }
                 let web = session.source() == Some(proto::HumanControlSource::Web);
                 match params.action {
                     proto::MotionTrackingAction::Start => {
@@ -9591,7 +9968,7 @@ async fn handle_session(
                         if let Some(reason) = reason { Err(reason.to_owned()) }
                         else {
                             let already_owner = guard.access(session) == human_control::Access::Owner;
-                            if !guard.acquire(session, proto::HumanControlSource::Web).accepted {
+                            if !guard.acquire_if_free(session, proto::HumanControlSource::Web).accepted {
                                 Err("网页无法取得控制权".to_owned())
                             } else {
                                 if !already_owner { clear_human_intents(&intents); }
@@ -9631,7 +10008,6 @@ async fn handle_session(
         if let Ok(proto::Call::RobotMotionTracking(params)) = &call {
             let result = {
                 let mut guard = state.human_control.lock();
-                if guard.expired() { clear_human_intents(&intents); }
                 let web = session.source() == Some(proto::HumanControlSource::Web);
                 match params.action {
                     proto::MotionTrackingAction::Start => {
@@ -9648,7 +10024,7 @@ async fn handle_session(
                             else if state.human_action_busy.load(Ordering::Acquire) { Some("机器人正在执行动作或尚未准备好") }
                             else { None };
                         if let Some(reason) = reason { Err(reason.to_owned()) }
-                        else if !guard.acquire(session, proto::HumanControlSource::Web).accepted {
+                        else if !guard.acquire_if_free(session, proto::HumanControlSource::Web).accepted {
                             Err("网页无法取得控制权".to_owned())
                         } else {
                             intents.stop();
@@ -9692,14 +10068,15 @@ async fn handle_session(
         if let Ok(proto::Call::RobotCoordinatedTracking(params)) = &call {
             let result = {
                 let mut guard = state.human_control.lock();
-                if guard.expired() { clear_human_intents(&intents); }
                 let web = session.source() == Some(proto::HumanControlSource::Web);
+                let needs_disabled_tof = params.stop_distance_mm.is_some() && !state.obstacle.sensor_enabled();
                 match params.action {
                     proto::MotionTrackingAction::Start => {
                         let snapshot = intents.snapshot();
                         let reason = if !web { Some("网页控制连接未注册") }
                             else if guard.status_blocked() || guard.maintenance_transition_blocked() { Some("维护页面禁止运动") }
                             else if !params.valid() { Some("目标、相机或联合追踪参数无效") }
+                            else if needs_disabled_tof { Some("ToF 测距已关闭") }
                             else if coordinated_tracking::geometry().is_err() { Some("公共头部运动学模型不可用") }
                             else if intents.maze_active() { Some("迷宫模式正在运行") }
                             else if intents.motion_tracking_active() || intents.head_tracking_active() {
@@ -9708,12 +10085,7 @@ async fn handle_session(
                             else if !snapshot.enabled { Some("机器人策略未启用") }
                             else if snapshot.pose.active { Some("机器人处于姿态控制模式") }
                             else if state.policies.load().walk.is_none() { Some("未加载行走策略") }
-                            else if !params.arrival_skill.is_empty() && state.policies.load().stand.is_none() {
-                                Some("到位动作需要已加载的站立策略")
-                            }
-                            else if !params.arrival_skill.is_empty()
-                                && !has_do_name(&state.policies.load(), &params.arrival_skill)
-                            { Some("到位动作未加载") }
+                            else if let Some(reason) = arrival_skill_error(&state.policies.load(), params) { Some(reason) }
                             else if state.fallen.load(Ordering::Acquire) { Some("机器人处于摔倒状态") }
                             else if state.sitting.load(Ordering::Acquire) { Some("机器人处于坐下状态") }
                             else if state.human_action_busy.load(Ordering::Acquire) {
@@ -9723,7 +10095,7 @@ async fn handle_session(
                         if let Some(reason) = reason { Err(reason.to_owned()) }
                         else {
                             let already_owner = guard.access(session) == human_control::Access::Owner;
-                            if !guard.acquire(session, proto::HumanControlSource::Web).accepted {
+                            if !guard.acquire_if_free(session, proto::HumanControlSource::Web).accepted {
                                 Err("网页无法取得控制权".to_owned())
                             } else {
                                 if !already_owner { clear_human_intents(&intents); }
@@ -9734,10 +10106,11 @@ async fn handle_session(
                         }
                     }
                     proto::MotionTrackingAction::Update => {
-                        if !params.arrival_skill.is_empty()
-                            && (state.policies.load().stand.is_none()
-                                || !has_do_name(&state.policies.load(), &params.arrival_skill))
-                        { Err("到位动作或站立策略未加载".to_owned()) }
+                        if needs_disabled_tof {
+                            Err("ToF 测距已关闭".to_owned())
+                        } else if let Some(reason) = arrival_skill_error(&state.policies.load(), params) {
+                            Err(reason.to_owned())
+                        }
                         else if !web || guard.access(session) != human_control::Access::Owner {
                             Err("网页已失去控制权".to_owned())
                         } else if !intents.update_coordinated_tracking(session.id(), params.clone()) {
@@ -9774,7 +10147,6 @@ async fn handle_session(
         if let Ok(proto::Call::RobotMaze(params)) = &call {
             let result = {
                 let mut guard = state.human_control.lock();
-                if guard.expired() { clear_human_intents(&intents); }
                 let web = session.source() == Some(proto::HumanControlSource::Web);
                 match params.action {
                     proto::MotionTrackingAction::Start => {
@@ -9782,6 +10154,7 @@ async fn handle_session(
                         let reason = if !web { Some("网页控制连接未注册") }
                             else if guard.status_blocked() || guard.maintenance_transition_blocked() { Some("维护页面禁止运动") }
                             else if !params.valid() { Some("迷宫参数无效") }
+                            else if !state.obstacle.sensor_enabled() { Some("ToF 测距已关闭，无法开始迷宫模式") }
                             else if intents.motion_tracking_active() || intents.head_tracking_active()
                                 || intents.coordinated_tracking_active() { Some("视觉追踪正在运行") }
                             else if !snapshot.enabled { Some("机器人策略未启用") }
@@ -9792,7 +10165,7 @@ async fn handle_session(
                             else if state.human_action_busy.load(Ordering::Acquire) { Some("机器人正在执行动作或尚未准备好") }
                             else { None };
                         if let Some(reason) = reason { Err(reason.to_owned()) }
-                        else if !guard.acquire(session, proto::HumanControlSource::Web).accepted {
+                        else if !guard.acquire_if_free(session, proto::HumanControlSource::Web).accepted {
                             Err("网页无法取得控制权".to_owned())
                         } else {
                             intents.stop();
@@ -9835,7 +10208,6 @@ async fn handle_session(
             if let Some(id) = request.id.clone() {
                 let result = {
                     let mut guard = state.human_control.lock();
-                    if guard.expired() { clear_human_intents(&intents); }
                     use proto::HumanControlAction as Action;
                     match params.action {
                         Action::Register => guard.register(session, params.source),
@@ -9888,6 +10260,12 @@ async fn handle_session(
                             result
                         },
                         Action::UnblockMaintenanceTransition => guard.unblock_maintenance_transition(session),
+                        Action::Acquire | Action::AcquireIfFree
+                            if guard.status_blocked() || guard.maintenance_transition_blocked() => {
+                            proto::HumanControlResult {
+                                accepted: false, owner: None, reason: Some("设备状态页面禁止运动".into()),
+                            }
+                        }
                         Action::Acquire | Action::AcquireIfFree if (intents.head_tracking_active() || intents.motion_tracking_active()
                             || intents.coordinated_tracking_active() || intents.maze_active())
                             && guard.access(session) != human_control::Access::Owner =>
@@ -9943,7 +10321,10 @@ async fn handle_session(
                                 || state.human_motion_busy.load(Ordering::Acquire)
                                 || intents.snapshot().command.twist.iter().any(|value| *value != 0.0);
                             let result = guard.release(session, params.source, busy);
-                            if result.accepted { clear_human_intents(&intents); }
+                            if result.accepted {
+                                clear_human_motion(&intents, false);
+                                intents.hold_manual_head_on_release();
+                            }
                             result
                         }
                         Action::Abandon => {
@@ -10003,9 +10384,9 @@ async fn handle_session(
             && is_motion_intent(call)
             && !matches!(call, proto::Call::RobotSetObstacle(_))
         {
+            let mut skill_reply = None;
             let response = {
                 let mut guard = state.human_control.lock();
-                if guard.expired() { clear_human_intents(&intents); }
                 let access = guard.access(session);
                 let allowed = access == human_control::Access::Owner
                     || (access == human_control::Access::Unregistered && !guard.has_owner());
@@ -10040,6 +10421,17 @@ async fn handle_session(
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::refused("manual movement is disabled on the active page")))
                 } else if !allowed {
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::refused("another control source owns the robot")))
+                } else if let proto::Call::RobotAccessoryTrigger(params) = call {
+                    let result = if access == human_control::Access::Owner
+                        && session.source() == Some(proto::HumanControlSource::Gamepad)
+                        && params.pressure <= 100
+                    {
+                        intents.set_accessory_trigger(params.pressure);
+                        proto::IntentResult::accepted()
+                    } else {
+                        proto::IntentResult::refused("accessory trigger requires gamepad control and a pressure of 0–100")
+                    };
+                    request.id.clone().map(|id| proto::Response::ok(Some(id), &result))
                 } else {
                     if access == human_control::Access::Owner
                         && !matches!(call, proto::Call::RobotMove(_) | proto::Call::RobotHead(_)
@@ -10053,12 +10445,32 @@ async fn handle_session(
                         intents.set_gamepad_twist([p.vx, p.vy, p.vyaw]);
                         request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::accepted()))
                     } else if let Some(id) = request.id.clone() {
-                        Some(dispatch(&state, &intents, id, call))
+                        if let proto::Call::RobotDo(params) = call {
+                            match queue_manual_skill(&state, &intents, &params.skill) {
+                                Ok(reply) => {
+                                    skill_reply = Some((id, reply));
+                                    None
+                                }
+                                Err(reason) => Some(proto::Response::ok(Some(id), &proto::IntentResult::refused(reason))),
+                            }
+                        } else {
+                            Some(dispatch(&state, &intents, id, call))
+                        }
                     } else {
                         apply_intent(&state, &intents, call);
                         None
                     }
                 }
+            };
+            let response = if let Some((id, reply)) = skill_reply {
+                let result = match tokio::time::timeout(SKILL_ADMISSION_TIMEOUT, reply).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => proto::IntentResult::refused("the skill request was stopped"),
+                    Err(_) => proto::IntentResult::refused("the skill request timed out before it could start"),
+                };
+                Some(proto::Response::ok(Some(id), &result))
+            } else {
+                response
             };
             if let Some(response) = response { write_line(&mut write_half, &response).await?; }
             continue;
@@ -10239,7 +10651,7 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
             true
         }
         proto::Call::RobotHead(p) => {
-            intents.set_head([p.neck_pitch, p.head_pitch, p.head_yaw, p.head_roll]);
+            intents.set_head(*p);
             true
         }
         proto::Call::RobotPose(p) => {
@@ -10261,8 +10673,7 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
         }
         // A skill as a notification: how a client spells "the button is held" — `padd`
         // resends `roulade` every tick to keep a chain alive, and an answer per resend
-        // would be pure overhead. The one-shot press stays a request (`dispatch` refuses
-        // it with a reason); the loop arbitrates either way.
+        // would be pure overhead. One-shot requests wait for the control loop's decision.
         proto::Call::RobotDo(p) => {
             queue_skill(state, intents, &p.skill);
             true
@@ -10778,6 +11189,16 @@ fn has_do_name(policies: &PolicyNames, name: &str) -> bool {
         || policies.skills.iter().any(|skill| skill == name)
 }
 
+fn arrival_skill_error(policies: &PolicyNames, params: &proto::CoordinatedTrackingParams) -> Option<&'static str> {
+    [Some(params), params.pickup_after.as_deref()].into_iter().flatten()
+        .filter(|stage| !stage.arrival_skill.is_empty())
+        .find_map(|stage| {
+            if policies.stand.is_none() { Some("到位动作需要已加载的站立策略") }
+            else if !has_do_name(policies, &stage.arrival_skill) { Some("到位动作未加载") }
+            else { None }
+        })
+}
+
 fn cancel_arrival_skill(controller: Option<&mut Controller>, unwritten_sit: &mut bool) {
     if let Some(controller) = controller {
         if *unwritten_sit { controller.cancel_unwritten_sit(); }
@@ -10807,6 +11228,73 @@ fn start_arrival_skill(
                 false => Err("skill was already running"),
             }
         }
+    }
+}
+
+const SKILL_ADMISSION_TIMEOUT: Duration = Duration::from_millis(350);
+
+fn queue_manual_skill(
+    state: &RobotState,
+    intents: &Intents,
+    skill: &str,
+) -> Result<tokio::sync::oneshot::Receiver<proto::IntentResult>, String> {
+    if !intents.enabled() {
+        return Err("the policy is not driving — press Start on the pad".into());
+    }
+    if !state.homed.load(Ordering::Acquire) {
+        return Err("the robot is still going to its home pose; try again in a moment".into());
+    }
+    if state.active_skill.load().as_deref().map(String::as_str) == Some(skill) {
+        return Err("the skill is already running".into());
+    }
+    let known = do_names(&state.policies.load());
+    if !known.iter().any(|name| name == skill) {
+        return Err(if known.is_empty() {
+            "this robot has no skills configured".into()
+        } else {
+            format!("no skill named {:?}; this robot has {}", skill, known.join(", "))
+        });
+    }
+    let (reply, response) = tokio::sync::oneshot::channel();
+    intents.request_manual_skill(intents::ManualSkillRequest {
+        name: skill.to_owned(),
+        deadline: Instant::now() + SKILL_ADMISSION_TIMEOUT,
+        reply,
+    })?;
+    Ok(response)
+}
+
+fn start_requested_skill(
+    controller: &mut Controller,
+    name: &str,
+    now: Instant,
+    seat_transition_until: &mut Option<Instant>,
+) -> Result<(), &'static str> {
+    if controller.skill_recovering() {
+        return Err("the robot is recovering after a skill timeout");
+    }
+    if controller.busy() {
+        return Err(if controller.active_skill_name() == Some(name) {
+            "the skill is already running"
+        } else {
+            "a scripted move is already running"
+        });
+    }
+    if name == "sit_toggle" {
+        let direction = controller.sit_toggle()?;
+        *seat_transition_until = Some(now + Duration::from_secs_f64(controller.shutdown_sit_secs()));
+        tracing::info!(direction, "sit toggle");
+        return Ok(());
+    }
+    if name == "ground_pick" {
+        return controller.start_ground_pick();
+    }
+    let index = controller.skill_names().iter().position(|skill| skill == name)
+        .ok_or("no such skill on this robot")?;
+    if controller.start_skill(index)? {
+        Ok(())
+    } else {
+        Err("the skill is already running")
     }
 }
 
@@ -10954,6 +11442,9 @@ fn dispatch(
             apply_intent(state, intents, call);
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
+        proto::Call::RobotAccessoryTrigger(_) => proto::Response::ok(
+            Some(id), &proto::IntentResult::refused("accessory trigger requires gamepad control"),
+        ),
 
         // Gaze as a point: the IK runs here, against the same MJCF the policies train on,
         // and the answer is the joints the head was sent to — so a client can hold the gaze
@@ -10964,58 +11455,16 @@ fn dispatch(
             static HEAD_FK: std::sync::LazyLock<kinematics::head::HeadFk> =
                 std::sync::LazyLock::new(kinematics::head::HeadFk::alpha);
             let gaze = HEAD_FK.look_at([p.x, p.y, p.z], p.neck_pitch);
-            intents.set_head(gaze.joints);
             let [neck_pitch, head_pitch, head_yaw, head_roll] = gaze.joints;
+            let head = proto::HeadParams { neck_pitch, head_pitch, head_yaw, head_roll, raw_position: None };
+            intents.set_head(head);
             proto::Response::ok(
                 Some(id),
                 &proto::LookResult {
-                    head: proto::HeadParams {
-                        neck_pitch,
-                        head_pitch,
-                        head_yaw,
-                        head_roll,
-                    },
+                    head,
                     clamped: gaze.clamped,
                 },
             )
-        }
-
-        // A skill request is queued for the loop's next tick. Refused here only for what
-        // this side can already know — the skill was never configured, or the robot is
-        // down; the loop still arbitrates against whatever move is mid-flight, exactly as
-        // the prototype's buttons did.
-        proto::Call::RobotDo(p) => {
-            // Not refused for being down. A skill on a fallen robot is the human's call, and
-            // refusing it is how a robot ends up unable to do the thing that would have
-            // righted it.
-            // Refused before the name is even looked at, because "accepted" followed by
-            // nothing is the worst answer available: the loop drops a skill request whenever
-            // the policy is not driving, and it says so only in the journal. That silence cost
-            // an evening once already.
-            let result = if !intents.enabled() {
-                // Only the pad can start the policy: `robotctl robot` has `init` and `relax`
-                // and no `enable`, so naming a command here would be naming one that does not
-                // exist.
-                proto::IntentResult::refused("the policy is not driving — press Start on the pad")
-            } else if !state.homed.load(Ordering::Relaxed) {
-                proto::IntentResult::refused(
-                    "the robot is still going to its home pose; try again in a moment",
-                )
-            } else if queue_skill(state, intents, &p.skill) {
-                proto::IntentResult::accepted()
-            } else {
-                let known = do_names(&state.policies.load());
-                proto::IntentResult::refused(if known.is_empty() {
-                    "this robot has no skills configured".to_owned()
-                } else {
-                    format!(
-                        "no skill named {:?}; this robot has {}",
-                        p.skill,
-                        known.join(", ")
-                    )
-                })
-            };
-            proto::Response::ok(Some(id), &result)
         }
 
         // Picking the theremin up, or putting it down. Refused here for what this side can
@@ -11142,6 +11591,8 @@ fn dispatch(
                 enabled: state.policy_enabled,
                 slots: state.policy_slots.load().as_ref().clone(),
                 skills: state.policies.load().skills.clone(),
+                active_skill: state.active_skill.load_full().as_deref().cloned(),
+                last_skill_timeout: state.last_skill_timeout.load_full().as_deref().cloned(),
                 // The same flag `robot.do` refuses on, so a client can wait for it rather than
                 // be told no and guess whether asking again would help.
                 homed: state.startup_voltage_ready.load(Ordering::Acquire).then(|| state.homed.load(Ordering::Relaxed)),
@@ -11362,8 +11813,7 @@ fn dispatch(
         proto::Call::RobotEmergencyRelax => proto::Response::ok(Some(id),
             &proto::IntentResult::refused("卸力需要等待控制循环确认")),
 
-        // Never refused, like the shutdown it is the first half of: the loop decides whether the
-        // robot can sit first or is rebooted where it is.
+        // The control loop owns the seated pose, action playback and torque release.
         proto::Call::RobotRest => {
             let result = if intents.request_rest() {
                 proto::IntentResult::accepted()

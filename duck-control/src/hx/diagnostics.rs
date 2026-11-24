@@ -118,7 +118,7 @@ impl DiagnosticCache {
         parser: &Frames,
     ) {
         if tx.len() < 9
-            || tx[4] != SYNC_READ
+            || !matches!(tx[4], SYNC_READ | UNOQ_FEEDBACK_READ)
             || !matches!(
                 (tx[5], tx[6]),
                 (PRESENT_POSITION, PRESENT_POSITION_LEN)

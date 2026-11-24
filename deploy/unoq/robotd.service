@@ -1,0 +1,22 @@
+[Unit]
+Description=WonderDuck controller on Arduino UNO Q
+BindsTo=wonderduck-unoq-bridge.service
+After=wonderduck-unoq-bridge.service
+RequiresMountsFor=/home/arduino/wonderduck
+
+[Service]
+Type=exec
+WorkingDirectory=/home/arduino/wonderduck
+Group=arduino
+CPUAffinity=0 1 2 3
+Environment=WONDERDUCK_CONTROL_CPU=3
+Environment=WONDERDUCK_UNOQ_FEEDBACK=1
+Environment=WONDERDUCK_MOTION_CPU_MIN_KHZ=1612800
+ExecStart=/bin/sh /home/arduino/wonderduck/deploy/unoq/run-robotd.sh
+ExecStopPost=/bin/sh -ec 'if test -s /run/robotd/motion-cpu-min-khz; then cat /run/robotd/motion-cpu-min-khz > /sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq; fi'
+RuntimeDirectory=robotd webpadd
+KillMode=mixed
+TimeoutStopSec=25s
+
+[Install]
+WantedBy=multi-user.target

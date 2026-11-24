@@ -15,7 +15,7 @@
 /// The grey ultralytics pads a letterbox with, and therefore what calibration and training saw.
 pub const PAD: u8 = 114;
 
-/// How a frame was fitted into the model's square, so detections can be mapped back out of it.
+/// How a frame was fitted into the model input, so detections can be mapped back out of it.
 #[derive(Debug, Clone, Copy)]
 pub struct Letterbox {
     pub scale: f32,
@@ -30,18 +30,29 @@ pub fn letterbox_layout(
     size: usize,
     turn: Turn,
 ) -> (Letterbox, usize, usize) {
+    letterbox_rect_layout(width, height, (size, size), turn)
+}
+
+/// Fitted dimensions and coordinate transform for an input given as (width, height).
+pub fn letterbox_rect_layout(
+    width: usize,
+    height: usize,
+    model_size: (usize, usize),
+    turn: Turn,
+) -> (Letterbox, usize, usize) {
+    let (model_width, model_height) = model_size;
     let (upright_w, upright_h) = turn.upright(width, height);
-    let scale = (size as f32 / upright_w as f32).min(size as f32 / upright_h as f32);
+    let scale = (model_width as f32 / upright_w as f32).min(model_height as f32 / upright_h as f32);
     let fitted_w = ((upright_w as f32 * scale).round() as usize)
         .max(1)
-        .min(size);
+        .min(model_width);
     let fitted_h = ((upright_h as f32 * scale).round() as usize)
         .max(1)
-        .min(size);
+        .min(model_height);
     let fit = Letterbox {
         scale,
-        pad_x: ((size - fitted_w) / 2) as f32,
-        pad_y: ((size - fitted_h) / 2) as f32,
+        pad_x: ((model_width - fitted_w) / 2) as f32,
+        pad_y: ((model_height - fitted_h) / 2) as f32,
     };
     (fit, fitted_w, fitted_h)
 }
@@ -135,17 +146,31 @@ pub fn letterbox_from_uyvy_with_pad(
     pad: u8,
     out: &mut Vec<u8>,
 ) -> Letterbox {
+    letterbox_rect_from_uyvy_with_pad(uyvy, width, height, (size, size), turn, pad, out)
+}
+
+/// Convert and letterbox into an RGB input given as (width, height).
+pub fn letterbox_rect_from_uyvy_with_pad(
+    uyvy: &[u8],
+    width: usize,
+    height: usize,
+    model_size: (usize, usize),
+    turn: Turn,
+    pad: u8,
+    out: &mut Vec<u8>,
+) -> Letterbox {
+    let (model_width, model_height) = model_size;
     // Everything below is in *upright* coordinates — the picture the right way up, which is what
     // the model was trained on and what a detection has to be reported in. The turn is undone only
     // at the moment a source pixel is fetched.
     let (upright_w, upright_h) = turn.upright(width, height);
-    let (fit, fitted_w, fitted_h) = letterbox_layout(width, height, size, turn);
+    let (fit, fitted_w, fitted_h) = letterbox_rect_layout(width, height, model_size, turn);
     let pad_x = fit.pad_x as usize;
     let pad_y = fit.pad_y as usize;
     let stride = width * 2;
 
     out.clear();
-    out.resize(size * size * 3, pad);
+    out.resize(model_width * model_height * 3, pad);
     for y in 0..fitted_h {
         let uy = (y * upright_h) / fitted_h;
         for x in 0..fitted_w {
@@ -169,7 +194,7 @@ pub fn letterbox_from_uyvy_with_pad(
             let g = (298 * luma - 100 * u - 208 * v + 128) >> 8;
             let b = (298 * luma + 516 * u + 128) >> 8;
 
-            let target = ((y + pad_y) * size + (x + pad_x)) * 3;
+            let target = ((y + pad_y) * model_width + (x + pad_x)) * 3;
             out[target] = r.clamp(0, 255) as u8;
             out[target + 1] = g.clamp(0, 255) as u8;
             out[target + 2] = b.clamp(0, 255) as u8;

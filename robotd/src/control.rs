@@ -32,11 +32,13 @@
 //! after a sit→stand cycle until the next walk. Here scale and gain are recomputed from
 //! the active state every tick — same values on every path that matters, no leftovers.
 
+use duck_control::fall::FallPredictor;
+use duck_control::imu::ImuData;
 use duck_control::model::NUM_JOINTS;
 use duck_control::obs::{ACTION_LEN, OBS_LEN, Command, Observation};
 use duck_control::policy::{Net, Policy, PolicyError, PrecisionPolicy};
 use duck_ipc_proto::PrecisionAxis;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::precision_motion::PrecisionMotion;
 
@@ -49,6 +51,7 @@ const HEAD_JOINTS: std::ops::Range<usize> = 5..9;
 /// request landed within the last few ticks". 150 ms is seven ticks — generous against a
 /// dropped packet, far too short to mistake a fresh press for a hold.
 const CHAIN_WINDOW: f64 = 0.15;
+const SKILL_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Tuning {
@@ -184,11 +187,19 @@ struct ActiveSkill {
     phase: SkillPhase,
     /// Seconds left in this phase.
     remaining: f64,
+    /// Monotonic deadline for skills that report their own completion.
+    completion_deadline: Option<Instant>,
     /// Seconds left during which another request still counts as the button being held.
     /// Roulade's chaining, generalised: counted down every tick, refreshed by each request
     /// that lands while the skill runs, and positive at the end of a window means start
     /// another.
     chain: f64,
+}
+
+impl ActiveSkill {
+    fn timed_out(self, now: Instant, completed: bool) -> bool {
+        self.completion_deadline.is_some_and(|deadline| now >= deadline) && !completed
+    }
 }
 
 /// Which half of a skill is running.
@@ -265,6 +276,7 @@ pub struct Controller {
     /// One field where there were three, because a kick and a roulade were the same thing
     /// with different numbers.
     active: Option<ActiveSkill>,
+    skill_recovery: Option<FallPredictor>,
     roll_phase: Option<duck_control::roll_phase::RollPhase>,
     roll_heading: duck_control::roll_phase::RollHeadingReference,
     sit: Sit,
@@ -313,6 +325,7 @@ impl Controller {
             previous: None,
             ground_pick: None,
             active: None,
+            skill_recovery: None,
             roll_phase: None,
             roll_heading: Default::default(),
             sit: Sit::Up,
@@ -398,7 +411,7 @@ impl Controller {
         if self.precision_motion.is_some() {
             return Err("precision motion already running");
         }
-        if self.active.is_some() || self.ground_pick.is_some() || self.sit != Sit::Up {
+        if self.busy() || self.active.is_some() || self.sit != Sit::Up {
             return Err("another scripted motion or seat posture is active");
         }
         let motion = PrecisionMotion::new(now, axis, value)?;
@@ -458,6 +471,7 @@ impl Controller {
         self.previous = from.previous;
         self.ground_pick = from.ground_pick;
         self.active = from.active;
+        self.skill_recovery = from.skill_recovery.clone();
         self.roll_phase = from.roll_phase;
         self.roll_heading = from.roll_heading;
         self.sit = from.sit;
@@ -492,6 +506,7 @@ impl Controller {
         self.reset();
         self.ground_pick = None;
         self.active = None;
+        self.skill_recovery = None;
         self.sit = Sit::Up;
     }
 
@@ -529,10 +544,14 @@ impl Controller {
         self.policy.has_sitstand()
     }
 
-    /// How long the policy holds the shutdown sit before the joints ease into the rest pose:
-    /// the seat's settle time, then a second sitting still.
+    /// Duration of the configured sit transition.
+    pub fn sit_ramp_secs(&self) -> f64 {
+        self.skills.sitstand_ramp_s
+    }
+
+    /// The sit transition followed by a second of holding the seat.
     pub fn shutdown_sit_secs(&self) -> f64 {
-        self.skills.sitstand_ramp_s + 1.0
+        self.sit_ramp_secs() + 1.0
     }
 
     pub fn is_sitting(&self) -> bool {
@@ -552,7 +571,8 @@ impl Controller {
     /// A scripted move is mid-flight. Sitting itself is not busy — a seated robot is
     /// parked, not travelling.
     pub fn busy(&self) -> bool {
-        self.ground_pick.is_some()
+        self.skill_recovering()
+            || self.ground_pick.is_some()
             || (self.active.is_some()
                 && !self.roll_phase.is_some_and(|phase| phase.completed && !phase.holds_inverted()))
             || matches!(self.sit, Sit::Settling { .. } | Sit::Rising { .. } | Sit::AutoRising { .. })
@@ -562,6 +582,46 @@ impl Controller {
     pub fn scripted_active(&self) -> bool {
         self.ground_pick.is_some() || self.active.is_some()
             || matches!(self.sit, Sit::Settling { .. } | Sit::Rising { .. } | Sit::AutoRising { .. })
+    }
+
+    pub fn active_skill_name(&self) -> Option<&str> {
+        if let Some(skill) = self.active
+            && !self.roll_phase.is_some_and(|phase| phase.completed && !phase.holds_inverted())
+        {
+            return self.skills.skills.get(skill.index).map(|definition| definition.name.as_str());
+        }
+        self.ground_pick.map(|_| "ground_pick")
+    }
+
+    pub fn skill_timed_out(&self, now: Instant) -> bool {
+        self.active.is_some_and(|active| active.timed_out(now, self.policy.skill_completed(active.index)))
+    }
+
+    pub fn expire_skill(&mut self, now: Instant, pose: [f64; NUM_JOINTS]) -> Option<String> {
+        if !self.skill_timed_out(now) {
+            return None;
+        }
+        let name = self.active_skill_name()?.to_owned();
+        self.stop_moves();
+        self.previous = Some(pose);
+        self.skill_recovery = Some(FallPredictor::new(Default::default()));
+        Some(name)
+    }
+
+    pub fn skill_recovering(&self) -> bool {
+        self.skill_recovery.is_some()
+    }
+
+    pub fn observe_skill_recovery(&mut self, imu: Option<&ImuData>, period: Duration) {
+        let Some(recovery) = self.skill_recovery.as_mut() else { return; };
+        if let Some(imu) = imu {
+            recovery.observe(imu, period);
+            if recovery.standing_confirmed() {
+                self.skill_recovery = None;
+            }
+        } else {
+            recovery.reset();
+        }
     }
 
     pub fn release_completed_roll(&mut self) {
@@ -574,6 +634,12 @@ impl Controller {
     /// network existing and the move not already running — a pick can even preempt a kick's
     /// tail, and that stays as it was.
     pub fn start_ground_pick(&mut self) -> Result<(), &'static str> {
+        if self.skill_recovering() {
+            return Err("recovering after a skill timed out");
+        }
+        if self.active.is_some_and(|active| active.completion_deadline.is_some()) {
+            return Err("a scripted move is already running");
+        }
         if matches!(self.sit, Sit::Settling { .. } | Sit::AutoRising { .. }) {
             return Err("automatic seated recovery is running");
         }
@@ -612,6 +678,9 @@ impl Controller {
     /// always roll out of a kick's tail or out of the seat. A ground pick blocks everything, as
     /// it always has.
     pub fn start_skill(&mut self, index: usize) -> Result<bool, &'static str> {
+        if self.skill_recovering() {
+            return Err("recovering after a skill timed out");
+        }
         if matches!(self.sit, Sit::Settling { .. } | Sit::AutoRising { .. }) {
             return Err("automatic seated recovery is running");
         }
@@ -619,6 +688,10 @@ impl Controller {
             return Err("no such skill on this robot");
         };
         let (duration, chains) = (def.duration, def.chain);
+        let completion_controlled = self.policy.skill_completion_controlled(index);
+        if completion_controlled && self.sit != Sit::Up {
+            return Err("stand up before starting this skill");
+        }
         let roll_phase = self.policy.skill_phase(index);
         if def.name == "headstand" && !roll_phase.is_some_and(|phase| phase.holds_inverted()) {
             return Err("headstand requires a headstand_phase policy");
@@ -645,6 +718,9 @@ impl Controller {
                 active.chain = CHAIN_WINDOW;
                 return Ok(false);
             }
+            if active.completion_deadline.is_some() {
+                return Err("a scripted move is already running");
+            }
             if !chains {
                 return Err("a scripted move is already running");
             }
@@ -657,11 +733,12 @@ impl Controller {
             index,
             phase: SkillPhase::Holding,
             remaining: duration,
+            completion_deadline: completion_controlled.then(|| Instant::now() + SKILL_COMPLETION_TIMEOUT),
             chain: if roll_phase.is_some() { CHAIN_WINDOW } else { 0.0 },
         });
         self.roll_phase = roll_phase;
         self.roll_heading.clear();
-        if roll_phase.is_some() || self.policy.skill_completion_controlled(index) {
+        if roll_phase.is_some() || completion_controlled {
             self.policy.reset();
             if roll_phase.is_some_and(|phase| !phase.holds_inverted()) {
                 self.last_action.fill(0.0);
@@ -689,6 +766,12 @@ impl Controller {
     /// Sit if standing, stand if sitting. Refused mid-rise, as the prototype refuses it
     /// while a stand transition is in flight.
     pub fn sit_toggle(&mut self) -> Result<&'static str, &'static str> {
+        if self.skill_recovering() {
+            return Err("recovering after a skill timed out");
+        }
+        if self.active.is_some_and(|active| active.completion_deadline.is_some()) {
+            return Err("a scripted move is already running");
+        }
         if self.roll_phase.is_some_and(|phase| !phase.completed) {
             return Err("a roll is in progress");
         }
@@ -718,10 +801,8 @@ impl Controller {
     /// seconds, then cut torque and power off); this just puts the sitstand network in
     /// charge with the posture flag at 1.
     pub fn begin_shutdown_sit(&mut self) {
-        self.cancel_precision();
-        if self.roll_phase.take().is_some() {
-            self.active = None;
-        }
+        self.skill_recovery = None;
+        self.cancel_scripted_actions();
         self.sit = Sit::Sitting;
     }
 
@@ -792,6 +873,12 @@ impl Controller {
         mut trace: Option<&mut PolicyTrace>,
         now: Instant,
     ) -> Result<Step, PolicyError> {
+        let neutral = Command::default();
+        let (command, selection_twist, body_active) = if self.skill_recovering() {
+            (&neutral, [0.0; 3], false)
+        } else {
+            (command, selection_twist, body_active)
+        };
         if let Some(motion) = self.precision_motion {
             if let Some(frame) = motion.frame(now) {
                 return self.step_precision(sensors, frame, observation_gravity, trace);
@@ -926,7 +1013,8 @@ impl Controller {
                         twist: if body_active { [0.0; 3] } else { selection_twist },
                         ..Command::default()
                     };
-                    let standing = (self.policy.will_stand(selection.twist_magnitude()) && !self.force_walk)
+                    let standing = self.skill_recovering()
+                        || (self.policy.will_stand(selection.twist_magnitude()) && !self.force_walk)
                         || (body_active && self.policy.has_standing());
                     let Some(net) = idle_net(
                         self.policy.has_walking(),
@@ -1208,5 +1296,107 @@ fn idle_net(
             .or(has_walking.then_some(Net::Walk))
     } else {
         has_walking.then_some(Net::Walk)
+    }
+}
+
+#[cfg(test)]
+mod skill_tests {
+    use super::*;
+    use duck_control::Sensors;
+    use duck_control::policy::PolicyPaths;
+    use std::path::Path;
+
+    const PERIOD: Duration = Duration::from_millis(20);
+
+    fn controller() -> Controller {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let base = fixtures.join("feedforward.onnx");
+        let policy = Policy::load(&PolicyPaths {
+            walk: Some(base.clone()),
+            stand: Some(base.clone()),
+            sitstand: Some(base.clone()),
+            ground_pick: Some(base.clone()),
+            skills: vec![fixtures.join("kick_completion.onnx"), base],
+        }, 0.05).unwrap();
+        let skills = SkillTuning {
+            skills: vec![
+                robotd_params::SkillDef { name: "kick".into(), duration: 0.5, ..Default::default() },
+                robotd_params::SkillDef { name: "roll".into(), duration: 0.5, chain: true, ..Default::default() },
+            ],
+            ..Default::default()
+        };
+        Controller::new(policy, Tuning::default(), skills, [0.0; NUM_JOINTS], [0.0; NUM_JOINTS])
+    }
+
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn kick_timeout_does_not_extend_and_requires_fresh_upright_recovery() {
+        let mut controller = controller();
+        controller.sit_toggle().unwrap();
+        assert!(controller.start_skill(0).is_err());
+        controller.sit = Sit::Up;
+        let before = Instant::now();
+        assert_eq!(controller.start_skill(0), Ok(true));
+        let deadline = controller.active.unwrap().completion_deadline.unwrap();
+        assert!(deadline >= before + Duration::from_secs(5));
+        assert!(deadline <= Instant::now() + Duration::from_secs(5));
+        assert!(controller.start_skill(0).is_err());
+        assert_eq!(controller.active.unwrap().completion_deadline, Some(deadline));
+        assert_eq!(controller.expire_skill(deadline - PERIOD, [0.1; NUM_JOINTS]), None);
+        assert_eq!(controller.expire_skill(deadline, [0.1; NUM_JOINTS]).as_deref(), Some("kick"));
+        assert_eq!(controller.previous, Some([0.1; NUM_JOINTS]));
+        assert_eq!(controller.active_skill_name(), None);
+        assert!(controller.busy());
+        assert!(controller.start_skill(1).is_err());
+        assert!(controller.start_ground_pick().is_err());
+        assert!(controller.sit_toggle().is_err());
+        assert!(controller.start_precision(PrecisionAxis::X, 0.1, deadline).is_err());
+
+        let imu = ImuData::default();
+        for _ in 0..49 { controller.observe_skill_recovery(Some(&imu), PERIOD); }
+        controller.observe_skill_recovery(None, PERIOD);
+        for _ in 0..49 { controller.observe_skill_recovery(Some(&imu), PERIOD); }
+        assert!(controller.skill_recovering());
+        controller.observe_skill_recovery(Some(&imu), PERIOD);
+        assert!(!controller.busy());
+
+        assert_eq!(controller.start_skill(0), Ok(true));
+        let deadline = controller.active.unwrap().completion_deadline.unwrap();
+        controller.cancel_scripted_actions();
+        assert_eq!(controller.expire_skill(deadline, [0.0; NUM_JOINTS]), None);
+        assert!(!controller.skill_recovering());
+    }
+
+    #[test]
+    #[ignore = "requires ONNX Runtime >= 1.23"]
+    fn measured_model_completion_hands_back_without_timing_out() {
+        let mut controller = controller();
+        assert_eq!(controller.start_skill(0), Ok(true));
+        let deadline = controller.active.unwrap().completion_deadline.unwrap();
+        let mut sensors = Sensors::default();
+        let command = Command::default();
+        let step = |controller: &mut Controller, sensors: &Sensors| {
+            controller.step_with_trace(sensors, &command, false, PERIOD.as_secs_f64(), 1.0, None)
+                .unwrap().label
+        };
+        for _ in 0..100 {
+            assert_eq!(step(&mut controller, &sensors), "kick");
+        }
+        sensors.positions[2] = 0.3;
+        assert_eq!(step(&mut controller, &sensors), "kick");
+        sensors.positions[2] = 0.0;
+        for _ in 0..49 {
+            assert_eq!(step(&mut controller, &sensors), "kick");
+        }
+        assert_eq!(step(&mut controller, &sensors), "stand");
+        assert_eq!(controller.active_skill_name(), None);
+        assert_eq!(controller.expire_skill(deadline, sensors.positions), None);
+        assert!(!controller.skill_recovering());
+
+        assert_eq!(controller.start_skill(1), Ok(true));
+        assert_eq!(controller.start_skill(1), Ok(false));
+        assert_eq!(controller.expire_skill(deadline, sensors.positions), None);
+        controller.active.as_mut().unwrap().remaining = 0.0;
+        assert_eq!(step(&mut controller, &sensors), "roll");
     }
 }

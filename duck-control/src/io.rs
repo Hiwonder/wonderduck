@@ -319,6 +319,11 @@ pub trait RobotIo {
     fn end_device_observation(&mut self) {}
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 
+    /// Dispatch a timed frame to the servos. Returns false if the backend has no native timing.
+    fn write_timed_positions(&mut self, _positions: &[Option<f64>; NUM_JOINTS], _duration_ms: u16) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Transfer the motor bus to or from a connection-bound maintenance session.
     /// Neither operation may send motor commands.
     fn maintenance_handoff(&mut self, _release: bool) -> Result<()> {
@@ -390,6 +395,11 @@ pub trait RobotIo {
     /// Write raw position counts for explicitly identified joints.
     fn write_positions_raw(&mut self, _ids: &[u8], _positions: &[u16]) -> Result<()> {
         Err(IoError::Bus("raw servo position write is unsupported".into()))
+    }
+
+    /// Apply the optional accessory servos' gamepad pressure.
+    fn write_accessory_trigger(&mut self, _pressure: u8) -> Result<()> {
+        Ok(())
     }
 
     /// Reboot one servo: the Protocol 2 REBOOT instruction.

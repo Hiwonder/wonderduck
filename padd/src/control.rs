@@ -7,61 +7,188 @@ use std::time::{Duration, Instant};
 use duck_ipc_proto as proto;
 
 pub const REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+pub const IDLE_RELEASE: Duration = Duration::from_millis(250);
 const LEASE_TTL: Duration = Duration::from_millis(750);
 
 pub fn stop_on_pad_loss(present: bool, owns: bool) -> bool {
     present && owns
 }
 
+const START_TAP_MAX: Duration = Duration::from_millis(1500);
+const START_REST_HOLD: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartAction {
+    Initialize,
+    Rest,
+    ToggleHeadDrive,
+}
+
 #[derive(Default)]
-pub struct RestChord {
+enum StartGesture {
+    // Also used on connection to ignore buttons already down.
+    #[default]
+    AwaitRelease,
+    Ready,
+    Holding(Instant),
+    Chord,
+    RestRequested,
+}
+
+#[derive(Default)]
+pub struct StartControls {
     start: bool,
     select: bool,
-    latched: bool,
-    pending_rest: bool,
+    gesture: StartGesture,
+    pending: Option<StartAction>,
 }
 
-pub struct RestChordAction {
-    pub rest: bool,
-    pub suppress: bool,
-}
-
-impl RestChord {
-    fn update(&mut self, start: bool, select: bool) {
+impl StartControls {
+    fn update(&mut self, start: bool, select: bool, now: Instant) {
         self.start = start;
         self.select = select;
-        if start && select && !self.latched {
-            self.latched = true;
-            self.pending_rest = true;
-        }
-    }
-
-    pub fn button(&mut self, button: gilrs::Button, pressed: bool) {
-        match button {
-            gilrs::Button::Start => self.update(pressed, self.select),
-            gilrs::Button::Select => self.update(self.start, pressed),
+        match self.gesture {
+            StartGesture::Ready | StartGesture::Holding(_) if start && select => {
+                self.gesture = StartGesture::Chord;
+                self.pending = Some(StartAction::ToggleHeadDrive);
+            }
+            StartGesture::Ready if start => self.gesture = StartGesture::Holding(now),
+            StartGesture::Holding(since) if !start => {
+                let elapsed = now.saturating_duration_since(since);
+                if elapsed >= START_REST_HOLD {
+                    self.request_rest();
+                } else {
+                    self.gesture = StartGesture::Ready;
+                    if elapsed < START_TAP_MAX {
+                        self.pending = Some(StartAction::Initialize);
+                    }
+                }
+            }
             _ => {}
         }
     }
 
-    pub fn finish(&mut self, start: bool, select: bool) -> RestChordAction {
-        self.update(start, select);
-        let action = RestChordAction {
-            rest: self.pending_rest,
-            suppress: self.latched,
-        };
-        self.pending_rest = false;
-        if !start && !select {
-            self.latched = false;
-        }
-        action
+    fn request_rest(&mut self) {
+        self.gesture = StartGesture::RestRequested;
+        self.pending = Some(StartAction::Rest);
     }
 
-    pub fn disconnected(&mut self) {
-        self.start = false;
-        self.select = false;
-        self.pending_rest = false;
-        self.latched = false;
+    pub fn button(&mut self, button: gilrs::Button, pressed: bool, now: Instant) {
+        match button {
+            gilrs::Button::Start => self.update(pressed, self.select, now),
+            gilrs::Button::Select => self.update(self.start, pressed, now),
+            _ => {}
+        }
+    }
+
+    pub fn finish(
+        &mut self,
+        start: bool,
+        select: bool,
+        now: Instant,
+    ) -> (Option<StartAction>, bool) {
+        self.update(start, select, now);
+        if let StartGesture::Holding(since) = self.gesture
+            && now.saturating_duration_since(since) >= START_REST_HOLD
+        {
+            self.request_rest();
+        }
+        let action = self.pending.take();
+        if !start && (!select || matches!(self.gesture, StartGesture::Chord)) {
+            self.gesture = StartGesture::Ready;
+        }
+        let suppress_motion = action == Some(StartAction::Rest)
+            || matches!(self.gesture, StartGesture::RestRequested);
+        (action, suppress_motion)
+    }
+}
+
+#[cfg(test)]
+mod start_controls_tests {
+    use super::*;
+    use gilrs::Button;
+
+    #[test]
+    fn start_requests_rest_once_at_three_seconds() {
+        let now = Instant::now();
+        let held = now + START_REST_HOLD;
+        let mut keys = StartControls::default();
+        keys.finish(false, false, now);
+        assert_eq!(keys.finish(true, false, now), (None, false));
+        assert_eq!(
+            keys.finish(true, false, held - Duration::from_millis(1)),
+            (None, false)
+        );
+        assert_eq!(
+            keys.finish(true, false, held),
+            (Some(StartAction::Rest), true)
+        );
+        assert_eq!(keys.finish(true, true, held), (None, true));
+        assert_eq!(keys.finish(false, true, held), (None, true));
+        assert_eq!(keys.finish(false, false, held), (None, false));
+    }
+
+    #[test]
+    fn chord_toggles_in_both_press_orders_and_consumes_start_release() {
+        let now = Instant::now();
+        let later = now + START_REST_HOLD;
+        let mut keys = StartControls::default();
+        keys.finish(false, false, now);
+        for (first, second) in [
+            (Button::Select, Button::Start),
+            (Button::Start, Button::Select),
+        ] {
+            keys.button(first, true, now);
+            keys.button(second, true, now);
+            keys.button(second, false, now);
+            assert_eq!(
+                keys.finish(first == Button::Start, first == Button::Select, now),
+                (Some(StartAction::ToggleHeadDrive), false)
+            );
+            if first == Button::Select {
+                assert_eq!(
+                    keys.finish(true, true, later),
+                    (Some(StartAction::ToggleHeadDrive), false)
+                );
+            } else {
+                assert_eq!(keys.finish(true, false, later), (None, false));
+                assert_eq!(keys.finish(true, true, later), (None, false));
+            }
+            assert_eq!(keys.finish(true, true, later), (None, false));
+            assert_eq!(keys.finish(false, false, later), (None, false));
+        }
+    }
+
+    #[test]
+    fn short_press_initializes_and_reconnect_requires_release() {
+        let now = Instant::now();
+        let mut keys = StartControls::default();
+        assert_eq!(keys.finish(true, true, now), (None, false));
+        assert_eq!(
+            keys.finish(true, false, now + START_REST_HOLD),
+            (None, false)
+        );
+        assert_eq!(
+            keys.finish(false, false, now + START_REST_HOLD),
+            (None, false)
+        );
+        let later = now + START_REST_HOLD;
+        keys.button(Button::Start, true, later);
+        keys.button(Button::Start, false, later);
+        assert_eq!(
+            keys.finish(false, false, later),
+            (Some(StartAction::Initialize), false)
+        );
+        keys.finish(true, false, later);
+        assert_eq!(
+            keys.finish(false, false, later + START_TAP_MAX),
+            (None, false)
+        );
+        keys.finish(true, false, later + START_TAP_MAX);
+        assert_eq!(
+            keys.finish(false, false, later + START_TAP_MAX + START_REST_HOLD),
+            (Some(StartAction::Rest), true)
+        );
     }
 }
 

@@ -1,0 +1,185 @@
+--- a/src/libcamera/pipeline/camss/camss_csi.cpp
++++ b/src/libcamera/pipeline/camss/camss_csi.cpp
+@@ -113,7 +113,7 @@
+  * - The desired \a size shall fit in the sensor output size to avoid the need
+  *   to up-scale.
+  * - The aspect ratio of sensor output size shall be as close as possible to
+- *   the sensor's native resolution field of view.
++ *   the requested output aspect ratio.
+  * - The sensor output size shall be as small as possible to lower the required
+  *   bandwidth.
+  *
+@@ -134,8 +134,6 @@
+ 	unsigned int bestArea = std::numeric_limits<unsigned int>::max();
+ 	const Size &resolution = sensor_->resolution();
+ 	std::vector<unsigned int> mbusCodes;
+-	float desiredRatio = static_cast<float>(resolution.width) /
+-			     resolution.height;
+ 	float bestRatio = std::numeric_limits<float>::max();
+ 	unsigned int desiredCode = 0;
+ 	uint32_t bestCode = 0;
+@@ -145,6 +143,8 @@
+ 	/* If no desired size use the sensor resolution. */
+ 	if (size.isNull())
+ 		size = resolution;
++
++	const float desiredRatio = static_cast<float>(size.width) / size.height;
+ 
+ 	if (format.isValid())
+ 		desiredCode = PixelFormatToMbusCode(format);
+--- a/src/libcamera/pipeline/camss/camss_isp_ope.cpp
++++ b/src/libcamera/pipeline/camss/camss_isp_ope.cpp
+@@ -7,10 +7,12 @@
+ 
+ #include "camss_isp_ope.h"
+ 
++#include <cmath>
+ #include <string.h>
+ 
+ #include <libcamera/base/log.h>
+ 
++#include <libcamera/color_space.h>
+ #include <libcamera/controls.h>
+ #include <libcamera/formats.h>
+ #include <libcamera/geometry.h>
+@@ -21,6 +23,7 @@
+ #include "libcamera/internal/camera_sensor.h"
+ #include "libcamera/internal/device_enumerator.h"
+ #include "libcamera/internal/dma_buf_allocator.h"
++#include "libcamera/internal/formats.h"
+ #include "libcamera/internal/framebuffer.h" // FIXME drop once softIPA (ab)use is gone
+ #include "libcamera/internal/ipa_manager.h"
+ #include "libcamera/internal/media_device.h"
+@@ -341,13 +344,17 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	/*
+-	 * No input-crop, downscale instead to keep full field of view.
+-	 * \todo crop in x or y dimension to match requested output aspect,
+-	 * to keep square pixels after scaling.
+-	 */
++	/* Preserve the aspect ratio and the Bayer phase before scaling. */
++	const unsigned int horizontalAlignment =
++		PixelFormatInfo::info(inputCfg.pixelFormat).bitsPerPixel == 10 ? 4 : 2;
++	const Size cropSize = inputCfg.size.boundedToAspectRatio(outputCfg.size)
++				     .alignedDownTo(horizontalAlignment, 2);
++	const unsigned int left = (inputCfg.size.width - cropSize.width) / 2;
++	const unsigned int top = (inputCfg.size.height - cropSize.height) / 2;
++	const Rectangle crop(left / horizontalAlignment * horizontalAlignment,
++			     top / 2 * 2, cropSize);
+ 	ret = trySetSubdevSelection(proc_.get(), PROC_PAD_INPUT, V4L2_SEL_TGT_CROP,
+-				    Rectangle(inputCfg.size), whence, "OPE input crop");
++				    crop, whence, "OPE input crop");
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -601,6 +608,43 @@
+ 	colorCorrect->k[1] = 0;
+ 	colorCorrect->k[2] = 0;
+ 
++	const auto &colorSpace = outStream_.configuration().colorSpace;
++	const bool videoRange = colorSpace && colorSpace->ycbcrEncoding == ColorSpace::YcbcrEncoding::Rec601 &&
++				colorSpace->range == ColorSpace::Range::Limited;
++	if (videoRange) {
++		/* BT.601 limited range: Y=16..235, Cb/Cr=16..240, in Q8. */
++		auto yuv = params.block<ipa::camss::CamssBlocks::ChromaEnh>();
++		yuv->luma_v0 = 66;
++		yuv->luma_v1 = 129;
++		yuv->luma_v2 = 25;
++		yuv->luma_k = 16;
++		yuv->coeff_ap = yuv->coeff_am = 112;
++		yuv->coeff_bp = yuv->coeff_bm = -86;
++		yuv->coeff_cp = yuv->coeff_cm = 112;
++		yuv->coeff_dp = yuv->coeff_dm = -42;
++		yuv->kcb = yuv->kcr = 128;
++	}
++
++	/* Encode the transfer curve before the ISP converts RGB to YUV. */
++	auto gamma = params.block<ipa::camss::CamssBlocks::Gamma>();
++	constexpr double maxCode = CAMSS_GAMMA_LUT_SIZE - 1;
++	for (unsigned int i = 0; i < CAMSS_GAMMA_LUT_SIZE; ++i) {
++		double linear = i / maxCode;
++		if (linear < 0.5)
++			linear = 0.5 * std::pow(linear * 2, debayerParams.contrastExp);
++		else
++			linear = 1 - 0.5 * std::pow((1 - linear) * 2, debayerParams.contrastExp);
++
++		double encoded = std::pow(linear, debayerParams.gamma);
++		if (colorSpace && colorSpace->transferFunction == ColorSpace::TransferFunction::Rec709) {
++			/* Adjust the BT.601/709 curve relative to the default gamma (2.2). */
++			const double mapped = std::pow(linear, debayerParams.gamma * 2.2);
++			encoded = mapped < 0.018 ? 4.5 * mapped : 1.099 * std::pow(mapped, 0.45) - 0.099;
++		}
++		const auto value = std::lround(encoded * maxCode);
++		gamma->glut[i] = gamma->blut[i] = gamma->rlut[i] = value;
++	}
++
+ 	info->paramBuffer->_d()->metadata().planes()[0].bytesused = params.bytesused();
+ 	params_->queueBuffer(info->paramBuffer);
+ 	output_->queueBuffer(outputBuffer);
+--- a/src/ipa/softisp/algorithms/agc.h
++++ b/src/ipa/softisp/algorithms/agc.h
+@@ -18,6 +18,7 @@
+ class Agc : public Algorithm
+ {
+ public:
++	int init(IPAContext &context, const ValueNode &tuningData) override;
+ 	int configure(IPAContext &context, const IPAConfigInfo &configInfo) override;
+ 
+ 	void process(IPAContext &context, const uint32_t frame,
+@@ -26,6 +27,8 @@
+ 		     ControlList &metadata) override;
+ 
+ private:
++	unsigned int maxExposureUs_ = 0;
++	double maxAnalogueGain_ = 0.0;
+ 	AgcMSV agc_;
+ };
+ 
+--- a/src/ipa/softisp/algorithms/agc.cpp
++++ b/src/ipa/softisp/algorithms/agc.cpp
+@@ -6,6 +6,8 @@
+  */
+ 
+ #include "agc.h"
++
++#include <algorithm>
+ 
+ #include <libcamera/base/log.h>
+ 
+@@ -19,16 +21,32 @@
+ 
+ namespace ipa::softisp::algorithms {
+ 
++int Agc::init([[maybe_unused]] IPAContext &context, const ValueNode &tuningData)
++{
++	maxExposureUs_ = tuningData["maxExposureUs"].get<unsigned int>().value_or(0);
++	maxAnalogueGain_ = tuningData["maxAnalogueGain"].get<double>().value_or(0.0);
++	return 0;
++}
++
+ int Agc::configure(IPAContext &context, [[maybe_unused]] const IPAConfigInfo &configInfo)
+ {
++	const auto &sensor = context.configuration.agc;
++	uint32_t exposureMax = sensor.exposureMax;
++	const double lineUs = sensor.lineDuration.get<std::micro>();
++	if (maxExposureUs_ && lineUs > 0)
++		exposureMax = std::clamp<double>(maxExposureUs_ / lineUs, sensor.exposureMin, sensor.exposureMax);
++	const double gainMax = maxAnalogueGain_ > 0.0
++		? std::clamp(maxAnalogueGain_, sensor.againMin, sensor.againMax)
++		: sensor.againMax;
++
+ 	agc_.setLimits({
+ 		.exposure = {
+ 			context.configuration.agc.exposureMin,
+-			context.configuration.agc.exposureMax,
++			exposureMax,
+ 		},
+ 		.gain = {
+ 			context.configuration.agc.againMin,
+-			context.configuration.agc.againMax,
++			gainMax,
+ 		},
+ 		.gainMinStep = context.configuration.agc.againMinStep,
+ 		.gain1 = context.configuration.agc.again10,

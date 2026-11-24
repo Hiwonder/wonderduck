@@ -622,6 +622,7 @@ let wanted = false;
 // push after the welcome, once as the reply to our own — so without this the second listing opens
 // a second session against a robot that is about to accept the first.
 let starting = false;
+let producerRetry = null;
 
 function send(msg) {
   log("out", "→", JSON.stringify(msg));
@@ -869,6 +870,7 @@ $("robots").onchange = () => {
 
 /// Everything that has to be forgotten when a link goes away, whichever link it was.
 function teardown() {
+  clearTimeout(producerRetry);
   setState("closed", "bad"); setDc("no control channel");
   setLive(false);
   setConnectLabel();
@@ -974,6 +976,7 @@ async function onSignalling(raw) {
         break;
 
       case "list": {
+        clearTimeout(producerRetry);
         // The rendezvous lists every robot the signed-in account owns, and the mini's producers
         // are on the same service — so this filters on `meta.kind`. On a LAN there is exactly one
         // producer and it is this robot, whose local `meta` carries no `kind` at all, so the
@@ -982,12 +985,18 @@ async function onSignalling(raw) {
         if (REMOTE) producers = producers.filter((p) => (p.meta || {}).kind === KIND);
 
         if (!producers.length) {
-          log("bad", REMOTE
-            ? "!! no duck is registered with this account. A robot appears here about thirty "
-              + "seconds after `robotctl account login`, and only while it has a network."
-            : "!! no producers. mediad registers as one when its pipeline reaches PLAYING — "
-              + "check its journal for a pipeline that would not start.");
-          setState("no producer", "bad");
+          if (REMOTE) {
+            log("bad", "!! no duck is registered with this account. A robot appears here about thirty "
+              + "seconds after `robotctl account login`, and only while it has a network.");
+            setState("no producer", "bad");
+          } else if (wanted && !starting && !sessionId) {
+            setState("waiting for camera");
+            producerRetry = setTimeout(() => {
+              if (wanted && !starting && !sessionId && ws?.readyState === WebSocket.OPEN) {
+                send({ type: "list" });
+              }
+            }, 2000);
+          }
           return;
         }
 

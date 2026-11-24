@@ -41,6 +41,7 @@ impl Default for SensorConfig {
 }
 
 pub struct Shared {
+    sensor_enabled: bool,
     setting: ArcSwap<proto::ObstacleParams>,
     reading: ArcSwapOption<Reading>,
     active: AtomicBool,
@@ -49,6 +50,7 @@ pub struct Shared {
 impl Default for Shared {
     fn default() -> Self {
         Self {
+            sensor_enabled: true,
             setting: ArcSwap::from_pointee(proto::ObstacleParams::default()),
             reading: ArcSwapOption::empty(),
             active: AtomicBool::new(false),
@@ -57,9 +59,18 @@ impl Default for Shared {
 }
 
 impl Shared {
+    pub fn new(sensor_enabled: bool) -> Self {
+        Self { sensor_enabled, ..Self::default() }
+    }
 
+    pub fn sensor_enabled(&self) -> bool {
+        self.sensor_enabled
+    }
 
     pub fn set(&self, params: proto::ObstacleParams, _now_ns: u64) -> Result<(), &'static str> {
+        if params.enabled && !self.sensor_enabled {
+            return Err("the ToF sensor is disabled");
+        }
         if !(proto::OBSTACLE_MIN_THRESHOLD_MM..=proto::OBSTACLE_MAX_THRESHOLD_MM)
             .contains(&params.threshold_mm)
         {
@@ -150,7 +161,11 @@ impl Shared {
             distance_mm: reading
                 .and_then(|reading| Self::reading_frame(reading, now_ns))
                 .and_then(|(distance, _)| distance),
-            sensor_status: Self::sensor_status(reading, now_ns),
+            sensor_status: if self.sensor_enabled {
+                Self::sensor_status(reading, now_ns)
+            } else {
+                proto::DistanceSensorStatus::Unavailable
+            },
             enabled: params.enabled,
             threshold_mm: params.threshold_mm,
             clear_delay_ms: params.clear_delay_ms,

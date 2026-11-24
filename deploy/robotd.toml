@@ -297,9 +297,10 @@ mode = "walk"
 # stays quiet, and nothing here reaches a health verdict.
 # enabled = true
 
-# ALSA playback device — the TLV320AIC3104 codec that setup-board.sh brings up. The mic
-# worker captures from "<device>,0".
+# ALSA playback device — the TLV320AIC3104 codec that setup-board.sh brings up.
 # device = "plughw:aic3104"
+# Specify the capture PCM if the microphone uses a separate ALSA device.
+# capture_device = "plughw:aic3104,0"
 
 # Where the voice bank lives.
 # bank = "/var/lib/robot/sounds"
@@ -472,7 +473,7 @@ mode = "walk"
 # pinned to a 1920x1080 mode that runs at 30 and the ISP scales down from it, so 1080p30 asks for
 # no scaling at all — what is unmeasured is whether the capture path and the encoder hold 30 fps
 # at 2.25x the pixels. A rung that does not hold runs slower rather than failing.
-quality = "360p30"
+quality = "720p30"
 
 # Starting video bitrate, bits per second. Unset follows the quality — 4 Mb/s at 1080p30,
 # 2 Mb/s at 720p30, 1 Mb/s at 720p15, 800 kb/s at 360p30 — which is what almost every robot
