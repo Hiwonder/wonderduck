@@ -4,10 +4,23 @@ set -eu
 board=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 root=$(CDPATH= cd -- "$board/../.." && pwd)
 runtime=${MEDIA_RUNTIME_DIR:-"$root/media-runtime-candidate"}
-backend=${WONDERDUCK_CAMERA_BACKEND:-libcamera}
+backend=${WONDERDUCK_CAMERA_BACKEND:-auto}
+ope="$runtime/unoq-libcamera"
+ope_plugin="$ope/lib/gstreamer-1.0/libgstlibcamera.so"
+
+if [ "$backend" = auto ]; then
+    backend=libcamera
+    if [ -L /sys/bus/platform/devices/5c42000.isp/driver ] && [ -r "$ope_plugin" ]; then
+        backend=libcamera-ope
+    fi
+fi
 
 case "$backend" in
     libcamera) set -- "$@" --libcamera ;;
+    libcamera-ope)
+        test -r "$ope_plugin" || { printf 'UNO Q OPE libcamera runtime is missing\n' >&2; exit 2; }
+        set -- "$@" --libcamera-ope "$ope_plugin"
+        ;;
     v4l2) set -- "$@" --generic-camera --camera-device "${WONDERDUCK_CAMERA_DEVICE:?Set the V4L2 capture device}" ;;
     *) printf 'Unsupported camera backend %s\n' "$backend" >&2; exit 2 ;;
 esac
@@ -17,7 +30,7 @@ if [ "${1:-}" = --check ]; then
     if [ -e "$lock" ] && ! flock -n "$lock" true; then
         exit 3
     fi
-    if [ "$backend" = libcamera ]; then
+    if [ "$backend" != v4l2 ]; then
         cameras=$(cam --list) || exit 2
         printf '%s\n' "$cameras" | awk '$1 ~ /^[0-9]+:$/ { found=1 } END { exit !found }'
     else
@@ -26,6 +39,28 @@ if [ "${1:-}" = --check ]; then
     exit $?
 fi
 
-exec "$runtime/run" mediad --no-remote --rotate "${WONDERDUCK_CAMERA_ROTATION:-0}" \
+scanner=/usr/lib/aarch64-linux-gnu/gstreamer1.0/gstreamer-1.0/gst-plugin-scanner
+if [ ! -x "$scanner" ]; then
+    printf 'GStreamer system plugin scanner is required for the UNO Q Venus encoder\n' >&2
+    exit 2
+fi
+cache="$runtime/cache/$(id -u)"
+mkdir -p "$cache"
+export LD_LIBRARY_PATH="$runtime/lib"
+export GST_PLUGIN_PATH_1_0="$runtime/lib/gstreamer-1.0"
+export GST_PLUGIN_SYSTEM_PATH_1_0="$GST_PLUGIN_PATH_1_0:/usr/lib/aarch64-linux-gnu/gstreamer-1.0"
+export GST_PLUGIN_SCANNER_1_0="$scanner"
+export GST_REGISTRY_1_0="$cache/registry-venus.bin"
+if [ "$backend" = libcamera-ope ]; then
+    export LD_LIBRARY_PATH="$ope/lib:$LD_LIBRARY_PATH"
+    export LIBCAMERA_PIPELINES_MATCH_LIST=camss
+    export LIBCAMERA_IPA_MODULE_PATH="$ope/lib/libcamera/ipa"
+    export LIBCAMERA_IPA_CONFIG_PATH="$ope/share/libcamera/ipa"
+    export LIBCAMERA_IPA_PROXY_PATH="$ope/libexec/libcamera"
+fi
+# Probe the V4L2 encoder after the kernel has registered its device.
+rm -f "$GST_REGISTRY_1_0"
+
+exec "$runtime/bin/mediad" --venus-h264 --no-remote --rotate "${WONDERDUCK_CAMERA_ROTATION:-180}" \
     --config "${WONDERDUCK_ROBOT_PARAMS:-/etc/robot/robotd.toml}" \
     --frame-socket "$runtime/webpadd-media.sock" "$@"

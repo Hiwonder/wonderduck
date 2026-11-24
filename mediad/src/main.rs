@@ -99,6 +99,14 @@ struct Args {
     #[arg(long, conflicts_with = "generic_camera")]
     libcamera: bool,
 
+    /// Load the supplied libcamera GStreamer plugin for Qualcomm CAMSS hardware ISP capture.
+    #[arg(long, conflicts_with_all = ["libcamera", "generic_camera"], requires = "venus_h264")]
+    libcamera_ope: Option<PathBuf>,
+
+    /// Use Qualcomm Venus H.264 encoding for LAN previews.
+    #[arg(long, requires = "no_remote")]
+    venus_h264: bool,
+
     /// Sensor exposure in lines (~19 µs each) and analogue gain, where 256 is 1x.
     ///
     /// The starting values only: with the driver's boot values the picture is black rather than
@@ -408,7 +416,9 @@ fn main() -> ExitCode {
                         device: args.camera_device.clone(),
                         exposure: args.exposure,
                         analogue_gain: args.analogue_gain,
-                        backend: if args.libcamera {
+                        backend: if let Some(plugin) = &args.libcamera_ope {
+                            mediad::pipeline::CameraBackend::LibcameraOpe(plugin.clone())
+                        } else if args.libcamera {
                             mediad::pipeline::CameraBackend::Libcamera
                         } else if args.generic_camera {
                             mediad::pipeline::CameraBackend::V4l2
@@ -431,6 +441,7 @@ fn main() -> ExitCode {
             port: args.port,
             bitrate: media.bitrate_resolved(),
             congestion_control: media.congestion_control,
+            venus_h264: args.venus_h264,
             width,
             height,
             fps,
@@ -476,7 +487,10 @@ fn main() -> ExitCode {
         // V4L2 controls through `ioctl`, so it exists only where a real camera can. Nothing else
         // in this function cares: the other two sources have no sensor to meter.
         #[cfg(target_os = "linux")]
-        let _exposure = match (&source, args.no_auto_exposure || args.generic_camera || args.libcamera) {
+        let _exposure = match (
+            &source,
+            args.no_auto_exposure || args.generic_camera || args.libcamera || args.libcamera_ope.is_some(),
+        ) {
             (mediad::pipeline::Source::Camera(camera), false) => Some(mediad::exposure::spawn(
                 camera.device.clone(),
                 frames.clone(),

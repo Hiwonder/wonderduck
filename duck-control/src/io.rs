@@ -397,6 +397,11 @@ pub trait RobotIo {
         Err(IoError::Bus("raw servo position write is unsupported".into()))
     }
 
+    /// Apply the optional accessory servos' gamepad pressure.
+    fn write_accessory_trigger(&mut self, _pressure: u8) -> Result<()> {
+        Ok(())
+    }
+
     /// Reboot one servo: the Protocol 2 REBOOT instruction.
     ///
     /// The way out of a latched hardware error — overload, overheating, electrical shock, the

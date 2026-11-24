@@ -18,6 +18,13 @@ import tty
 import msgpack
 
 HX_BAUD = 1_000_000
+HX_READ = 0x02
+HX_SYNC_READ = 0x82
+HX_SYNC_WRITE = 0x83
+UNOQ_FEEDBACK_READ = 0x93
+UNOQ_FEEDBACK_METADATA_ID = 0xfd
+UNOQ_FEEDBACK_IDS = bytes((20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14, 200))
+STATUS_READ = 0x92
 TCGETS2 = 0x802C542A
 TIOCGPTPEER = 0x5441
 TERMIOS2 = struct.Struct("=IIIIB19BII")
@@ -27,6 +34,7 @@ RPC_LOCK_DIRECTORY = Path("/run/lock/wonderduck-unoq")
 class Router:
     def __init__(self, path=None, timeout=.1):
         endpoint = path or os.environ["WONDERDUCK_UNOQ_ROUTER"]
+        self.endpoint = endpoint
         self.prioritize_hx = (
             Path(endpoint).resolve() == Path("/run/arduino-router.sock").resolve()
             and RPC_LOCK_DIRECTORY.is_dir()
@@ -47,7 +55,7 @@ class Router:
 
         with (RPC_LOCK_DIRECTORY / "admission").open("rb") as admission, \
              (RPC_LOCK_DIRECTORY / "wire").open("rb") as wire:
-            if method == "servo":
+            if method in ("servo", "feedback"):
                 # Keep the admission lock while HX waits for an in-flight
                 # transaction. No new sensor exchange can overtake HX.
                 fcntl.flock(admission, fcntl.LOCK_EX)
@@ -100,6 +108,8 @@ def read_i2c_reply(reply, expected):
 
 class HeadImu:
     def __init__(self, address):
+        if os.environ.get("WONDERDUCK_UNOQ_HEAD_IMU_ENABLED", "true") != "true":
+            raise OSError("UNO Q head IMU polling is disabled")
         self.address = address
         self.router = Router()
 
@@ -119,6 +129,8 @@ class TofBus:
     """The CircuitPython I2C subset used by the existing VL53L0X driver."""
 
     def __init__(self):
+        if os.environ.get("WONDERDUCK_UNOQ_TOF_ENABLED", "true") != "true":
+            raise OSError("UNO Q ToF polling is disabled")
         self.router = Router()
         self.locked = False
 
@@ -192,6 +204,117 @@ def release_closed_client(master):
         os.close(peer)
 
 
+def status_read_reply(router, frame):
+    # The RPC response marks the end of the STM32's receive window. Report
+    # an empty result explicitly so a disconnected joint cannot stall the scan.
+    body = frame[2:4] + bytes((HX_READ,)) + frame[5:7]
+    reply = router.call("servo", b"\xff\xff" + body + bytes((~sum(body) & 0xff,)))
+    if reply == b"":
+        body = bytes((frame[2], 2, 0))
+        return b"\xff\xff" + body + bytes((~sum(body) & 0xff,))
+    if isinstance(reply, bytes) and len(reply) == 6 and reply[3:5] == b"\x02\x00":
+        raise OSError("empty success frame from the HX bus")
+    return reply
+
+
+def feedback_reply(sequence, age_us, reply):
+    if not isinstance(reply, bytes) or not reply or not sequence or age_us > 40_000:
+        return b""
+    payload = struct.pack("<II", sequence, age_us)
+    body = bytes((UNOQ_FEEDBACK_METADATA_ID, len(payload) + 2, 0)) + payload
+    return b"\xff\xff" + body + bytes((~sum(body) & 0xff,)) + reply
+
+
+def feedback_error_reply():
+    body = bytes((UNOQ_FEEDBACK_METADATA_ID, 10, 0)) + bytes(8)
+    return b"\xff\xff" + body + bytes((~sum(body) & 0xff,))
+
+
+def valid_feedback_frames(data):
+    if len(data) != len(UNOQ_FEEDBACK_IDS) * 18:
+        return False
+    seen = set()
+    for offset in range(0, len(data), 18):
+        frame = data[offset:offset + 18]
+        if (frame[:2] != b"\xff\xff" or frame[3] != 14 or frame[2] not in UNOQ_FEEDBACK_IDS
+                or frame[2] in seen or sum(frame[2:]) & 0xff != 0xff):
+            return False
+        seen.add(frame[2])
+    return len(seen) == len(UNOQ_FEEDBACK_IDS)
+
+
+def ordinary_sync_read(frame):
+    request = bytearray(frame)
+    request[4] = HX_SYNC_READ
+    request[-1] = ~sum(request[2:-1]) & 0xff
+    return bytes(request)
+
+
+class FeedbackSession:
+    def __init__(self, router):
+        self.router = router
+        self.supported = None
+        self.active = False
+        self.sequence = 0
+        self.last_failure_log = 0
+
+    def failure(self, reason):
+        now = time.monotonic()
+        if now - self.last_failure_log >= 1:
+            print(f"STM32 feedback unavailable: {reason}", flush=True)
+            self.last_failure_log = now
+        return feedback_error_reply()
+
+    def stop(self):
+        if self.active:
+            self.router.call("feedback_stop")
+            self.active = False
+
+    def read(self, frame):
+        if (len(frame) != 24 or frame[2] != 0xfe or frame[5:7] != b"\x38\x0c"
+                or frame[7:-1] != UNOQ_FEEDBACK_IDS):
+            raise OSError("invalid UNO Q cached feedback request")
+        if self.supported is None:
+            try:
+                self.supported = self.router.call("feedback_version") == 2
+            except OSError as error:
+                if "not available" not in str(error):
+                    raise
+                self.supported = False
+            if not self.supported:
+                print("STM32 cached feedback unavailable; using synchronous reads", flush=True)
+        if not self.supported:
+            result = self.router.call("servo", ordinary_sync_read(frame))
+            self.sequence = (self.sequence + 1) & 0xffffffff or 1
+            return feedback_reply(self.sequence, 0, result) or feedback_error_reply()
+
+        self.active = True
+        started = time.monotonic_ns()
+        result = self.router.call("feedback", self.sequence)
+        elapsed_us = (time.monotonic_ns() - started + 999) // 1000
+        if not isinstance(result, bytes) or len(result) < 8:
+            return self.failure("no new sample before deadline")
+        sequence, mcu_age_us = struct.unpack_from("<II", result)
+        if sequence == self.sequence:
+            return self.failure(f"repeated sample sequence={sequence}")
+        # Add the full RPC time to bound the age at the local serial reply.
+        age_us = mcu_age_us + elapsed_us
+        data = result[8:]
+        if not valid_feedback_frames(data):
+            invalid = []
+            for offset in range(0, len(data), 18):
+                frame = data[offset:offset + 18]
+                if (len(frame) != 18 or frame[:2] != b"\xff\xff" or frame[3] != 14
+                        or sum(frame[2:]) & 0xff != 0xff):
+                    invalid.append(f"{offset}:{frame[:5].hex()}")
+            return self.failure(f"invalid sample sequence={sequence} bytes={len(data)} frames={invalid[:3]}")
+        reply = feedback_reply(sequence, age_us, data)
+        if not reply:
+            return self.failure(f"stale sample sequence={sequence} age_us={age_us}")
+        self.sequence = sequence
+        return reply
+
+
 def serve_bus(router, port, owner=None):
     # Hold the master across maintenance handoffs. Close our own slave so
     # Studio's fuser check reports only real clients of the motor bus.
@@ -221,6 +344,7 @@ def forward_servo_packets(router, master):
     pending = bytearray()
     serial_settings = bytearray(TERMIOS2.size)
     closed = False
+    feedback = FeedbackSession(router)
     events = select.poll()
     events.register(master, 0)
     while True:
@@ -231,6 +355,7 @@ def forward_servo_packets(router, master):
                 raise
             if not closed:
                 pending.clear()
+                feedback.stop()
                 release_closed_client(master)
                 closed = True
             time.sleep(0.02)
@@ -241,7 +366,14 @@ def forward_servo_packets(router, master):
             fcntl.ioctl(master, TCGETS2, serial_settings)
             if TERMIOS2.unpack(serial_settings)[-2:] != (HX_BAUD, HX_BAUD):
                 continue
-            reply = router.call("servo", frame)
+            if frame[4] not in (UNOQ_FEEDBACK_READ, HX_SYNC_WRITE):
+                feedback.stop()
+            if len(frame) == 8 and frame[2] < 254 and frame[4] == STATUS_READ:
+                reply = status_read_reply(router, frame)
+            elif frame[4] == UNOQ_FEEDBACK_READ:
+                reply = feedback.read(frame)
+            else:
+                reply = router.call("servo", frame)
             if not isinstance(reply, bytes):
                 raise OSError("malformed UART reply from expansion board")
             if not reply or events.poll(0):
@@ -254,14 +386,33 @@ def forward_servo_packets(router, master):
                     raise
 
 
+def connect_bridge(timeout):
+    deadline = time.monotonic() + timeout
+    while True:
+        router = None
+        try:
+            router = Router()
+            version = router.call("version")
+        except OSError:
+            if router is not None:
+                router.close()
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.25)
+            continue
+        if version != 1:
+            router.close()
+            raise OSError("unsupported WonderDuck STM32 bridge version")
+        return router
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=Path, help="PTY link for the HX motor and AT32 bus")
     parser.add_argument("--owner", help="User allowed to open the PTY")
     options = parser.parse_args()
-    with Router() as router:
-        if router.call("version") != 1:
-            raise OSError("unsupported WonderDuck STM32 bridge version")
+    # The router socket can exist before the STM32 registers its RPC methods.
+    with connect_bridge(25 if options.port else 0) as router:
         if options.port:
             serve_bus(router, options.port, pwd.getpwnam(options.owner) if options.owner else None)
         else:

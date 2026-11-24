@@ -188,6 +188,7 @@ pub struct Settings {
     /// Whether the send rate adapts to the link, and by what. `robotd_params::CongestionControl`
     /// has the trade, and it is a CPU one as much as a network one.
     pub congestion_control: robotd_params::CongestionControl,
+    pub venus_h264: bool,
     pub width: u32,
     pub height: u32,
     pub fps: u32,
@@ -231,11 +232,12 @@ pub struct Camera {
     pub backend: CameraBackend,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CameraBackend {
     Rockchip,
     V4l2,
     Libcamera,
+    LibcameraOpe(std::path::PathBuf),
 }
 
 /// One raw frame off the tee, as the last one seen.
@@ -404,6 +406,7 @@ pub fn start(
         port,
         bitrate,
         congestion_control,
+        venus_h264,
         width,
         height,
         fps,
@@ -440,6 +443,14 @@ pub fn start(
     let pipeline = gst::Pipeline::new();
 
     let target_rate = gst::Fraction::new(fps as i32, 1);
+    let capture_format = match &source {
+        Source::Camera(Camera { backend: CameraBackend::LibcameraOpe(plugin), .. }) => {
+            gst::Plugin::load_file(plugin)
+                .with_context(|| format!("could not load the OPE plugin at {}", plugin.display()))?;
+            "NV12"
+        }
+        _ => CAPTURE_FORMAT,
+    };
     let (src, capture_rate) = match &source {
         Source::Test => {
             let src = make("videotestsrc")?;
@@ -449,7 +460,9 @@ pub fn start(
             (src, target_rate)
         }
         #[cfg(target_os = "linux")]
-        Source::Camera(camera) if camera.backend != CameraBackend::Rockchip => (generic_camera_source(camera)?, target_rate),
+        Source::Camera(camera) if camera.backend != CameraBackend::Rockchip => {
+            (generic_camera_source(camera, width, height)?, target_rate)
+        }
         #[cfg(target_os = "linux")]
         Source::Camera(camera) => {
             let src = camera_source(camera, fps)?;
@@ -487,7 +500,7 @@ pub fn start(
     //
     // `mpph264enc` lists `UYVY` on its sink pad and converts on the SoC's 2D accelerator, so the
     // 4:2:2 to 4:2:0 step costs no CPU — the RGA was already doing one operation per frame.
-    let caps = capture_caps(width, height, capture_rate);
+    let caps = capture_caps(width, height, capture_rate, capture_format);
     let capsfilter = gst::ElementFactory::make("capsfilter")
         .property("caps", &caps)
         .build()
@@ -526,6 +539,14 @@ pub fn start(
     // Keep the newest frames when the WebRTC sink stalls, without blocking capture or the other
     // branches. Two buffers match the stream branch and bound retained capture buffers.
     let video_queue = make_video_queue()?;
+    let consumers: Consumers = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let venus = if venus_h264 {
+        Some(venus_preview(
+            fps, out_width, out_height, capture_format, bitrate, consumers.clone(),
+        )?)
+    } else {
+        None
+    };
 
     // **Raw video in, and `webrtcsink` owns the encoder.** This used to be
     // `mpph264enc ! h264parse ! webrtcsink`, which worked and gave up two things quietly: with
@@ -602,6 +623,11 @@ pub fn start(
     // off, and then nothing moves it and this is the rate.
     sink.set_property("start-bitrate", bitrate);
 
+    let congestion_control = if venus.is_some() {
+        robotd_params::CongestionControl::Disabled
+    } else {
+        congestion_control
+    };
     set_congestion_control(&sink, congestion_control);
 
     // The encoder settings, applied through the hook that exists for it.
@@ -611,7 +637,6 @@ pub fn start(
     // first-frame, and both matter — see `wire_encoder_setup`.
     wire_encoder_setup(&sink)?;
 
-    let consumers: Consumers = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let (channels_tx, channels_rx) = mpsc::channel::<Channel>(4);
     wire_consumers(&sink, channels_tx, runtime, consumers.clone(), relays)?;
 
@@ -632,7 +657,7 @@ pub fn start(
     // `out_width`/`out_height` rather than reusing `caps`: handing the appsink the capture caps
     // would fail negotiation on a quarter turn, and silently describe the wrong shape on a half
     // one.
-    let out_caps = capture_caps(out_width, out_height, capture_rate);
+    let out_caps = capture_caps(out_width, out_height, capture_rate, capture_format);
 
     let frames = Frames::default();
     let appsink = gst_app::AppSink::builder()
@@ -644,7 +669,7 @@ pub fn start(
         .max_buffers(1)
         .drop(true)
         .build();
-    wire_frames(&appsink, frames.clone(), out_width, out_height);
+    wire_frames(&appsink, frames.clone(), out_width, out_height, capture_format);
 
     // ── the H.264 branch, for a Space this robot streams to ─────────────────
     //
@@ -694,6 +719,7 @@ pub fn start(
         width,
         height,
         fps,
+        capture_format,
         consumers.clone(),
     )?;
 
@@ -703,10 +729,17 @@ pub fn start(
     }
     .context(
         "could not link the source to the tee. A caps failure here means the source cannot \
-         produce NV12 at the requested size and rate.",
+         produce the capture format at the requested size and rate.",
     )?;
-    gst::Element::link_many([&video_queue, &sink])
-        .context("could not link the video queue to webrtcsink")?;
+    if let Some(encoder) = &venus {
+        pipeline.add(encoder).context("could not add the Venus encoder")?;
+        gst::Element::link_many([&video_queue, encoder.upcast_ref(), &sink])
+            .context("could not link Venus H.264 to webrtcsink")?;
+        tracing::info!(encoder = "v4l2h264enc", "Venus H.264 for LAN previews");
+    } else {
+        gst::Element::link_many([&video_queue, &sink])
+            .context("could not link the video queue to webrtcsink")?;
+    }
     gst::Element::link_many([&raw_queue, appsink.upcast_ref()])
         .context("could not link the raw branch to its appsink")?;
 
@@ -1092,6 +1125,137 @@ fn make_video_queue() -> Result<gst::Element> {
         .map_err(|_| anyhow!("no queue element; gstreamer core is incomplete"))
 }
 
+fn venus_preview(
+    fps: u32,
+    width: u32,
+    height: u32,
+    capture_format: &str,
+    bitrate: u32,
+    consumers: Consumers,
+) -> Result<gst::Bin> {
+    let level = if width.div_ceil(16) * height.div_ceil(16) <= 3_600 && fps <= 30 {
+        "3.1"
+    } else {
+        "4"
+    };
+    let (convert, rate_control) = if capture_format == "NV12" {
+        // Venus can far exceed the requested bitrate on noisy live input unless the
+        // firmware also receives a minimum H.264 quantizer for each frame type.
+        const MINIMUM_QP: u8 = 29;
+        (
+            "",
+            format!(
+                "frame_level_rate_control_enable=1,video_bitrate_mode=1,video_bitrate={bitrate},\
+                 h264_minimum_qp_value={MINIMUM_QP},h264_i_frame_minimum_qp_value={MINIMUM_QP},\
+                 h264_p_frame_minimum_qp_value={MINIMUM_QP}"
+            ),
+        )
+    } else {
+        (
+            "videoconvert ! ",
+            "frame_level_rate_control_enable=0,h264_i_frame_qp_value=34,h264_p_frame_qp_value=34"
+                .to_owned(),
+        )
+    };
+    let description = format!(
+        "{convert}capsfilter caps=video/x-raw,format=NV12 ! \
+         v4l2h264enc name=venus-encoder min-force-key-unit-interval=300000000 \
+         extra-controls=controls,{rate_control},h264_loop_filter_mode=0,video_b_frames=0,video_gop_size={fps} ! \
+         video/x-h264,profile=constrained-baseline,level=(string){level} ! \
+         h264parse config-interval=-1 ! capsfilter caps=\"video/x-h264,stream-format=avc,alignment=au\""
+    );
+    let bin = gst::parse::bin_from_description(&description, true)
+        .context("could not build the Venus preview encoder")?;
+    if capture_format == "NV12" {
+        wire_venus_preview_filter(&bin, width, height, consumers)?;
+    }
+    Ok(bin)
+}
+
+fn wire_venus_preview_filter(
+    bin: &gst::Bin,
+    width: u32,
+    height: u32,
+    consumers: Consumers,
+) -> Result<()> {
+    use crate::preview_filter::Workspace;
+    let layout = gst_video::VideoInfo::builder(gst_video::VideoFormat::Nv12, width, height)
+        .build()
+        .context("invalid NV12 preview layout")?;
+    let input = bin.static_pad("sink").context("missing Venus input pad")?;
+    let encoder = bin
+        .by_name("venus-encoder")
+        .context("missing Venus encoder")?
+        .downgrade();
+    let workspace = Mutex::new((Workspace::default(), None::<std::time::Instant>));
+    let first_frame = std::sync::Once::new();
+    let first_error = std::sync::Once::new();
+    input
+        .add_probe(gst::PadProbeType::BUFFER, move |_, probe| {
+            if consumers.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                return gst::PadProbeReturn::Ok;
+            }
+            if let Some(gst::PadProbeData::Buffer(source)) = probe.data.as_mut() {
+                let mut work = workspace.lock().unwrap_or_else(|e| e.into_inner());
+                // Venus emits regular I pictures, but only its first is an IDR. A lost
+                // reference can otherwise freeze decoding across multiple GOPs.
+                if work
+                    .1
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1))
+                {
+                    if let Some(encoder) = encoder.upgrade() {
+                        encoder.send_event(
+                            gst_video::DownstreamForceKeyUnitEvent::builder()
+                                .all_headers(true)
+                                .build(),
+                        );
+                    }
+                    work.1 = Some(std::time::Instant::now());
+                }
+                if let Some(output) = filtered_preview_buffer(source, &layout, &mut work.0) {
+                    *source = output;
+                    first_frame.call_once(|| tracing::info!("Venus preview filter active"));
+                } else {
+                    first_error
+                        .call_once(|| tracing::warn!("could not map NV12 preview for filtering"));
+                }
+            }
+            gst::PadProbeReturn::Ok
+        })
+        .context("could not attach Venus preview filter")?;
+    Ok(())
+}
+
+fn filtered_preview_buffer(
+    source: &gst::Buffer,
+    layout: &gst_video::VideoInfo,
+    work: &mut crate::preview_filter::Workspace,
+) -> Option<gst::Buffer> {
+    use gst_video::prelude::VideoFrameExt;
+    // The raw perception branch reads this same sensor frame. Give Venus its own pixels.
+    let mut output = source.copy_deep().ok()?;
+    {
+        let mut frame =
+            gst_video::VideoFrameRef::from_buffer_ref_writable(output.get_mut()?, layout).ok()?;
+        let stride = frame.plane_stride();
+        let ys = usize::try_from(stride[0]).ok()?;
+        let uvs = usize::try_from(stride[1]).ok()?;
+        let [y, uv, _, _] = frame.planes_data_mut();
+        if !crate::preview_filter::filter_nv12(
+            y,
+            ys,
+            uv,
+            uvs,
+            layout.width() as usize,
+            layout.height() as usize,
+            work,
+        ) {
+            return None;
+        }
+    }
+    Some(output)
+}
+
 /// Request a source pad from the tee and link it to a branch's sink pad.
 fn link_tee_branch(tee: &gst::Element, branch: &gst::Element) -> Result<()> {
     let src_pad = tee
@@ -1107,7 +1271,13 @@ fn link_tee_branch(tee: &gst::Element, branch: &gst::Element) -> Result<()> {
 }
 
 /// Answer a reader's request for a frame out of the raw branch, and drop every other buffer.
-fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u32) {
+fn wire_frames(
+    appsink: &gst_app::AppSink,
+    frames: Frames,
+    width: u32,
+    height: u32,
+    capture_format: &'static str,
+) {
     appsink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |sink| {
@@ -1118,14 +1288,7 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                 if !frames.take_request() {
                     return Ok(gst::FlowSuccess::Ok);
                 }
-                let Some(buffer) = sample.buffer() else {
-                    return Ok(gst::FlowSuccess::Ok);
-                };
-                // `UYVY` is a single plane, so this maps without merging anything — unlike the
-                // `NM12` this used to carry, where mapping silently copied two non-contiguous
-                // planes into one block. The `to_vec` below is still a copy, and still the only
-                // one on this branch.
-                let Ok(map) = buffer.map_readable() else {
+                let Some(data) = requested_frame_pixels(&sample, capture_format) else {
                     // A buffer that will not map is not worth failing the pipeline over — the next
                     // one is a frame away, and this branch is advisory by design. The request has
                     // been taken by now, so the reader waits out its timeout rather than being
@@ -1141,13 +1304,44 @@ fn wire_frames(appsink: &gst_app::AppSink, frames: Frames, width: u32, height: u
                     // Taken here rather than at delivery: this is the moment the buffer existed,
                     // and it costs one clock read on a frame someone already asked for.
                     captured_at: SystemTime::now(),
-                    data: map.as_slice().to_vec(),
+                    data,
                 });
 
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
     );
+}
+
+fn requested_frame_pixels(sample: &gst::Sample, capture_format: &str) -> Option<Vec<u8>> {
+    use gst_video::prelude::VideoFrameExt;
+
+    let buffer = sample.buffer()?;
+    if capture_format != "NV12" {
+        return Some(buffer.map_readable().ok()?.as_slice().to_vec());
+    }
+
+    // Keep the frame and detector interfaces in UYVY. Map the actual GStreamer plane strides
+    // and expand chroma vertically only when a raw frame has been requested.
+    let info = gst_video::VideoInfo::from_caps(sample.caps()?).ok()?;
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
+    let width = info.width() as usize;
+    let height = info.height() as usize;
+    let y_stride = usize::try_from(frame.plane_stride()[0]).ok()?;
+    let uv_stride = usize::try_from(frame.plane_stride()[1]).ok()?;
+    let y = frame.plane_data(0).ok()?;
+    let uv = frame.plane_data(1).ok()?;
+    let mut pixels = Vec::with_capacity(width * height * 2);
+    for row in 0..height {
+        let y_start = row * y_stride;
+        let uv_start = (row / 2) * uv_stride;
+        let luma = y.get(y_start..y_start + width)?;
+        let chroma = uv.get(uv_start..uv_start + width)?;
+        for (luma, chroma) in luma.chunks_exact(2).zip(chroma.chunks_exact(2)) {
+            pixels.extend_from_slice(&[chroma[0], luma[0], chroma[1], luma[1]]);
+        }
+    }
+    (pixels.len() == width * height * 2).then_some(pixels)
 }
 
 /// Put a default `GST_DEBUG` in the environment, before `gst::init` reads it.
@@ -1313,9 +1507,9 @@ fn make(name: &str) -> Result<gst::Element> {
         .map_err(|_| anyhow!("no {name} element; a GStreamer package is missing"))
 }
 
-fn capture_caps(width: u32, height: u32, rate: gst::Fraction) -> gst::Caps {
+fn capture_caps(width: u32, height: u32, rate: gst::Fraction, format: &str) -> gst::Caps {
     gst::Caps::builder("video/x-raw")
-        .field("format", CAPTURE_FORMAT)
+        .field("format", format)
         .field("width", width as i32)
         .field("height", height as i32)
         .field("framerate", rate)
@@ -1364,13 +1558,22 @@ fn camera_framerate(
 }
 
 #[cfg(target_os = "linux")]
-fn generic_camera_source(camera: &Camera) -> Result<gst::Element> {
+fn generic_camera_source(camera: &Camera, width: u32, height: u32) -> Result<gst::Element> {
     // Keep the same raw output contract for preview, color detection and object detection.
-    let pipeline = match camera.backend {
-        CameraBackend::Libcamera => "libcamerasrc ! videoconvertscale ! videorate drop-only=true",
-        _ => "v4l2src name=capture ! decodebin ! videoconvertscale ! videorate drop-only=true",
+    let pipeline = match &camera.backend {
+        CameraBackend::LibcameraOpe(_) => format!(
+            "libcamerasrc ! video/x-raw,format=NV12,width={width},height={height},colorimetry=bt601 \
+             ! videorate drop-only=true"
+        ),
+        // The UNO Q software ISP otherwise debayers its largest mode for every preview frame.
+        // Allow the driver's aligned size (e.g. 632×360) before scaling to square output pixels.
+        CameraBackend::Libcamera => format!(
+            "libcamerasrc ! video/x-raw,width=(int)[1,{width}],height=(int)[1,{height}] \
+             ! videoconvertscale ! video/x-raw,pixel-aspect-ratio=1/1 ! videorate drop-only=true"
+        ),
+        _ => "v4l2src name=capture ! decodebin ! videoconvertscale ! videorate drop-only=true".into(),
     };
-    let source = gst::parse::bin_from_description(pipeline, true)
+    let source = gst::parse::bin_from_description(&pipeline, true)
         .context("cannot build the camera capture pipeline")?;
     if let Some(capture) = source.by_name("capture") {
         capture.set_property("device", &camera.device);
@@ -1909,6 +2112,7 @@ fn meter_capture_rate(
     width: u32,
     height: u32,
     fps: u32,
+    format: &'static str,
     consumers: Consumers,
 ) -> Result<()> {
     let target = fps as f64;
@@ -1963,7 +2167,7 @@ fn meter_capture_rate(
                     target_fps: fps,
                     width,
                     height,
-                    format: CAPTURE_FORMAT.to_owned(),
+                    format: format.to_owned(),
                     frames: meter.frames,
                     dropped: meter.dropped,
                     consumers: consumers.load(std::sync::atomic::Ordering::Relaxed),

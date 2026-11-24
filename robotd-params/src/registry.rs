@@ -430,6 +430,7 @@ pub const REGISTRY: &[Entry] = &[
         "The voice and the microphone; off walks identically and stays quiet",
     ),
     entry("audio.device", Kind::Text, "ALSA playback device"),
+    entry("audio.capture_device", Kind::Text, "ALSA microphone capture PCM"),
     entry(
         "audio.player",
         Kind::Text,

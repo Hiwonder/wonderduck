@@ -5,6 +5,8 @@ use crate::io::{DeviceObservation, ImuObservation, ServoObservation};
 
 const STATUS_IMU_INTERVAL: Duration = Duration::from_millis(55);
 const ABSENT_SERVO_RETRY: Duration = Duration::from_secs(3);
+use super::ACCESSORY_SERVO_IDS;
+const OPTIONAL_SERVO_INTERVAL: Duration = Duration::from_secs(1);
 // Local PTY operation translated by the UNO Q bridge, never sent on the HX wire.
 const UNOQ_STATUS_READ: u8 = 0x92;
 
@@ -13,6 +15,8 @@ pub(super) struct ObservationScan {
     enabled: bool,
     individual: bool,
     next_joint: usize,
+    next_optional_servo: usize,
+    next_optional_at: Instant,
     next_imu: Instant,
     last_read_was_imu: bool,
     absent_servo_retry: [Option<Instant>; JOINT_IDS.len()],
@@ -27,12 +31,13 @@ impl ObservationScan {
                 servos: JOINT_IDS.into_iter().map(|id| ServoObservation {
                     id, ..Default::default()
                 }).collect(),
-                imu: ImuObservation::default(),
-                bus_error: None,
+                ..Default::default()
             },
             enabled: false,
             individual: false,
             next_joint: 0,
+            next_optional_servo: 0,
+            next_optional_at: Instant::now() + OPTIONAL_SERVO_INTERVAL,
             next_imu: Instant::now(),
             last_read_was_imu: false,
             absent_servo_retry: [None; JOINT_IDS.len()],
@@ -57,6 +62,7 @@ impl HxIo {
             let configuration_error = servo.configuration_error.take();
             *servo = ServoObservation { id: servo.id, configuration, configuration_error, ..Default::default() };
         }
+        scan.latest.optional_servos.clear();
         scan.latest.imu = ImuObservation::default();
     }
 
@@ -72,6 +78,9 @@ impl HxIo {
         if scan.individual == active { return; }
         scan.individual = active;
         scan.next_joint = 0;
+        scan.next_optional_servo = 0;
+        scan.next_optional_at = Instant::now() + OPTIONAL_SERVO_INTERVAL;
+        scan.latest.optional_servos.clear();
         scan.next_imu = Instant::now();
         scan.last_read_was_imu = false;
         scan.absent_servo_retry.fill(None);
@@ -90,9 +99,7 @@ impl HxIo {
         if self.status_unconfirmed {
             return Err(IoError::Bus("status reply unconfirmed; motor bus is quarantined".into()));
         }
-        let bridged = std::env::var_os("WONDERDUCK_SERVO_PORT")
-            .is_some_and(|port| port == std::ffi::OsStr::new(&self.port_path))
-            && std::env::var_os("WONDERDUCK_UNOQ_ROUTER").is_some();
+        let bridged = self.uses_unoq_bridge();
         let request = packet(id, if bridged { UNOQ_STATUS_READ } else { READ }, &[address, length])?;
         self.status_unconfirmed = true;
         // Do not discard unexpected bytes: they may belong to an earlier transaction.
@@ -204,11 +211,18 @@ impl HxIo {
         }
     }
 
+    pub(super) fn uses_unoq_bridge(&self) -> bool {
+        std::env::var_os("WONDERDUCK_SERVO_PORT")
+            .is_some_and(|port| port == std::ffi::OsStr::new(&self.port_path))
+            && std::env::var_os("WONDERDUCK_UNOQ_ROUTER").is_some()
+    }
+
     pub(super) fn sample_one_observation(&mut self, deadline: Instant) -> Result<Option<DeviceObservation>> {
         // Do not start a query when the current control tick has no useful slack.
         if deadline.saturating_duration_since(Instant::now()) < Duration::from_millis(3) {
             return Ok(None);
         }
+        let optional_supported = self.uses_unoq_bridge();
         let scan = self.observation.get_or_insert_with(ObservationScan::new);
         scan.enabled = true;
         if !scan.individual { return Ok(Some(scan.latest.clone())); }
@@ -228,6 +242,13 @@ impl HxIo {
             }
             return Ok(sample);
         }
+        if optional_supported && now >= scan.next_optional_at {
+            let id = ACCESSORY_SERVO_IDS[scan.next_optional_servo];
+            scan.next_optional_servo = (scan.next_optional_servo + 1) % ACCESSORY_SERVO_IDS.len();
+            scan.next_optional_at = now + OPTIONAL_SERVO_INTERVAL;
+            scan.last_read_was_imu = false;
+            return self.sample_optional_servo(id);
+        }
         let Some(joint) = joint else { return Ok(None); };
         scan.last_read_was_imu = false;
         scan.next_joint = (joint + 1) % JOINT_IDS.len();
@@ -246,23 +267,7 @@ impl HxIo {
                     };
                     return Ok(Some(scan.latest.clone()));
                 }
-                let b = &frame.data;
-                let raw = u16::from_le_bytes([b[56], b[57]]);
-                let raw = signed_magnitude(raw, 15).clamp(0, 4095) as u16;
-                let speed = signed_magnitude(u16::from_le_bytes([b[58], b[59]]), 15);
-                let load = signed_magnitude(u16::from_le_bytes([b[60], b[61]]), 10);
-                scan.latest.servos[joint] = ServoObservation {
-                    id, t_ns: Some(stamp), observed_t_ns: Some(stamp), valid: true,
-                    raw: Some(raw), speed_rad_s: Some(f64::from(HX_JOINT_DIRECTIONS[joint]) * f64::from(speed) * HX_RAD_PER_SPEED_COUNT),
-                    load_percent: Some(f64::from(load) / 10.0), voltage: Some(f64::from(b[62]) * 0.1),
-                    temperature: Some(f64::from(b[63])), torque: Some(b[40]), packet_status: Some(frame.error),
-                    register_status: Some(b[65]), moving: Some(b[66] != 0), error: None,
-                    configuration: Some(duck_ipc_proto::ServoConfiguration {
-                        firmware_version: [b[0], b[1]], servo_version: [b[3], b[4]],
-                        position_pid: [b[21], b[23], b[22]], overtemperature_c: b[13],
-                        minimum_starting_torque: u16::from_le_bytes([b[24], b[25]]),
-                    }), configuration_error: None,
-                };
+                scan.latest.servos[joint] = Self::decode_status_servo(frame, stamp, HX_JOINT_DIRECTIONS[joint]);
                 Ok(Some(scan.latest.clone()))
             }
             Ok(None) => {
@@ -286,6 +291,38 @@ impl HxIo {
                 };
                 Err(error)
             }
+        }
+    }
+
+    fn sample_optional_servo(&mut self, id: u8) -> Result<Option<DeviceObservation>> {
+        let reply = self.read_status_one(id, 0, 71)?;
+        let stamp = duck_ipc_proto::clock::monotonic_ns();
+        let scan = self.observation.as_mut().expect("status scan exists");
+        let optional = &mut scan.latest.optional_servos;
+        optional.retain(|servo| servo.id != id);
+        if let Some(frame) = reply.filter(|frame| !frame.data.is_empty()) {
+            // Use the servo's register direction for unassigned joints.
+            optional.push(Self::decode_status_servo(frame, stamp, 1));
+        }
+        Ok(Some(scan.latest.clone()))
+    }
+
+    fn decode_status_servo(frame: StatusFrame, stamp: u64, direction: i8) -> ServoObservation {
+        let b = &frame.data;
+        let raw = signed_magnitude(u16::from_le_bytes([b[56], b[57]]), 15).clamp(0, 4095) as u16;
+        let speed = signed_magnitude(u16::from_le_bytes([b[58], b[59]]), 15);
+        let load = signed_magnitude(u16::from_le_bytes([b[60], b[61]]), 10);
+        ServoObservation {
+            id: frame.id, t_ns: Some(stamp), observed_t_ns: Some(stamp), valid: true,
+            raw: Some(raw), speed_rad_s: Some(f64::from(direction) * f64::from(speed) * HX_RAD_PER_SPEED_COUNT),
+            load_percent: Some(f64::from(load) / 10.0), voltage: Some(f64::from(b[62]) * 0.1),
+            temperature: Some(f64::from(b[63])), torque: Some(b[40]), packet_status: Some(frame.error),
+            register_status: Some(b[65]), moving: Some(b[66] != 0), error: None,
+            configuration: Some(duck_ipc_proto::ServoConfiguration {
+                firmware_version: [b[0], b[1]], servo_version: [b[3], b[4]],
+                position_pid: [b[21], b[23], b[22]], overtemperature_c: b[13],
+                minimum_starting_torque: u16::from_le_bytes([b[24], b[25]]),
+            }), configuration_error: None,
         }
     }
 

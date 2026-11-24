@@ -26,6 +26,7 @@ mod coordinated_tracking;
 mod gamepad_process;
 mod head_tracking;
 mod human_control;
+mod motion_cpu;
 mod motion_tracking;
 mod maze;
 mod managed_models;
@@ -1562,7 +1563,12 @@ async fn main() -> ExitCode {
     if args.no_policy {
         params.policy.enabled = false;
     }
-    if args.motion_only {
+    let tof_enabled = std::env::var_os("WONDERDUCK_UNOQ_TOF_ENABLED")
+        .is_none_or(|value| value == "true");
+    if !tof_enabled {
+        tracing::info!("UNO Q ToF polling is disabled");
+    }
+    if args.motion_only || !tof_enabled {
         params.theremin.enabled = false;
     }
     if let Err(error) = args.policy_overrides.apply(&mut params.policy) {
@@ -1716,6 +1722,7 @@ async fn main() -> ExitCode {
 
     let requires_voltage_recovery = physical_status_bus && low_voltage_lock.requires_rearm();
     let mut state = RobotState::new(&params, &params_path);
+    state.obstacle = Arc::new(obstacle::Shared::new(tof_enabled));
     state.status_bus_fault.store(status_fault_at_startup, Ordering::Release);
     state.low_voltage_lock = low_voltage_lock;
     state.startup_voltage_ready.store(!requires_voltage_recovery, Ordering::Relaxed);
@@ -1851,7 +1858,7 @@ async fn main() -> ExitCode {
 
     let (camera_enabled, sensor_enabled, web_enabled) = auxiliary_services(&args);
     let camera = camera_enabled.then(|| camera_process::CameraSupervisor::start(args.with_camera));
-    let sensor = obstacle::start_sensor(sensor_enabled, Arc::clone(&state.obstacle), obstacle::SensorConfig {
+    let sensor = obstacle::start_sensor(sensor_enabled && tof_enabled, Arc::clone(&state.obstacle), obstacle::SensorConfig {
         hz: args.tof_hz, timing_budget_ms: args.tof_timing_budget_ms,
         signal_rate_limit: args.tof_signal_rate_limit, record_raw: args.record_person_follow,
     });
@@ -2268,6 +2275,7 @@ fn spawn_control_thread(
                     period,
                     poweroff,
                     recorder.clone(),
+                    None,
                 ));
                 return;
             }
@@ -2288,6 +2296,7 @@ fn spawn_control_thread(
                     period,
                     poweroff,
                     recorder.clone(),
+                    None,
                 ));
                 return;
             }
@@ -2347,6 +2356,7 @@ fn spawn_control_thread(
                         period,
                         poweroff,
                         recorder,
+                        motion_cpu::MotionCpuFloor::configured(),
                     )
                     .await;
                 }
@@ -2731,6 +2741,13 @@ impl RobotIo for BusIo {
         match self {
             Self::Dynamixel(io) => RobotIo::write_positions_raw(io, ids, positions),
             Self::Hx(io) => RobotIo::write_positions_raw(io, ids, positions),
+        }
+    }
+
+    fn write_accessory_trigger(&mut self, pressure: u8) -> duck_control::io::Result<()> {
+        match self {
+            Self::Hx(io) => io.write_accessory_trigger(pressure),
+            Self::Dynamixel(_) => Ok(()),
         }
     }
 
@@ -3559,7 +3576,7 @@ mod partial_maintenance_tests {
                     valid: true, torque: Some(0), ..Default::default() }
             }
         }).collect();
-        proto::DeviceObservation { servos, imu: Default::default(), bus_error: None }
+        proto::DeviceObservation { servos, ..Default::default() }
     }
 
     #[test]
@@ -3625,8 +3642,7 @@ fn publish_status_fault(state: &RobotState, cached: Option<proto::DeviceObservat
     let mut observation = cached.unwrap_or_else(|| proto::DeviceObservation {
         servos: duck_control::model::JOINT_IDS.into_iter().map(|id|
             proto::ServoObservation { id, ..Default::default() }).collect(),
-        imu: proto::ImuObservation::default(),
-        bus_error: None,
+        ..Default::default()
     });
     observation.bus_error = Some("设备状态回复未确认；串口已隔离，控制和低压监测暂停".into());
     let _ = state.devices_tx.send(observation);
@@ -4645,6 +4661,7 @@ async fn control_loop<T: RobotIo>(
     period: Duration,
     poweroff: PowerOff,
     recorder: Option<record::RecordSender>,
+    mut motion_cpu: Option<motion_cpu::MotionCpuFloor>,
 ) {
     // Owned rather than borrowed from `params`, because neither the mode nor the slots stay
     // what the file said: `robot.setMode` replaces the mode, `robot.loadPolicy` replaces one
@@ -5037,6 +5054,16 @@ async fn control_loop<T: RobotIo>(
     while !state.shutdown.load(Ordering::Acquire) {
         ticker.tick().await;
         let tick_start = Instant::now();
+        if let Some(floor) = motion_cpu.as_mut() {
+            // Standing under policy control still needs timely feedback with zero twist.
+            // The moving flag includes homing, scripted motion and fall recovery.
+            let active = intents.enabled() || state.moving.load(Ordering::Relaxed)
+                || intents.rest_phase() == proto::RestPhase::Resting
+                || shutdown_sit.is_some() || shutdown_rest.is_some()
+                || matches!(state.exit_sit.load(Ordering::Acquire), EXIT_SIT_REQUESTED | EXIT_SIT_RUNNING);
+            floor.update(active && !powered_off && !maintenance_parked && !status_session_open
+                && !state.status_bus_fault.load(Ordering::Acquire), tick_start);
+        }
         read_timing.begin_tick(tick_start);
 
         if state.status_bus_fault.load(Ordering::Acquire) {
@@ -8383,6 +8410,16 @@ async fn control_loop<T: RobotIo>(
                 }
             }
         };
+        // A due R2 reversal is a single write behind the main motor command.
+        // Skipping it when a tick has little spare time leaves a pause at the endpoint.
+        if wrote_targets && write_ok && gamepad_ready && !stop_changed && fresh.is_some()
+            && !status_page_active && !write_guard.maintenance_transition_blocked()
+            && shutdown_rest.is_none() && !state.stopping.load(Ordering::Acquire)
+            && state.exit_sit.load(Ordering::Acquire) == 0
+            && let Err(error) = safety.write_accessory_trigger(intents.accessory_trigger())
+        {
+            tracing::warn!(%error, "accessory servo write failed");
+        }
         drop(write_guard);
         if wrote_targets && write_ok && !limits.contains(&duck_control::safety::Limit::NotFinite)
             && rest_sitting && driving && !inference_failed && fresh.is_some() && policy_label.as_ref() == "sit"
@@ -9394,7 +9431,8 @@ fn is_motion_intent(call: &proto::Call) -> bool {
         | proto::Call::RobotHead(_) | proto::Call::RobotHeadTracking(_) | proto::Call::RobotMotionTracking(_) | proto::Call::RobotCoordinatedTracking(_) | proto::Call::RobotMaze(_) | proto::Call::RobotLook(_) | proto::Call::RobotStop
         | proto::Call::RobotEnable(_) | proto::Call::RobotInit | proto::Call::RobotRelax
         | proto::Call::RobotRebootMotors(_) | proto::Call::RobotRest | proto::Call::RobotDo(_)
-        | proto::Call::RobotPose(_) | proto::Call::RobotMouth(_) | proto::Call::RobotSound(_)
+        | proto::Call::RobotPose(_) | proto::Call::RobotMouth(_) | proto::Call::RobotAccessoryTrigger(_)
+        | proto::Call::RobotSound(_)
         | proto::Call::RobotSoundClip(_)
         | proto::Call::RobotTheremin(_) | proto::Call::RobotChorale(_)
         | proto::Call::RobotShutdown | proto::Call::RobotSetMode(_)
@@ -9882,12 +9920,14 @@ async fn handle_session(
                 let mut guard = state.human_control.lock();
                 if guard.expired() { clear_human_intents(&intents); }
                 let web = session.source() == Some(proto::HumanControlSource::Web);
+                let needs_disabled_tof = params.stop_distance_mm.is_some() && !state.obstacle.sensor_enabled();
                 match params.action {
                     proto::MotionTrackingAction::Start => {
                         let snapshot = intents.snapshot();
                         let reason = if !web { Some("网页控制连接未注册") }
                             else if guard.status_blocked() || guard.maintenance_transition_blocked() { Some("维护页面禁止运动") }
                             else if !params.valid() { Some("目标、相机或联合追踪参数无效") }
+                            else if needs_disabled_tof { Some("ToF 测距已关闭") }
                             else if coordinated_tracking::geometry().is_err() { Some("公共头部运动学模型不可用") }
                             else if intents.maze_active() { Some("迷宫模式正在运行") }
                             else if intents.motion_tracking_active() || intents.head_tracking_active() {
@@ -9917,7 +9957,9 @@ async fn handle_session(
                         }
                     }
                     proto::MotionTrackingAction::Update => {
-                        if let Some(reason) = arrival_skill_error(&state.policies.load(), params) {
+                        if needs_disabled_tof {
+                            Err("ToF 测距已关闭".to_owned())
+                        } else if let Some(reason) = arrival_skill_error(&state.policies.load(), params) {
                             Err(reason.to_owned())
                         }
                         else if !web || guard.access(session) != human_control::Access::Owner {
@@ -9964,6 +10006,7 @@ async fn handle_session(
                         let reason = if !web { Some("网页控制连接未注册") }
                             else if guard.status_blocked() || guard.maintenance_transition_blocked() { Some("维护页面禁止运动") }
                             else if !params.valid() { Some("迷宫参数无效") }
+                            else if !state.obstacle.sensor_enabled() { Some("ToF 测距已关闭，无法开始迷宫模式") }
                             else if intents.motion_tracking_active() || intents.head_tracking_active()
                                 || intents.coordinated_tracking_active() { Some("视觉追踪正在运行") }
                             else if !snapshot.enabled { Some("机器人策略未启用") }
@@ -10222,6 +10265,17 @@ async fn handle_session(
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::refused("manual movement is disabled on the active page")))
                 } else if !allowed {
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::refused("another control source owns the robot")))
+                } else if let proto::Call::RobotAccessoryTrigger(params) = call {
+                    let result = if access == human_control::Access::Owner
+                        && session.source() == Some(proto::HumanControlSource::Gamepad)
+                        && params.pressure <= 100
+                    {
+                        intents.set_accessory_trigger(params.pressure);
+                        proto::IntentResult::accepted()
+                    } else {
+                        proto::IntentResult::refused("accessory trigger requires gamepad control and a pressure of 0–100")
+                    };
+                    request.id.clone().map(|id| proto::Response::ok(Some(id), &result))
                 } else {
                     if access == human_control::Access::Owner
                         && !matches!(call, proto::Call::RobotMove(_) | proto::Call::RobotHead(_)
@@ -11146,6 +11200,9 @@ fn dispatch(
             apply_intent(state, intents, call);
             proto::Response::ok(Some(id), &proto::IntentResult::accepted())
         }
+        proto::Call::RobotAccessoryTrigger(_) => proto::Response::ok(
+            Some(id), &proto::IntentResult::refused("accessory trigger requires gamepad control"),
+        ),
 
         // Gaze as a point: the IK runs here, against the same MJCF the policies train on,
         // and the answer is the joints the head was sent to — so a client can hold the gaze

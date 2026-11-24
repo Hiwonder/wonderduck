@@ -10,7 +10,9 @@ set +a
 
 export PYTHONPATH="$board:$board/python${PYTHONPATH:+:$PYTHONPATH}"
 export ORT_DYLIB_PATH="$root/onnxruntime-linux-aarch64-1.28.0/lib/libonnxruntime.so.1.28.0"
-export WONDERDUCK_OBJECT_MODEL="$root/models/object-detection.onnx"
+export WONDERDUCK_OBJECT_GPU_RUNNER="$root/target/release/object-gpu-runner"
+export WONDERDUCK_UNOQ_TOF_ENABLED="${WONDERDUCK_UNOQ_TOF_ENABLED:-false}"
+export WONDERDUCK_UNOQ_HEAD_IMU_ENABLED="${WONDERDUCK_UNOQ_HEAD_IMU_ENABLED:-false}"
 export MEDIA_RUNTIME_DIR="$root/media-runtime-candidate"
 export WONDERDUCK_ROBOT_PARAMS=${WONDERDUCK_ROBOT_PARAMS:-/etc/robot/robotd.toml}
 export ROBOT_FREEZE_POLICY_IMU=0

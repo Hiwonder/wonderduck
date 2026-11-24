@@ -315,6 +315,10 @@ impl<T: RobotIo> Safety<T> {
         self.io.write_positions_raw(ids, positions)
     }
 
+    pub fn write_accessory_trigger(&mut self, pressure: u8) -> Result<(), IoError> {
+        self.io.write_accessory_trigger(pressure)
+    }
+
     /// Reboot these servos, and forget the gain cache: a rebooted servo comes back at its EEPROM
     /// gains, and a cache that still says the running gain is written would leave it there. The
     /// next [`Self::apply`] rewrites the gains on every servo.

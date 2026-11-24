@@ -281,6 +281,7 @@ pub struct Intents {
     /// Mouth opening, 0..1, as `f64::to_bits`. Continuous like the twist, unstamped like
     /// the pose — a mouth left open by a dead client is exactly what the prototype does.
     mouth: std::sync::atomic::AtomicU64,
+    accessory_trigger: ArcSwapOption<Stamped<u8>>,
     /// Whether the policy should drive. Discrete, so a plain flag rather than a slot.
     enabled: AtomicBool,
     /// A pending `robot.init` / `robot.relax`, as [`PowerRequest`].
@@ -494,6 +495,7 @@ impl Intents {
             maze_epoch: std::sync::atomic::AtomicU64::new(0),
             pose: ArcSwap::from_pointee(PoseIntent::default()),
             mouth: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
+            accessory_trigger: ArcSwapOption::empty(),
             enabled: AtomicBool::new(false),
             power: AtomicU8::new(POWER_NONE),
             theremin: AtomicU8::new(THEREMIN_NONE),
@@ -856,11 +858,13 @@ impl Intents {
     /// Clear the movement request while letting an existing scripted action finish.
     pub fn stop_for_maintenance(&self) {
         self.set_twist([0.0; 3]);
+        self.accessory_trigger.store(None);
         self.request_precision(duck_ipc_proto::PrecisionMoveParams::Cancel);
     }
 
     /// Zero the velocity now. Distinct from the deadman only in that it is deliberate.
     pub fn stop(&self) {
+        self.accessory_trigger.store(None);
         let at_us = self.now_us();
         self.twist.rcu(|previous| {
             let mut next = **previous;
@@ -941,6 +945,16 @@ impl Intents {
     pub fn set_mouth(&self, open: f64) {
         self.mouth
             .store(open.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn set_accessory_trigger(&self, pressure: u8) {
+        self.accessory_trigger.store(Some(Arc::new(Stamped { value: pressure, at_us: self.now_us() })));
+    }
+
+    pub fn accessory_trigger(&self) -> u8 {
+        let trigger = self.accessory_trigger.load();
+        trigger.as_ref().filter(|sample| self.now_us().saturating_sub(sample.at_us) <= 300_000)
+            .map_or(0, |sample| sample.value)
     }
 
     /// Queue the ground pick, which is not one of the configurable one-shots.

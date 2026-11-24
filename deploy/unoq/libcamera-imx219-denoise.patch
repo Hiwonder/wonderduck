@@ -1,0 +1,154 @@
+--- a/src/libcamera/pipeline/camss/camss.cpp
++++ b/src/libcamera/pipeline/camss/camss.cpp
+@@ -691,6 +691,8 @@
+ 
+ 	if (request->findBuffer(&csi_->rawStream_))
+ 		pipe()->completeBuffer(request, buffer);
++	else
++		info->effectiveSensorControls = delayedCtrls_->get(buffer->metadata().sequence);
+ 
+ 	isp_->queueBuffers(request, buffer);
+ }
+--- a/src/libcamera/pipeline/camss/camss_isp_ope.h
++++ b/src/libcamera/pipeline/camss/camss_isp_ope.h
+@@ -80,6 +80,7 @@
+ 	static constexpr unsigned int DISP_PAD_OUTPUT = 1;
+ 
+ 	int init();
++	void denoiseBayer(uint32_t frame, const FrameBuffer *buffer, MappedFrameBuffer &input);
+ 	int trySetVideoCfg(V4L2VideoDevice *v4l2Dev, StreamConfiguration &cfg,
+ 			   bool set, bool update_stride_and_size,
+ 			   const char *msgPrefix) const;
+@@ -114,6 +115,11 @@
+ 	std::vector<IPABuffer> ipaBuffers_;
+ 	/* FIXME drop once using own camss IPA, which will map on IPA side */
+ 	std::map<unsigned int, MappedFrameBuffer> mappedIpaBuffers_;
++	unsigned int bayerStride_ = 0;
++	bool denoiseReported_ = false;
++	unsigned int previousSequence_ = 0;
++	float previousExposureValue_ = 0.0f;
++	std::vector<uint8_t> previousBayer_;
+ 	unsigned int inputBufferCount_;
+ 	unsigned int outputBufferCount_;
+ };
+--- a/src/libcamera/pipeline/camss/camss_isp_ope.cpp
++++ b/src/libcamera/pipeline/camss/camss_isp_ope.cpp
+@@ -6,11 +6,13 @@
+  */
+ 
+ #include "camss_isp_ope.h"
++#include "imx219-raw-denoise.h"
+ 
+ #include <cmath>
+ #include <string.h>
+ 
+ #include <libcamera/base/log.h>
++#include <libcamera/base/utils.h>
+ 
+ #include <libcamera/color_space.h>
+ #include <libcamera/controls.h>
+@@ -430,6 +432,17 @@
+ 	if (ret < 0)
+ 		return ret;
+ 
++	const char *setting = utils::secure_getenv("WONDERDUCK_CAMERA_RAW_DENOISE");
++	const bool denoise = (!setting || strcmp(setting, "0") != 0) && sensor_->model() == "imx219" &&
++		inputCfg.pixelFormat == formats::SRGGB10_CSI2P &&
++		inputCfg.size == Size(Imx219RawDenoise::width, Imx219RawDenoise::height) &&
++		inputCfg.stride >= Imx219RawDenoise::rowBytes;
++	bayerStride_ = denoise ? inputCfg.stride : 0;
++	denoiseReported_ = false;
++	previousBayer_.clear();
++	if (denoise)
++		LOG(Camss, Info) << "IMX219 RAW10 temporal denoise enabled";
++
+ 	ret = stats_->configure(inputCfg);
+ 	if (ret < 0)
+ 		return ret;
+@@ -531,20 +544,67 @@
+ 	return output_->exportBuffers(count, buffers);
+ }
+ 
++void CamssIspOpe::denoiseBayer(uint32_t frame, const FrameBuffer *buffer, MappedFrameBuffer &input)
++{
++	const size_t bytes = static_cast<size_t>(bayerStride_) * Imx219RawDenoise::height;
++	auto plane = input.planes()[0];
++	const CamssFrames::Info *info = frameInfos_->find(frame);
++	if (plane.size() < bytes || !info ||
++	    !info->effectiveSensorControls.contains(V4L2_CID_ANALOGUE_GAIN) ||
++	    !info->effectiveSensorControls.contains(V4L2_CID_EXPOSURE)) {
++		previousBayer_.clear();
++		return;
++	}
++
++	const auto &controls = info->effectiveSensorControls;
++	const int code = controls.get(V4L2_CID_ANALOGUE_GAIN).get<int32_t>();
++	const int lines = controls.get(V4L2_CID_EXPOSURE).get<int32_t>();
++	/* IMX219 gain = 256/(256-code), engage only above 1.8x. */
++	if (code < 114 || code > 232 || lines <= 0) {
++		previousBayer_.clear();
++		return;
++	}
++	const float gain = 256.0f / (256 - code);
++	const float exposureValue = gain * lines;
++	const unsigned int sequence = buffer->metadata().sequence;
++	if (previousBayer_.size() != bytes || sequence != previousSequence_ + 1 ||
++	    std::abs(exposureValue - previousExposureValue_) > 0.08f * exposureValue)
++		previousBayer_.assign(plane.begin(), plane.begin() + bytes);
++	else {
++		Imx219RawDenoise(gain).apply(plane.data(), previousBayer_.data(), bayerStride_);
++		if (!denoiseReported_) {
++			LOG(Camss, Info) << "IMX219 RAW10 temporal denoise active";
++			denoiseReported_ = true;
++		}
++	}
++
++	previousSequence_ = sequence;
++	previousExposureValue_ = exposureValue;
++}
++
+ void CamssIspOpe::queueBuffers(Request *request, FrameBuffer *inputBuffer)
+ {
+ 	uint32_t frame = request->sequence();
+-
+-	DmaSyncer inputDmaSync(inputBuffer->planes()[0].fd, DmaSyncer::SyncType::Read);
+-
+-	MappedFrameBuffer input(inputBuffer, MappedFrameBuffer::MapFlag::Read);
+-	if (!input.isValid()) {
+-		LOG(Camss, Error) << "mmap-ing buffer(s) failed";
+-		return;
+-	}
+-
+-	ipa_->queueRequest(frame, request->controls());
+-	stats_->processFrame(frame, 0, input);
++	/* An application requesting RAW owns the original sensor samples. */
++	const bool internal = bayerStride_ &&
++		std::none_of(request->buffers().begin(), request->buffers().end(),
++			     [inputBuffer](const auto &entry) { return entry.second == inputBuffer; });
++	{
++		DmaSyncer sync(inputBuffer->planes()[0].fd, internal ? DmaSyncer::SyncType::ReadWrite
++							    : DmaSyncer::SyncType::Read);
++		MappedFrameBuffer input(inputBuffer, internal ? MappedFrameBuffer::MapFlag::ReadWrite
++						      : MappedFrameBuffer::MapFlag::Read);
++		if (!input.isValid()) {
++			LOG(Camss, Error) << "mmap-ing buffer(s) failed";
++			return;
++		}
++
++		ipa_->queueRequest(frame, request->controls());
++		/* Meter the untouched image before filtering the ISP input. */
++		stats_->processFrame(frame, 0, input);
++		if (internal)
++			denoiseBayer(frame, inputBuffer, input);
++	}
+ 	ipa_->computeParams(frame);
+ 	/* paramsComputed() will queue all the buffers once the params are known. */
+ }
+@@ -699,6 +759,7 @@
+ {
+ 	params_->streamOff();
+ 	output_->streamOff();
++	previousBayer_.clear();
+ 	input_->streamOff();
+ 	ipa_->stop();
+ }

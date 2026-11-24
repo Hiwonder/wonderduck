@@ -1,0 +1,24 @@
+# format=hiwonder-servo-studio-action-csv-v3
+# action_id=1
+# frame_count=4
+# layout_scale=100
+# layout_servo:10=108,266
+# layout_servo:11=108,383
+# layout_servo:12=20,497
+# layout_servo:13=20,614
+# layout_servo:14=20,731
+# layout_servo:20=418,262
+# layout_servo:21=418,379
+# layout_servo:22=501,496
+# layout_servo:23=501,613
+# layout_servo:24=501,731
+# layout_servo:30=264,243
+# layout_servo:31=264,125
+# layout_servo:32=264,8
+# layout_servo:33=108,8
+# layout_servo:34=418,8
+duration_ms,servo:1,servo:2,servo:3,servo:4,servo:5,servo:6,servo:7,servo:8,servo:9,servo:10,servo:11,servo:12,servo:13,servo:14,servo:15,servo:16,servo:17,servo:18,servo:19,servo:20,servo:21,servo:22,servo:23,servo:24,servo:25,servo:26,servo:27,servo:28,servo:29,servo:30,servo:31,servo:32,servo:33,servo:34,servo:35,servo:36
+2000,,,,,,,,,,2041,2000,1796,2048,2300,,,,,,2055,2096,2300,2048,1796,,,,,,2659,1336,2048,2048,2048,,
+1000,,,,,,,,,,2041,2000,1796,2048,2300,,,,,,2055,2096,2300,2048,1796,,,,,,2659,1926,2048,2048,2048,,
+1000,,,,,,,,,,2041,2000,1796,2048,2300,,,,,,2055,2096,2300,2048,1796,,,,,,2659,1926,2048,2048,2048,,
+2000,,,,,,,,,,2041,2000,1796,2048,2300,,,,,,2055,2096,2300,2048,1796,,,,,,1780,1820,2048,2048,2048,,

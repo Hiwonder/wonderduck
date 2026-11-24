@@ -26,6 +26,8 @@ mod gyro_gains;
 mod servo_diagnostics;
 mod position_gain;
 mod startup_config;
+#[cfg(all(test, target_os = "linux"))]
+mod unoq_feedback_tests;
 use diagnostics::DiagnosticCache;
 use frames::{Frames, StatusFrame};
 use imu_source::ImuReader;
@@ -45,11 +47,17 @@ const READ: u8 = 0x02;
 const WRITE: u8 = 0x03;
 const SYNC_READ: u8 = 0x82;
 const SYNC_WRITE: u8 = 0x83;
+// Local UNO Q PTY instruction; the bridge translates it to STM32 cached feedback.
+const UNOQ_FEEDBACK_READ: u8 = 0x93;
+const UNOQ_FEEDBACK_METADATA_ID: u8 = 0xfd;
+const UNOQ_FEEDBACK_MAX_AGE_US: u32 = 40_000;
+const UNOQ_FEEDBACK_MAX_AGE_NS: u64 = 50_000_000;
 
 /// HX registers used by the control loop.
 const PRESENT_POSITION: u8 = 56;
 const PRESENT_POSITION_LEN: u8 = 12;
 const GOAL_POSITION: u8 = 42;
+const ACCESSORY_SERVO_IDS: [u8; 2] = [35, 36];
 const TORQUE_ENABLE: u8 = 40;
 const VOLTAGE_OFFSET: usize = 62 - PRESENT_POSITION as usize;
 const TEMPERATURE_OFFSET: usize = 63 - PRESENT_POSITION as usize;
@@ -98,6 +106,9 @@ const HX_BUS_JOINT_INDICES: [usize; NUM_JOINTS] =
 pub const PHYSICAL_HOME_ENCODER_TARGETS: [u16; NUM_JOINTS] = [
     2055, 2096, 2300, 2048, 1796, 1780, 1820, 2048, 2048, 2048, 2041, 2000, 1796, 2048, 2300,
 ];
+
+/// Manual head travel in HX encoder counts, ordered by pitch (ID 31) and yaw (ID 32).
+pub const MANUAL_HEAD_POSITION_LIMITS: [(u16, u16); 2] = [(1100, 2300), (1024, 3072)];
 
 /// Fixed physical Home, separate from the policy's observation and action reference.
 pub fn home_target() -> [f64; NUM_JOINTS] {
@@ -197,9 +208,15 @@ pub struct HxIo {
     /// the torque-off request rather than relying on the Dynamixel-specific behavior of ignoring
     /// goals while torque is disabled.
     torque_enabled: Option<bool>,
+    accessory_motion: AccessoryMotion,
+    accessory_torque: bool,
     /// Maintenance can change motion shaping; restore it with the next new target.
     motion_restore_pending: bool,
     record_feedback: bool,
+    unoq_feedback: bool,
+    unoq_feedback_sequence: Option<u32>,
+    unoq_feedback_request_ns: u64,
+    unoq_feedback_started_ns: Option<u64>,
     last_sent_goals: Option<SentGoals>,
     servo_diagnostics_ids: Vec<u8>,
 }
@@ -223,8 +240,14 @@ impl HxIo {
             slow: None,
             read_only: false,
             torque_enabled: None,
+            accessory_motion: AccessoryMotion::default(),
+            accessory_torque: false,
             motion_restore_pending: false,
             record_feedback: false,
+            unoq_feedback: std::env::var_os("WONDERDUCK_UNOQ_FEEDBACK").is_some_and(|v| v == "1"),
+            unoq_feedback_sequence: None,
+            unoq_feedback_request_ns: 0,
+            unoq_feedback_started_ns: None,
             last_sent_goals: None,
             servo_diagnostics_ids: Vec::new(),
         })
@@ -348,17 +371,19 @@ impl HxIo {
             return Ok(());
         }
         let desired = [1, 0, u8::from(enabled), 0];
-        let mut params = vec![116];
-        params.extend_from_slice(&desired);
-        let frames = self.exchange(packet(self.imu_device_id(), WRITE, &params)?, &[self.imu_device_id()], 4)
-            .map_err(|error| IoError::Bus(format!(
-                "MCU acceleration calibration switch requires updated QMI8658 firmware: {error}"
-            )))?;
-        if frames.len() != 1 || frames[0].data != desired {
-            return Err(IoError::Bus("MCU acceleration calibration write acknowledgement mismatch".into()));
-        }
         if self.read_register_block(self.imu_device_id(), 116, 4)? != desired {
-            return Err(IoError::Bus("MCU acceleration calibration readback mismatch".into()));
+            let mut params = vec![116];
+            params.extend_from_slice(&desired);
+            let frames = self.exchange(packet(self.imu_device_id(), WRITE, &params)?, &[self.imu_device_id()], 4)
+                .map_err(|error| IoError::Bus(format!(
+                    "MCU acceleration calibration switch requires updated QMI8658 firmware: {error}"
+                )))?;
+            if frames.len() != 1 || frames[0].data != desired {
+                return Err(IoError::Bus("MCU acceleration calibration write acknowledgement mismatch".into()));
+            }
+            if self.read_register_block(self.imu_device_id(), 116, 4)? != desired {
+                return Err(IoError::Bus("MCU acceleration calibration readback mismatch".into()));
+            }
         }
         self.wait_for_imu_ready_at(self.imu_device_id())?;
         self.imu.set_acceleration_enabled(enabled);
@@ -506,8 +531,19 @@ impl HxIo {
         }
         // A failed multi-servo operation may have changed only some joints.
         self.torque_enabled = None;
+        let accessory = if on { Ok(()) } else { self.release_accessory_torque() };
         self.set_torque_ids(&HX_BUS_JOINT_IDS, on)?;
+        accessory?;
         self.torque_enabled = Some(on);
+        Ok(())
+    }
+
+    fn release_accessory_torque(&mut self) -> Result<()> {
+        if self.accessory_torque {
+            self.sync_write_ids(TORQUE_ENABLE, 1, &ACCESSORY_SERVO_IDS, &[vec![0], vec![0]])?;
+            self.accessory_torque = false;
+            self.accessory_motion = AccessoryMotion::default();
+        }
         Ok(())
     }
 
@@ -708,11 +744,21 @@ impl HxIo {
 
     fn exchange_with_cycle_deadline(
         &mut self,
-        tx: Vec<u8>,
+        mut tx: Vec<u8>,
         expected: &[u8],
         length: u8,
         deadline: Instant,
     ) -> Result<Vec<StatusFrame>> {
+        self.unoq_feedback_started_ns = None;
+        if self.unoq_feedback && !self.read_only && tx.len() == 24 &&
+            tx[4..7] == [SYNC_READ, PRESENT_POSITION, PRESENT_POSITION_LEN] &&
+            expected.len() == NUM_JOINTS + 1 && expected[..NUM_JOINTS] == HX_BUS_JOINT_IDS &&
+            expected[NUM_JOINTS] == IMU_DXL_ID
+        {
+            tx[4] = UNOQ_FEEDBACK_READ;
+            tx[23] = !tx[2..23].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+            self.unoq_feedback_request_ns = duck_ipc_proto::clock::monotonic_ns();
+        }
         self.send_instruction(&tx)?;
         let result = self.receive(
             &tx,
@@ -749,7 +795,8 @@ impl HxIo {
         record_servo_status: bool,
     ) -> Result<Vec<StatusFrame>> {
         let started = Instant::now();
-        let observe_control = tx.len() >= 9 && tx[4] == SYNC_READ
+        let cached = tx.get(4) == Some(&UNOQ_FEEDBACK_READ);
+        let observe_control = tx.len() >= 9 && matches!(tx[4], SYNC_READ | UNOQ_FEEDBACK_READ)
             && matches!((tx[5], tx[6]),
                 (PRESENT_POSITION, PRESENT_POSITION_LEN)
                     | (RECORD_FEEDBACK_ADDRESS, RECORD_FEEDBACK_LENGTH))
@@ -800,6 +847,24 @@ impl HxIo {
                 }
             }
             while let Some(frame) = parser.pop() {
+                if cached && frame.id == UNOQ_FEEDBACK_METADATA_ID {
+                    if frame.error != 0 || frame.data.len() != 8 || self.unoq_feedback_started_ns.is_some() {
+                        return Err(self.read_failure(ReadFailureReason::Response(
+                            "invalid UNO Q feedback metadata".into()), tx, &parser, &found, started.elapsed()));
+                    }
+                    let sequence = u32::from_le_bytes(frame.data[..4].try_into().unwrap());
+                    let age_us = u32::from_le_bytes(frame.data[4..].try_into().unwrap());
+                    if sequence == 0 || self.unoq_feedback_sequence.is_some_and(|previous| {
+                        (sequence.wrapping_sub(previous) as i32) < 0
+                    }) || age_us > UNOQ_FEEDBACK_MAX_AGE_US {
+                        return Err(self.read_failure(ReadFailureReason::Response(
+                            "stale UNO Q feedback".into()), tx, &parser, &found, started.elapsed()));
+                    }
+                    self.unoq_feedback_sequence = Some(sequence);
+                    self.unoq_feedback_started_ns = Some(
+                        self.unoq_feedback_request_ns.saturating_sub(u64::from(age_us) * 1000));
+                    continue;
+                }
                 if self.read_only {
                     let evidence = parser.evidence(&found);
                     if evidence.checksum_errors != 0 || evidence.invalid_lengths != 0 || evidence.discarded_bytes != 0 {
@@ -835,6 +900,12 @@ impl HxIo {
                 if observe_control { self.observe_control_frame(&frame, tx[5]); }
                 found.push(frame);
                 if found.len() == expected.len() {
+                    if cached && self.unoq_feedback_started_ns.is_none_or(|sample| {
+                        duck_ipc_proto::clock::monotonic_ns().saturating_sub(sample) > UNOQ_FEEDBACK_MAX_AGE_NS
+                    }) {
+                        return Err(self.read_failure(ReadFailureReason::Response(
+                            "missing or expired UNO Q feedback metadata".into()), tx, &parser, &found, started.elapsed()));
+                    }
                     if self.read_only && parser.evidence(&found).pending_bytes != 0 {
                         return Err(self.read_failure(ReadFailureReason::Response(
                             "trailing bytes after read-only voltage response".into()), tx, &parser, &found, started.elapsed()));
@@ -858,7 +929,11 @@ impl HxIo {
         elapsed: Duration,
     ) -> IoError {
         self.diagnostics.record_control_read(tx, found, parser);
-        let expected = if tx[4] == SYNC_READ { &tx[7..tx.len() - 1] } else { &tx[2..3] };
+        let expected = if matches!(tx[4], SYNC_READ | UNOQ_FEEDBACK_READ) {
+            &tx[7..tx.len() - 1]
+        } else {
+            &tx[2..3]
+        };
         let mut failure = ReadFailure {
             reason,
             missing_ids: expected.iter().copied()
@@ -1105,6 +1180,7 @@ impl RobotIo for HxIo {
             if self.port.is_none() {
                 return Err(IoError::Bus("motor bus is already released".into()));
             }
+            self.release_accessory_torque()?;
             self.port.take();
             self.observation = None;
         } else {
@@ -1315,6 +1391,29 @@ impl RobotIo for HxIo {
         self.diagnostic_write_positions(ids, positions)
     }
 
+    fn write_accessory_trigger(&mut self, pressure: u8) -> Result<()> {
+        if self.torque_enabled != Some(true) || self.recovery_imu_pending {
+            return Ok(());
+        }
+        let mut next_motion = self.accessory_motion;
+        if let Some((positions, duration_ms)) = next_motion.update(pressure, Instant::now()) {
+            if !self.uses_unoq_bridge() {
+                return Ok(());
+            }
+            let duration = duration_ms.to_le_bytes();
+            let data = positions.map(|position| {
+                let goal = position.to_le_bytes();
+                vec![1, 0, goal[0], goal[1], duration[0], duration[1], 0, 0]
+            });
+            // Torque, acceleration, goal position, duration and speed in one frame.
+            // The auxiliary IDs are outside the policy's periodic position writes.
+            self.accessory_torque = true;
+            self.sync_write_ids(TORQUE_ENABLE, 8, &ACCESSORY_SERVO_IDS, &data)?;
+        }
+        self.accessory_motion = next_motion;
+        Ok(())
+    }
+
     fn reboot(&mut self, id: u8) -> Result<()> {
         Err(IoError::Bus(format!(
             "HX backend does not support reboot for ID {id}"
@@ -1345,6 +1444,113 @@ impl RobotIo for HxIo {
     fn restart_imu_stream(&mut self) {
         self.imu.invalidate_host();
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct AccessoryMotion {
+    pressure: u8,
+    opening: bool,
+    repeating: bool,
+    next_toggle: Option<Instant>,
+}
+
+impl AccessoryMotion {
+    fn update(&mut self, pressure: u8, now: Instant) -> Option<([u16; 2], u16)> {
+        const HOLD_TO_REPEAT: Duration = Duration::from_secs(1);
+        const PRESSURE_TOLERANCE: u8 = 2;
+
+        let pressure = pressure.min(100);
+        if pressure == 0 {
+            let previous = std::mem::take(self);
+            return previous.opening.then(|| accessory_trigger_target(0, previous.pressure));
+        }
+        if !self.repeating && (self.pressure == 0 || self.pressure.abs_diff(pressure) > PRESSURE_TOLERANCE) {
+            self.pressure = pressure;
+            self.opening = true;
+            self.next_toggle = Some(now + HOLD_TO_REPEAT);
+            return Some(accessory_trigger_target(pressure, 0));
+        }
+        if self.next_toggle.is_some_and(|deadline| now >= deadline) {
+            // Keep the qualified pressure until release so trigger noise does
+            // not interrupt either half of a repeating movement.
+            self.repeating = true;
+            self.opening = !self.opening;
+            let target_pressure = if self.opening { self.pressure } else { 0 };
+            let target = accessory_trigger_target(target_pressure, self.pressure);
+            self.next_toggle = Some(now + Duration::from_millis(u64::from(target.1)));
+            return Some(target);
+        }
+        None
+    }
+}
+
+fn accessory_trigger_target(pressure: u8, previous_pressure: u8) -> ([u16; 2], u16) {
+    // Return to centre using the duration of the last successfully sent press.
+    let timing_pressure = if pressure == 0 { previous_pressure } else { pressure };
+    let timing_pressure = u32::from(timing_pressure.min(100));
+    let pressure = u32::from(pressure.min(100));
+    let travel = ((1365 * pressure + 50) / 100) as u16;
+    let duration = 800 - ((650 * timing_pressure + 50) / 100) as u16;
+    ([2048 - travel, 2048 + travel], duration)
+}
+
+#[cfg(test)]
+#[test]
+fn accessory_trigger_respects_travel_and_time_limits() {
+    assert_eq!(accessory_trigger_target(0, 0), ([2048, 2048], 800));
+    assert_eq!(accessory_trigger_target(50, 0), ([1365, 2731], 475));
+    assert_eq!(accessory_trigger_target(100, 50), ([683, 3413], 150));
+    assert_eq!(accessory_trigger_target(0, 50), ([2048, 2048], 475));
+    assert_eq!(accessory_trigger_target(0, 100), ([2048, 2048], 150));
+    let mut previous = accessory_trigger_target(0, 0);
+    for pressure in 1..=u8::MAX {
+        let target = accessory_trigger_target(pressure, 0);
+        assert!((683..=previous.0[0]).contains(&target.0[0]));
+        assert!((previous.0[1]..=3413).contains(&target.0[1]));
+        assert!((150..=previous.1).contains(&target.1));
+        assert_eq!(accessory_trigger_target(0, pressure), ([2048, 2048], target.1));
+        previous = target;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn accessory_trigger_repeats_at_the_held_pressure_until_released() {
+    let mut motion = AccessoryMotion::default();
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    assert_eq!(motion.update(50, at(0)), Some(([1365, 2731], 475)));
+    assert_eq!(motion.update(52, at(999)), None);
+    assert_eq!(motion.update(49, at(1000)), Some(([2048, 2048], 475)));
+    assert_eq!(motion.update(43, at(1474)), None);
+    assert_eq!(motion.update(55, at(1475)), Some(([1365, 2731], 475)));
+    assert_eq!(motion.update(45, at(1950)), Some(([2048, 2048], 475)));
+    assert_eq!(motion.update(0, at(2010)), None);
+    assert_eq!(motion.update(0, at(2520)), None);
+
+    assert_eq!(motion.update(100, at(3000)), Some(([683, 3413], 150)));
+    assert_eq!(motion.update(98, at(4000)), Some(([2048, 2048], 150)));
+    assert_eq!(motion.update(100, at(4150)), Some(([683, 3413], 150)));
+    assert_eq!(motion.update(0, at(4190)), Some(([2048, 2048], 150)));
+    assert_eq!(motion.update(0, at(4400)), None);
+}
+
+#[cfg(test)]
+#[test]
+fn accessory_trigger_restarts_hold_timer_when_pressure_changes() {
+    let mut motion = AccessoryMotion::default();
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    assert!(motion.update(100, at(0)).is_some());
+    assert_eq!(motion.update(50, at(990)), Some(([1365, 2731], 475)));
+    assert_eq!(motion.update(50, at(1000)), None);
+    assert_eq!(motion.update(50, at(1990)), Some(([2048, 2048], 475)));
+    assert_eq!(motion.update(100, at(2000)), None);
+    assert_eq!(motion.update(100, at(2465)), Some(([1365, 2731], 475)));
+    assert_eq!(motion.update(0, at(2470)), Some(([2048, 2048], 475)));
+    assert_eq!(motion.update(100, at(3000)), Some(([683, 3413], 150)));
+    assert_eq!(motion.update(100, at(3999)), None);
+    assert_eq!(motion.update(100, at(4000)), Some(([2048, 2048], 150)));
 }
 
 fn validate_raw_joint_positions(ids: &[u8], positions: &[u16]) -> Result<()> {

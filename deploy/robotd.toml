@@ -297,9 +297,10 @@ mode = "walk"
 # stays quiet, and nothing here reaches a health verdict.
 # enabled = true
 
-# ALSA playback device — the TLV320AIC3104 codec that setup-board.sh brings up. The mic
-# worker captures from "<device>,0".
+# ALSA playback device — the TLV320AIC3104 codec that setup-board.sh brings up.
 # device = "plughw:aic3104"
+# Specify the capture PCM if the microphone uses a separate ALSA device.
+# capture_device = "plughw:aic3104,0"
 
 # Where the voice bank lives.
 # bank = "/var/lib/robot/sounds"

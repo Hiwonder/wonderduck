@@ -42,6 +42,7 @@ impl HxIo {
     }
 
     pub(super) fn read_sensors(&mut self, deadline: Option<Instant>) -> Result<Sensors> {
+        self.unoq_feedback_started_ns = None;
         self.prepare_recovered_imu()?;
         self.begin_control_observation();
         let result = self.read_sensors_inner(deadline);
@@ -89,7 +90,7 @@ impl HxIo {
         if host && self.imu.timing_last() {
             host_imu = Some(self.read_host_imu(deadline)?);
         }
-        let acquired_t_ns = broadcast_end_ns;
+        let acquired_t_ns = self.unoq_feedback_started_ns.unwrap_or(broadcast_end_ns);
         if let Some(feedback) = &mut feedback {
             feedback.read_end_t_ns = broadcast_end_ns;
         }
@@ -197,6 +198,11 @@ impl HxIo {
         };
         if let Some(packet) = timed_imu {
             timing.mcu = Some(packet.timing);
+        }
+        if self.unoq_feedback_started_ns.is_some() {
+            if let Some(sequence) = self.unoq_feedback_sequence {
+                timing.sequence = u64::from(sequence);
+            }
         }
         sensors.imu = imu;
         sensors.imu_timing = Some(timing);

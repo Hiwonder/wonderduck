@@ -226,7 +226,7 @@ def play_enabled(arguments):
     if stream is not None:
         arguments = stream[0]
     try:
-        with speaker_enabled(verbose=False):
+        with speaker_enabled(verbose=False, device=argument_value(arguments, "-D", "--device")):
             process = subprocess.Popen(["aplay", *arguments],
                                        stdin=subprocess.PIPE if stream is not None else sys.stdin)
             try:
@@ -264,7 +264,7 @@ def main():
             return play_with_lock(arguments[2:], int(arguments[1]))
         if_free = bool(arguments and arguments[0] == "--if-free")
         return play(arguments[1:] if if_free else arguments, if_free=if_free)
-    except (OSError, RuntimeError, ValueError) as error:
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         print("音频播放失败：{}".format(error), file=sys.stderr, flush=True)
         return 1
     except KeyboardInterrupt:

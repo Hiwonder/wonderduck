@@ -779,6 +779,8 @@ pub struct AudioParams {
     pub enabled: bool,
     /// ALSA playback device — the TLV320AIC3104 codec.
     pub device: String,
+    /// ALSA capture PCM when the microphone uses a separate device.
+    pub capture_device: Option<String>,
     /// Executable with the `aplay` argument contract. A board adapter may hold an amplifier GPIO.
     pub player: PathBuf,
     /// Where the per-robot voice bank lives. The release's postinstall renders it there
@@ -805,6 +807,7 @@ impl Default for AudioParams {
         Self {
             enabled: true,
             device: "plughw:aic3104".to_owned(),
+            capture_device: None,
             player: PathBuf::from("aplay"),
             bank: PathBuf::from("/var/lib/robot/sounds"),
             greet: true,
@@ -826,16 +829,16 @@ impl AudioParams {
         self.pet_detect.unwrap_or(false)
     }
 
-    /// The capture PCM for the mic worker: the playback device with subdevice 0. Only
-    /// appended when the operator has not already spelled a subdevice out — `plughw:aic3104`
-    /// in `robotd.toml` is the default and needs it, but the equally natural full spec
-    /// `plughw:aic3104,0` would otherwise become `plughw:aic3104,0,0`, which no card
-    /// answers to. That lands the worker in its restart loop for the life of the daemon.
+    /// Preserve named ALSA PCMs and use device 0 for existing hardware card settings.
     pub fn capture_device(&self) -> String {
-        if self.device.contains(',') {
-            self.device.clone()
-        } else {
+        if let Some(device) = &self.capture_device {
+            device.clone()
+        } else if (self.device.starts_with("plughw:") || self.device.starts_with("hw:"))
+            && !self.device.contains(',')
+        {
             format!("{},0", self.device)
+        } else {
+            self.device.clone()
         }
     }
 

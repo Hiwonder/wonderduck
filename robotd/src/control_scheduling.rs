@@ -29,6 +29,26 @@ pub fn configure(nice: i32) -> io::Result<()> {
             "control scheduler verification failed: policy={policy}, nice={actual}, requested={nice}"
         )));
     }
+    if let Ok(value) = std::env::var("WONDERDUCK_CONTROL_CPU") {
+        let result = value.parse::<usize>().ok().filter(|cpu| *cpu < libc::CPU_SETSIZE as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid control CPU"))
+            .and_then(|cpu| {
+                let mut affinity: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+                unsafe {
+                    libc::CPU_ZERO(&mut affinity);
+                    libc::CPU_SET(cpu, &mut affinity);
+                    if libc::sched_setaffinity(0, std::mem::size_of_val(&affinity), &affinity) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        if let Err(error) = result {
+            tracing::warn!(%value, %error, "cannot set control thread CPU affinity");
+        } else {
+            tracing::info!(%value, "control thread CPU affinity configured");
+        }
+    }
     tracing::info!(
         nice,
         reset_children = true,

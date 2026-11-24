@@ -1,5 +1,6 @@
 Cmnd_Alias WONDERDUCK_UNOQ_STUDIO = /usr/bin/python3 /home/arduino/wonderduck/extensions/wonderduck_studio/console/server.py --studio --port 8090 --hz 20 --serial /run/wonderduck-unoq/bus --imu-source id200 --robotd-socket /run/robotd.sock --robot-root /home/arduino/wonderduck
-Defaults!WONDERDUCK_UNOQ_STUDIO env_keep += "PYTHONPATH WONDERDUCK_UNOQ_ROUTER WONDERDUCK_HEAD_IMU_ADDRESS"
+Defaults!WONDERDUCK_UNOQ_STUDIO env_keep += "PYTHONPATH WONDERDUCK_UNOQ_ROUTER WONDERDUCK_HEAD_IMU_ADDRESS WONDERDUCK_SERVO_PORT"
+Defaults!WONDERDUCK_UNOQ_STUDIO env_keep += "WONDERDUCK_UNOQ_TOF_ENABLED WONDERDUCK_UNOQ_HEAD_IMU_ENABLED"
 
 arduino ALL=(root) NOPASSWD: /usr/bin/fuser -s /run/wonderduck-unoq/bus
 arduino ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload, /usr/bin/systemd-run --unit=wonderduck-robotd-restart --on-active=2s --timer-property=RemainAfterElapse=no --collect /usr/bin/systemctl restart robotd.service

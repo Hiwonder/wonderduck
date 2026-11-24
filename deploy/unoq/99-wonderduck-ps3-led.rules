@@ -1,0 +1,3 @@
+# UNO Q uses hid-generic for Bluetooth Sixaxis controllers. Apply the player LED
+# after BlueZ creates the hidraw device. Leave native hid-sony devices alone.
+ACTION=="add", SUBSYSTEM=="hidraw", KERNELS=="0005:054C:0268.*", DRIVERS=="hid-generic", RUN+="/usr/bin/python3 /usr/local/libexec/wonderduck-ps3-player-led.py %k"

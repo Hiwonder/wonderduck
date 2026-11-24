@@ -745,6 +745,8 @@ pub mod method {
     /// Mouth opening, 0 (closed) to 1 (open). Continuous; send as a notification. The mouth
     /// is not part of any policy — this is the only thing that moves it.
     pub const ROBOT_MOUTH: &str = "robot.mouth";
+    /// Analog gamepad R2 pressure for the UNO Q accessory servos.
+    pub const ROBOT_ACCESSORY_TRIGGER: &str = "robot.accessoryTrigger";
     /// Play one of the robot's voice-bank sounds — chirp, greet, coo... `wheee` is the
     /// held ride: `hold: true` starts it and must keep arriving (a notification per tick,
     /// like the mouth) or the ride ends; `hold: false` releases it deliberately. The two
@@ -1123,6 +1125,7 @@ pub enum Call {
     RobotPose(PoseParams),
     /// Mouth opening. Continuous. Send as a notification.
     RobotMouth(MouthParams),
+    RobotAccessoryTrigger(AccessoryTriggerParams),
     /// Play a voice-bank sound.
     RobotSound(SoundParams),
     /// Play a named user clip once or while held.
@@ -1321,6 +1324,7 @@ impl Call {
             Call::RobotDo(_) => method::ROBOT_DO,
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
+            Call::RobotAccessoryTrigger(_) => method::ROBOT_ACCESSORY_TRIGGER,
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotSoundClip(_) => method::ROBOT_SOUND_CLIP,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
@@ -1523,6 +1527,7 @@ impl Call {
             | Call::RobotDo(_)
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
+            | Call::RobotAccessoryTrigger(_)
             | Call::RobotSound(_)
             | Call::RobotSoundClip(_)
             | Call::RobotTheremin(_)
@@ -1643,6 +1648,7 @@ impl Call {
             Call::RobotRebootMotors(p) => encode(p),
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
+            Call::RobotAccessoryTrigger(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
             Call::RobotLoadPolicy(p) => encode(p),
             Call::RobotApplyModel(p) => encode(p),
@@ -1763,6 +1769,7 @@ impl Call {
             method::ROBOT_DO => Call::RobotDo(decode(params)?),
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
+            method::ROBOT_ACCESSORY_TRIGGER => Call::RobotAccessoryTrigger(decode(params)?),
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_SOUND_CLIP => Call::RobotSoundClip(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
@@ -2566,7 +2573,7 @@ pub struct CoordinatedTrackingParams {
     pub stop_area_px: Option<u64>,
     /// Half-width of the pixel-area following deadzone, in pixels squared.
     pub stop_area_deadzone_px: u64,
-    /// Desired ToF distance in millimetres for continuous following.
+    /// Desired ToF distance in millimetres for continuous following. None uses pixel area alone.
     pub stop_distance_mm: Option<u32>,
     /// Half-width of the ToF following deadzone, in millimetres.
     pub stop_distance_deadzone_mm: u32,
@@ -2597,7 +2604,7 @@ impl CoordinatedTrackingParams {
             })
             && self.stop_area_px.is_none_or(|area| area > 0)
             && self.stop_distance_mm.is_none_or(|distance| distance > 0)
-            && self.stop_area_px.is_some() == self.stop_distance_mm.is_some()
+            && (self.stop_distance_mm.is_none() || self.stop_area_px.is_some())
             && self.head_deadzone.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.head_gains.iter().flatten().all(|value| value.is_finite())
             && self.body_gains.iter().all(|value| value.is_finite())
@@ -2888,6 +2895,13 @@ impl Default for PoseParams {
 pub struct MouthParams {
     /// 0 closed, 1 fully open. Clamped by the robot.
     pub open: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AccessoryTriggerParams {
+    /// Released at 0, fully pressed at 100.
+    pub pressure: u8,
 }
 
 /// Which mode to switch to, for [`Call::RobotSetMode`].
@@ -3360,6 +3374,9 @@ pub struct SubscribeParams {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DeviceObservation {
     pub servos: Vec<ServoObservation>,
+    /// Read-only observations for detected servos outside the robot's joints.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_servos: Vec<ServoObservation>,
     pub imu: ImuObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bus_error: Option<String>,

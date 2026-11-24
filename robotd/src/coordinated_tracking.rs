@@ -818,7 +818,9 @@ impl Tracker {
         let window = FinalWindow::new(params.final_point, params.final_tolerance);
         PersonFollowDiagnostic {
             accepted_target: frame.map(|frame| frame.target),
-            distance_source: range.map(|_| if self.tof_distance_mm.is_some() { "tof" } else { "area" }),
+            distance_source: range.map(|_| {
+                if self.tof_distance_mm.is_some() && params.stop_distance_mm.is_some() { "tof" } else { "area" }
+            }),
             distance_error: range.map(|(_, error)| error),
             distance_in_deadzone: range.map(|(reached, _)| reached),
             position_in_window: frame.map(|frame| [
@@ -833,10 +835,9 @@ impl Tracker {
         }
     }
 
-    fn tof_range(params: &CoordinatedTrackingParams, distance: u32) -> (bool, f64) {
-        let target = params.stop_distance_mm.expect("following requires a distance setting");
+    fn tof_range(distance: u32, target: u32, deadzone: u32) -> (bool, f64) {
         let difference = i64::from(distance) - i64::from(target);
-        let deadzone = i64::from(params.stop_distance_deadzone_mm);
+        let deadzone = i64::from(deadzone);
         if difference.abs() <= deadzone {
             (true, 0.0)
         } else {
@@ -847,8 +848,8 @@ impl Tracker {
 
     fn follow_range(&self, params: &CoordinatedTrackingParams, frame: Frame) -> Option<(bool, f64)> {
         let stop_area = params.stop_area_px?;
-        if let Some(distance) = self.tof_distance_mm {
-            Some(Self::tof_range(params, distance))
+        if let (Some(distance), Some(target)) = (self.tof_distance_mm, params.stop_distance_mm) {
+            Some(Self::tof_range(distance, target, params.stop_distance_deadzone_mm))
         } else {
             let area = self.follow_area.filter(|_| params.stop_area_deadzone_px > 0)
                 .map(|area| area.value_px.round() as u64)
@@ -953,7 +954,8 @@ impl Tracker {
             restart.fresh_frames = restart.fresh_frames.saturating_add(1);
         }
         restart.elapsed += dt;
-        let needs_camera_confirmation = direction[1] != 0 || (direction[0] != 0 && self.tof_distance_mm.is_none());
+        let needs_camera_confirmation = direction[1] != 0 || (direction[0] != 0
+            && (self.tof_distance_mm.is_none() || params.stop_distance_mm.is_none()));
         if restart.elapsed >= FOLLOW_RESTART_CONFIRM_S && (!needs_camera_confirmation || restart.fresh_frames >= 2) {
             self.follow_settled = false;
             self.follow_restart = None;
@@ -1303,13 +1305,13 @@ impl Tracker {
             return Ok(step);
         }
         let Some(target) = params.target else {
-            if let (Some(_), Some(_), Some(distance)) =
+            if let (Some(_), Some(target_distance), Some(distance)) =
                 (params.stop_area_px, params.stop_distance_mm, self.tof_distance_mm)
                 && self.last_twist[0] != 0.0
             {
                 // Without a target, a fresh range may only slow the previous motion.
                 let limits = limits.with_linear_limits([params.approach_linear_limit; 2]);
-                let (_, error) = Self::tof_range(&params, distance);
+                let (_, error) = Self::tof_range(distance, target_distance, params.stop_distance_deadzone_mm);
                 let forward = (params.body_gains[0] * error).clamp(limits.forward[0], limits.forward[1]);
                 let cap = minimum_body_speed([forward, 0.0, 0.0], limits)[0];
                 self.last_twist[0] = if cap.signum() == self.last_twist[0].signum() {
