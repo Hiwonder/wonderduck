@@ -73,6 +73,8 @@ npm run build --prefix extensions/wonderduck_studio/console/web
 ```bash
 (
 set -euo pipefail
+test -s extensions/wonderduck_studio/console/web/build/index.html
+test -s extensions/wonderduck_studio/console/web/build/debug.html
 ssh "$robot" 'sudo systemctl stop robotd'
 git ls-files scripts/ assets/prompt-sounds/network/ | rsync -a --files-from=- ./ "${robot}:/home/wonderduck/wonderduck/"
 git -C extensions/wonderduck_studio ls-files console/ webpadd/web/ | rsync -a --files-from=- extensions/wonderduck_studio/ "${robot}:/home/wonderduck/wonderduck/extensions/wonderduck_studio/"
@@ -150,6 +152,7 @@ cd "$HOME/wonderduck"
 build="$PWD/target/native-build"
 for program in robotd padd robotctl webpadd; do test -x "$build/release/$program"; done
 test -s "$build/web/index.html"
+test -s "$build/web/debug.html"
 sudo systemctl stop robotd
 install -m 0755 "$build"/release/{robotd,padd,robotctl,webpadd} target/release/
 rsync -a --delete "$build/web/" extensions/wonderduck_studio/console/web/build/

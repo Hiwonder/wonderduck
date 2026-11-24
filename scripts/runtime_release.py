@@ -5,6 +5,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+from html.parser import HTMLParser
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -17,7 +18,7 @@ import sys
 import tarfile
 import tempfile
 import time
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlsplit
 from urllib.request import urlopen
 
 
@@ -177,6 +178,39 @@ def require_arm64(path):
         raise ValueError('不是 ARM64 Linux 可执行文件或动态库：' + str(path))
 
 
+class StudioPageAssets(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.paths = set()
+
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        if tag == 'script':
+            reference = attrs.get('src')
+        elif tag == 'link' and attrs.get('rel') in ('stylesheet', 'modulepreload'):
+            reference = attrs.get('href')
+        else:
+            return
+        if reference:
+            url = urlsplit(reference)
+            if not (url.scheme or url.netloc) and url.path:
+                self.paths.add(unquote(url.path).lstrip('/'))
+
+
+def require_studio_web(web):
+    for name in ('index.html', 'debug.html'):
+        page = web / name
+        if not page.is_file() or not page.stat().st_size:
+            raise ValueError('运行包缺少 Studio 网页入口：' + name)
+        assets = StudioPageAssets()
+        assets.feed(page.read_text(encoding='utf-8'))
+        assets.close()
+        for relative in sorted(assets.paths):
+            asset = web / relative
+            if not asset.is_file() or not asset.stat().st_size:
+                raise ValueError('Studio 网页资源缺失：{} 引用 {}'.format(name, relative))
+
+
 def package(args):
     development = development_release(args.version)
     version(args.min_hardware)
@@ -195,7 +229,8 @@ def package(args):
         require_arm64(path)
         if main_revision.encode('ascii') not in path.read_bytes():
             raise ValueError('程序未嵌入当前源码版本，请重新构建：' + str(path))
-    for file in (web / 'index.html', assets / 'models/object-detection.rknn',
+    require_studio_web(web)
+    for file in (assets / 'models/object-detection.rknn',
                  assets / 'models/librknnrt.so',
                  assets / 'onnxruntime-linux-aarch64-1.28.0/lib/libonnxruntime.so.1.28.0',
                  root / MEDIA_RUN_SOURCE,
@@ -402,8 +437,7 @@ def unpack(archive, stage):
             expected_dir = component.rsplit('/', 1)[-1] in ('bin', 'lib', 'libexec')
             if target.is_symlink() or (not target.is_dir() if expected_dir else not target.is_file()):
                 raise ValueError('运行包缺少摄像头运行文件：' + component)
-        if not (payload / STUDIO_WEB / 'index.html').is_file():
-            raise ValueError('运行包缺少网页入口')
+        require_studio_web(payload / STUDIO_WEB)
         for directory, _, _ in os.walk(str(payload), topdown=False, followlinks=False):
             sync_directory(Path(directory))
         sync_directory(stage)
