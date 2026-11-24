@@ -73,6 +73,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use duck_ipc_proto as proto;
 use gilrs::{Axis, Button, Gilrs, MappingSource};
+use robotd_params::BusProtocol;
 
 mod connection;
 mod control;
@@ -196,10 +197,8 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     max_angular: f64,
 
-    /// Full-deflection head travel, radians. The head command feeds the policy's
-    /// observation rather than a servo directly, so this is the prototype's generous 2.5 —
-    /// the network itself decides how far the head actually goes.
-    #[arg(long, default_value_t = 2.5)]
+    /// Head travel from center at full deflection, before the joint limits, radians.
+    #[arg(long, default_value_t = 2.5, value_parser = parse_speed_limit)]
     max_head: f64,
 
     /// Where to serve the raw input tap: the pad's own event stream, for `robotctl monitor`.
@@ -316,6 +315,7 @@ fn read_bindings(
     robotd_params::PadParams,
     robotd_params::PadDriveParams,
     robotd_params::PadImuHeadControlParams,
+    BusProtocol,
 ) {
     match robotd_params::Params::load(path, false) {
         Ok(params) => {
@@ -327,7 +327,7 @@ fn read_bindings(
                 vyaw = ?(drive.vyaw_min, drive.vyaw_max),
                 "button bindings"
             );
-            (pad, drive, params.pad_imu_head_control)
+            (pad, drive, params.pad_imu_head_control, params.bus.protocol)
         }
         Err(e) => {
             tracing::warn!(
@@ -339,6 +339,7 @@ fn read_bindings(
                 robotd_params::PadParams::default(),
                 robotd_params::PadDriveParams::default(),
                 robotd_params::PadImuHeadControlParams::default(),
+                BusProtocol::default(),
             )
         }
     }
@@ -353,6 +354,59 @@ fn head_from_pad(relative: [f32; 4], gain: f64, max_head: f64) -> proto::HeadPar
         head_yaw: angle(yaw),
         head_roll: -angle(roll),
         ..proto::HeadParams::default()
+    }
+}
+
+fn head_drive_target(protocol: BusProtocol, head: proto::HeadParams) -> proto::HeadParams {
+    if protocol != BusProtocol::Hx {
+        return head;
+    }
+
+    use duck_control::hx::{
+        MANUAL_HEAD_POSITION_LIMITS, PHYSICAL_HOME_ENCODER_TARGETS, decode_position, encode_position,
+    };
+    let offsets = [head.head_pitch, head.head_yaw];
+    let raw_position = std::array::from_fn(|axis| {
+        let joint = axis + 6;
+        let decode = |raw: u16| {
+            decode_position(joint, &raw.to_le_bytes()).expect("valid HX head calibration")
+        };
+        let home = decode(PHYSICAL_HOME_ENCODER_TARGETS[joint]);
+        let (min_raw, max_raw) = MANUAL_HEAD_POSITION_LIMITS[axis];
+        let offset = if offsets[axis].is_finite() { offsets[axis] } else { 0.0 };
+        let target = (home + offset).clamp(decode(max_raw), decode(min_raw));
+        encode_position(joint, target).expect("target within HX head travel")
+    });
+    proto::HeadParams { raw_position: Some(raw_position), ..proto::HeadParams::default() }
+}
+
+#[cfg(test)]
+mod head_drive_tests {
+    use super::{BusProtocol, head_drive_target, proto};
+
+    #[test]
+    fn hx_head_is_absolute_and_only_sends_pitch_and_yaw() {
+        let target = |pitch, yaw| {
+            head_drive_target(BusProtocol::Hx, proto::HeadParams {
+                head_pitch: pitch,
+                head_yaw: yaw,
+                head_roll: 0.4,
+                neck_pitch: 0.3,
+                ..proto::HeadParams::default()
+            })
+        };
+        for (pitch, yaw, expected) in [
+            (0.0, 0.0, [1820, 2048]),
+            (-2.5, 2.5, [2300, 1024]),
+            (2.5, -2.5, [1100, 3072]),
+            (0.1, -0.1, [1755, 2113]),
+            (0.0, 0.0, [1820, 2048]),
+        ] {
+            assert_eq!(target(pitch, yaw), proto::HeadParams {
+                raw_position: Some(expected),
+                ..proto::HeadParams::default()
+            });
+        }
     }
 }
 
@@ -603,7 +657,7 @@ fn run_session(
     // The button bindings, read once like every other daemon reads its config. A file that will
     // not parse is not a reason to leave somebody without a pad: the default mapping is the
     // fallback, and the reason is logged.
-    let (mut bindings, mut drive, mut imu_head) = read_bindings(&args.config);
+    let (mut bindings, mut drive, mut imu_head, bus_protocol) = read_bindings(&args.config);
     // When the file was last written, so a change is picked up without a restart.
     let mut bindings_at = config_mtime(&args.config);
     let mut bindings_checked = Instant::now();
@@ -621,6 +675,9 @@ fn run_session(
     // The continuous intents, and the buffer this tick's are built in. Both live across
     // ticks so a steady state neither allocates nor re-sends — see [`Continuous`].
     let mut continuous = Continuous::default();
+    let mut idle_since = None;
+    let mut release_checked = None;
+    let mut previous_imu_pose: Option<[f64; 2]> = None;
     let mut frame: Vec<proto::Call> = Vec::with_capacity(2);
     let mut precision = args
         .gamepad_precision
@@ -637,7 +694,7 @@ fn run_session(
             let now = config_mtime(&args.config);
             if now != bindings_at {
                 bindings_at = now;
-                (bindings, drive, imu_head) = read_bindings(&args.config);
+                (bindings, drive, imu_head, _) = read_bindings(&args.config);
                 tracing::warn!("button bindings reloaded");
             }
             match ask_roller(&mut stream, &mut next_id) {
@@ -759,6 +816,8 @@ fn run_session(
                 tap.idle();
             }
             gate.lost();
+            idle_since = None;
+            previous_imu_pose = None;
             std::thread::sleep(IDLE_POLL);
             continue;
         };
@@ -776,21 +835,6 @@ fn run_session(
         );
         if start_action == Some(StartAction::Rest) {
             gate.expire(Instant::now());
-            if !gate.driving() {
-                let requested_at = Instant::now();
-                match control::call(&mut stream, &mut next_id, proto::HumanControlAction::AcquireIfFree) {
-                    Ok(result) => {
-                        gate.acquired(&result, requested_at);
-                        if !gate.driving() {
-                            tracing::warn!(reason = ?result.reason, "rest unavailable: gamepad control not acquired");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "control acquisition for rest failed");
-                        return std::process::ExitCode::FAILURE;
-                    }
-                }
-            }
             if gate.driving() {
                 if pick_mouth.cancel()
                     && let Err(error) = notify(&mut stream, &proto::Call::RobotMouth(proto::MouthParams::default()))
@@ -848,19 +892,45 @@ fn run_session(
         }
         rest_rearm_required = false;
 
+        // Track the IMU even without ownership so a fresh controller tilt can
+        // request control. Compare to the last significant pose to filter drift.
+        let attitude = tap.and_then(|tap| {
+            tap.watch(&pad);
+            tap.imu_control(head_drive && imu_head.enabled);
+            if head_drive && imu_head.enabled { tap.attitude() } else { None }
+        });
+        if attitude.is_none() {
+            imu_reference = None;
+        }
+        let imu_head_pose = attitude.map(|attitude| {
+            let reference = *imu_reference.get_or_insert(attitude);
+            head_from_pad(pad_imu::relative(reference, attitude), imu_head.gain, args.max_head)
+        });
+        let imu_angles = imu_head_pose.map(|head| [head.head_pitch, head.head_yaw]);
+        let imu_moving = imu_angles.zip(previous_imu_pose).is_some_and(|(next, previous)| {
+            next.into_iter().zip(previous).any(|(next, previous)| (next - previous).abs() >= 0.025)
+        });
+        if imu_moving || previous_imu_pose.is_none() || imu_angles.is_none() {
+            previous_imu_pose = imu_angles;
+        }
         let neutral = pad_neutral(&pad, args.deadzone, head_drive);
-        let activity = button_activity || !neutral;
+        let activity = button_activity || imu_moving || !neutral;
+        if activity {
+            idle_since = None;
+        }
         gate.expire(Instant::now());
         if gate.observe(neutral, activity) {
             let requested_at = Instant::now();
             match control::call(
                 &mut stream,
                 &mut next_id,
-                proto::HumanControlAction::Acquire,
+                proto::HumanControlAction::AcquireIfFree,
             ) {
                 Ok(result) => {
                     gate.acquired(&result, requested_at);
-                    if !gate.driving() {
+                    if gate.driving() {
+                        continuous = Continuous::default();
+                    } else {
                         tracing::info!(reason = ?result.reason, "gamepad control unavailable");
                     }
                 }
@@ -884,12 +954,8 @@ fn run_session(
                     precision.gesture.step(now, [0.0; 3], [0.0; 3]);
                 }
             }
-            imu_reference = None;
+            idle_since = None;
             buttons_were_driving = false;
-            if let Some(tap) = tap.as_ref() {
-                tap.watch(&pad);
-                tap.imu_control(false);
-            }
             driving = true;
             let sleep_period = period.min(control::REFRESH_INTERVAL);
             if let Some(remaining) = sleep_period.checked_sub(tick.elapsed()) {
@@ -921,19 +987,8 @@ fn run_session(
             tracing::info!(head_drive, "Select and Start — gamepad mode switched");
         }
 
-        // A reconnected pad can have a new event node even when it returns between polls.
-        let attitude = tap.and_then(|tap| {
-            tap.watch(&pad);
-            tap.imu_control(head_drive && imu_head.enabled);
-            if head_drive && imu_head.enabled { tap.attitude() } else { None }
-        });
-        if attitude.is_none() {
-            imu_reference = None;
-        }
-        let imu_head_pose = attitude.map(|attitude| {
-            let reference = *imu_reference.get_or_insert(attitude);
-            head_from_pad(pad_imu::relative(reference, attitude), imu_head.gain, args.max_head)
-        });
+        // A mode change discards the IMU pose calculated in the previous mode.
+        let imu_head_pose = imu_head_pose.filter(|_| !mode_changed);
 
         if start_action == Some(StartAction::Initialize) {
             match explicit_low_voltage_rearm(&mut stream, &mut next_id, &mut gate) {
@@ -1057,7 +1112,7 @@ fn run_session(
                 head_yaw: -right_x * args.max_head,
                 ..proto::HeadParams::default()
             });
-            frame.push(proto::Call::RobotHead(head));
+            frame.push(proto::Call::RobotHead(head_drive_target(bus_protocol, head)));
         } else if mode_changed {
             frame.push(proto::Call::RobotHead(proto::HeadParams::default()));
         }
@@ -1148,6 +1203,33 @@ fn run_session(
                 Err(error) => {
                     tracing::error!(%error, "precision movement request failed");
                     return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
+
+        let busy = activity || pick_mouth.started_at.is_some()
+            || precision.as_ref().is_some_and(|drive| drive.awaiting_completion);
+        if busy {
+            idle_since = None;
+        } else {
+            let idle = tick.saturating_duration_since(*idle_since.get_or_insert(tick));
+            let retry_due = release_checked.is_none_or(|at| {
+                tick.saturating_duration_since(at) >= control::REFRESH_INTERVAL
+            });
+            if idle >= control::IDLE_RELEASE && retry_due {
+                release_checked = Some(tick);
+                match control::call(&mut stream, &mut next_id, proto::HumanControlAction::Release) {
+                    Ok(result) if result.accepted
+                        || result.owner != Some(proto::HumanControlSource::Gamepad) =>
+                    {
+                        gate.lost();
+                        gate.observe(true, false);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::error!(%error, "idle gamepad control release failed");
+                        return std::process::ExitCode::FAILURE;
+                    }
                 }
             }
         }

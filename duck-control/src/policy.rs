@@ -724,9 +724,6 @@ impl Network {
                     return Err(fail("invalid motion-completion state".into()));
                 }
                 self.completed = h[4] == 1.0;
-                if h[0] == 250.0 && !self.completed {
-                    tracing::warn!(policy = %self.path.display(), "kick unfinished after 5s; no automatic Stand handoff");
-                }
             }
             h_in.copy_from_slice(h);
             c_in.copy_from_slice(c);

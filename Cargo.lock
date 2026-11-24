@@ -3087,6 +3087,7 @@ name = "padd"
 version = "0.1.5"
 dependencies = [
  "clap",
+ "duck-control",
  "duck-ipc-proto",
  "evdev",
  "gilrs",

@@ -1,10 +1,11 @@
-//! Connection-bound human control leases. Robot intent changes belong to the caller.
+//! Connection-bound human control leases and their expiration.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::intents::Intents;
 use duck_ipc_proto::{HumanControlResult, HumanControlSource};
 
 const LEASE_DURATION: Duration = Duration::from_millis(750);
@@ -87,52 +88,53 @@ struct Maintenance {
     status_pending: Option<(u8, u8, u8)>,
 }
 
-#[derive(Debug, Default)]
 pub(crate) struct Arbiter {
     state: Mutex<State>,
+    intents: Arc<Intents>,
 }
 
 /// Hold this guard across access checks, intent mutations and any required cleanup.
 pub(crate) struct Guard<'a> {
     state: MutexGuard<'a, State>,
     now: Instant,
-    expired: bool,
 }
 
 impl Arbiter {
+    pub(crate) fn new(intents: Arc<Intents>) -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            intents,
+        }
+    }
+
     pub(crate) fn set_status_journal(&self, path: std::path::PathBuf) {
         self.state.lock().expect("human control arbiter poisoned").status_journal = path;
     }
+
     pub(crate) fn lock(&self) -> Guard<'_> {
-        let state = self.state.lock().expect("human control arbiter poisoned");
-        Guard::new(state, Instant::now())
+        self.lock_with_clock(Instant::now)
     }
 
-
+    fn lock_with_clock(&self, now: impl FnOnce() -> Instant) -> Guard<'_> {
+        let mut state = self.state.lock().expect("human control arbiter poisoned");
+        let now = now();
+        if let Some(lease) = &state.lease
+            && now >= lease.deadline
+        {
+            let session = lease.connection_id;
+            state.last_released = Some(session);
+            state.lease = None;
+            // Complete revocation before releasing the lock or admitting a new owner.
+            self.intents.cancel_motion_tracking();
+            self.intents.cancel_maze();
+            crate::clear_human_intents(&self.intents);
+            tracing::warn!(session, "human control lease expired; motion stopped");
+        }
+        Guard { state, now }
+    }
 }
 
-impl<'a> Guard<'a> {
-    fn new(mut state: MutexGuard<'a, State>, now: Instant) -> Self {
-        let expired = state
-            .lease
-            .as_ref()
-            .is_some_and(|lease| now >= lease.deadline);
-        if expired {
-            state.last_released = state.lease.as_ref().map(|lease| lease.connection_id);
-            state.lease = None;
-        }
-        Self {
-            state,
-            now,
-            expired,
-        }
-    }
-
-    /// If true, stop and clear the previous owner's intents before using this guard.
-    pub(crate) fn expired(&self) -> bool {
-        self.expired
-    }
-
+impl Guard<'_> {
     pub(crate) fn has_owner(&self) -> bool {
         self.state.lease.is_some() || self.state.maintenance.is_some() || self.state.emergency_release
     }
@@ -610,5 +612,129 @@ impl<'a> Guard<'a> {
         } else {
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::intents::{PoseIntent, PowerRequest};
+    use duck_ipc_proto::{HeadParams, MotionTrackingAction, MotionTrackingParams, RestPhase};
+
+    #[test]
+    fn read_only_status_revokes_expired_control_and_clears_intents_once() {
+        let intents = Arc::new(Intents::new());
+        let arbiter = Arbiter::new(Arc::clone(&intents));
+        let mut operator = Session::new();
+        let reader = Session::new();
+        let at = Instant::now();
+        let source = HumanControlSource::Web;
+        {
+            let mut guard = arbiter.lock_with_clock(|| at);
+            assert!(guard.register(&mut operator, source).accepted);
+            assert!(guard.acquire(&operator, source).accepted);
+            intents.set_twist([0.15, 0.0, 0.0]);
+            intents.set_head(HeadParams {
+                raw_position: Some([2000, 2300]),
+                ..HeadParams::default()
+            });
+            intents.set_pose(PoseIntent { body: [0.01, 0.0, 0.0], active: true });
+            assert!(intents.update_motion_tracking(operator.id(), MotionTrackingParams {
+                action: MotionTrackingAction::Start,
+                initial_pitch: None,
+                target: None,
+                line_speed: Some(0.1),
+                reference_area: 1.0,
+                deadzone: [0.0; 2],
+                gains: [[0.0; 3]; 2],
+            }));
+            intents.request_ground_pick();
+            assert!(intents.request_rest());
+            intents.request_relax();
+            intents.request_confirmed_shutdown();
+        }
+
+        let before = intents.snapshot();
+        let deadline = at + LEASE_DURATION;
+        assert_eq!(
+            arbiter.lock_with_clock(|| deadline - Duration::from_millis(1)).status(&reader, source).owner,
+            Some(source),
+        );
+        assert!(before.motion_tracking.is_some());
+
+        assert_eq!(arbiter.lock_with_clock(|| deadline).status(&reader, source).owner, None);
+        let after = intents.snapshot();
+        assert_eq!(after.command.twist, [0.0; 3]);
+        assert_eq!(after.head_position_raw, None);
+        assert!(!after.pose.active);
+        assert!(after.motion_tracking.is_none());
+        assert!(!intents.take_skills().ground_pick);
+        assert_eq!(intents.rest_phase(), RestPhase::Failed);
+        assert!(matches!(intents.take_power_request(), Some(PowerRequest::Relax)));
+        assert!(intents.take_shutdown());
+
+        drop(arbiter.lock_with_clock(|| deadline));
+        assert_eq!(after.stop_generation, before.stop_generation + 1);
+        assert_eq!(intents.snapshot().stop_generation, after.stop_generation);
+    }
+
+    #[test]
+    fn refreshed_deadline_and_late_disconnect_preserve_the_current_owner() {
+        let intents = Arc::new(Intents::new());
+        let arbiter = Arbiter::new(Arc::clone(&intents));
+        let mut previous = Session::new();
+        let mut next = Session::new();
+        let source = HumanControlSource::Web;
+        let at = Instant::now();
+        let refreshed_at = at + Duration::from_millis(500);
+        {
+            let mut guard = arbiter.lock_with_clock(|| at);
+            assert!(guard.register(&mut previous, source).accepted);
+            assert!(guard.acquire(&previous, source).accepted);
+            assert!(guard.register(&mut next, source).accepted);
+            intents.set_twist([0.15, 0.0, 0.0]);
+        }
+        assert!(arbiter.lock_with_clock(|| refreshed_at).refresh(&previous, source).accepted);
+        {
+            let mut guard = arbiter.lock_with_clock(|| at + LEASE_DURATION);
+            assert_eq!(guard.access(&previous), Access::Owner);
+            assert!(!guard.acquire_if_free(&next, source).accepted);
+            assert_eq!(intents.snapshot().command.twist, [0.15, 0.0, 0.0]);
+        }
+
+        let deadline = refreshed_at + LEASE_DURATION;
+        {
+            let mut guard = arbiter.lock_with_clock(|| deadline);
+            assert!(guard.acquire_if_free(&next, source).accepted);
+            assert_eq!(intents.snapshot().command.twist, [0.0; 3]);
+            intents.set_twist([-0.1, 0.0, 0.0]);
+        }
+        let mut guard = arbiter.lock_with_clock(|| deadline);
+        assert!(!guard.disconnect(&mut previous));
+        assert_eq!(guard.access(&next), Access::Owner);
+        assert_eq!(intents.snapshot().command.twist, [-0.1, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn maintenance_at_the_deadline_clears_queued_actions_before_handoff() {
+        let intents = Arc::new(Intents::new());
+        let arbiter = Arbiter::new(Arc::clone(&intents));
+        let mut operator = Session::new();
+        let maintenance = Session::new();
+        let source = HumanControlSource::Web;
+        let at = Instant::now();
+        {
+            let mut guard = arbiter.lock_with_clock(|| at);
+            assert!(guard.register(&mut operator, source).accepted);
+            assert!(guard.acquire(&operator, source).accepted);
+            assert!(guard.mark_action());
+            intents.request_sit_toggle();
+        }
+
+        let mut guard = arbiter.lock_with_clock(|| at + LEASE_DURATION);
+        guard.begin_maintenance(&maintenance, false).unwrap();
+        assert_eq!(guard.maintenance_phase(), Some(MaintenancePhase::Requested));
+        assert!(!guard.acquire_if_free(&operator, source).accepted);
+        assert!(!intents.take_skills().sit_toggle);
     }
 }
