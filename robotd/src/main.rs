@@ -6209,11 +6209,7 @@ async fn control_loop<T: RobotIo>(
                 motion_tracker.reset();
                 motion_tracking_sequence = Some(tracking.sequence);
             }
-            let eligible = snapshot.enabled && was_driving && !safety.fallen()
-                && bringup == Bringup::Ready && fresh.is_some() && shutdown_sit.is_none()
-                && limp_fall == LimpFall::Idle
-                && snapshot.stop_generation == previous_stop_generation
-                && controller.as_ref().is_some_and(|controller| !controller.busy() && !controller.is_sitting());
+            let eligible = autonomous_ready && !autonomous_paused && fresh.is_some();
             let target = if eligible { tracking.target } else { None };
             let twist = if let Some(speed) = tracking.line_speed {
                 motion_tracker.follow_line(target, speed, tracking.line_target_x.unwrap_or(160.0),
@@ -8635,22 +8631,28 @@ async fn control_loop<T: RobotIo>(
         {
             intents.advance_pickup(tracking.sequence, snapshot.stop_generation);
         }
-        let tracking_phase = snapshot.coordinated_tracking.as_ref().map(|tracking| {
-            use proto::CoordinatedTrackingPhase as Phase;
-            if autonomous_paused || safety.fallen() || in_limp_fall { Phase::Fallen }
-            else if !tracking.fresh || tracking.params.camera.is_none() { Phase::PausedVision }
-            else if coordinated_mouth.finishing() { Phase::MouthAfterAction }
-            else if coordinated_mouth.preparing() { Phase::MouthBeforeAction }
-            else if coordinated_tracker.arrival_action_running() { Phase::RunningAction }
-            else if fresh.is_none() || coordinated_feedback_missing { Phase::WaitingFeedback }
-            else if !snapshot.enabled || !driving || bringup != Bringup::Ready { Phase::WaitingRobot }
-            else if !coordinated_initial_head.arrived() { Phase::InitialHead }
-            // Reuse existing wire phases without changing the shared IPC version.
-            else if tracking.params.head_only() {
-                if tracking.params.target.is_some() { Phase::Approach } else { Phase::WaitingTarget }
-            }
-            else { coordinated_tracker.phase() }
-        });
+        use proto::CoordinatedTrackingPhase as Phase;
+        let recovering_autonomous_motion = (autonomous_paused || safety.fallen() || in_limp_fall)
+            && (snapshot.coordinated_tracking.is_some()
+                || snapshot.motion_tracking.is_some() || snapshot.maze.is_some());
+        let tracking_phase = if recovering_autonomous_motion {
+            Some(Phase::Fallen)
+        } else {
+            snapshot.coordinated_tracking.as_ref().map(|tracking| {
+                if !tracking.fresh || tracking.params.camera.is_none() { Phase::PausedVision }
+                else if coordinated_mouth.finishing() { Phase::MouthAfterAction }
+                else if coordinated_mouth.preparing() { Phase::MouthBeforeAction }
+                else if coordinated_tracker.arrival_action_running() { Phase::RunningAction }
+                else if fresh.is_none() || coordinated_feedback_missing { Phase::WaitingFeedback }
+                else if !snapshot.enabled || !driving || bringup != Bringup::Ready { Phase::WaitingRobot }
+                else if !coordinated_initial_head.arrived() { Phase::InitialHead }
+                // Reuse existing wire phases without changing the shared IPC version.
+                else if tracking.params.head_only() {
+                    if tracking.params.target.is_some() { Phase::Approach } else { Phase::WaitingTarget }
+                }
+                else { coordinated_tracker.phase() }
+            })
+        };
         if let Some(recorder) = recorder.as_ref().filter(|_| recording) {
             let servo_diagnostics = safety.record_servo_diagnostics(period.saturating_sub(tick_start.elapsed()));
             let mut sample = record::Sample::new(
@@ -10015,7 +10017,6 @@ async fn handle_session(
                             else if !snapshot.enabled { Some("机器人策略未启用") }
                             else if snapshot.pose.active { Some("机器人处于姿态控制模式") }
                             else if state.policies.load().walk.is_none() { Some("未加载行走策略") }
-                            else if state.fallen.load(Ordering::Acquire) { Some("机器人处于摔倒状态") }
                             else if state.human_action_busy.load(Ordering::Acquire) { Some("机器人正在执行动作或尚未准备好") }
                             else { None };
                         if let Some(reason) = reason { Err(reason.to_owned()) }
@@ -10081,7 +10082,6 @@ async fn handle_session(
                             else if snapshot.pose.active { Some("机器人处于姿态控制模式") }
                             else if state.policies.load().walk.is_none() { Some("未加载行走策略") }
                             else if let Some(reason) = arrival_skill_error(&state.policies.load(), params) { Some(reason) }
-                            else if state.fallen.load(Ordering::Acquire) { Some("机器人处于摔倒状态") }
                             else if state.sitting.load(Ordering::Acquire) { Some("机器人处于坐下状态") }
                             else if state.human_action_busy.load(Ordering::Acquire) {
                                 Some("机器人正在执行动作或尚未准备好")
@@ -10155,7 +10155,6 @@ async fn handle_session(
                             else if !snapshot.enabled { Some("机器人策略未启用") }
                             else if snapshot.pose.active { Some("机器人处于姿态控制模式") }
                             else if state.policies.load().walk.is_none() { Some("未加载行走策略") }
-                            else if state.fallen.load(Ordering::Acquire) { Some("机器人处于摔倒状态") }
                             else if state.sitting.load(Ordering::Acquire) { Some("机器人处于坐下状态") }
                             else if state.human_action_busy.load(Ordering::Acquire) { Some("机器人正在执行动作或尚未准备好") }
                             else { None };

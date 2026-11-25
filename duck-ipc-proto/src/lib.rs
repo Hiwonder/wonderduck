@@ -4468,7 +4468,7 @@ pub struct RobotState {
     pub head: [f64; 4],
     /// Which policy drove this tick: `walk`, `stand`, or `held` when none did.
     pub policy: String,
-    /// Actual coordinated tracking phase, absent while that mode is inactive.
+    /// Coordinated tracking phase, or fall recovery during an autonomous task.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracking_phase: Option<CoordinatedTrackingPhase>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
