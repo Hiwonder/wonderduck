@@ -143,6 +143,9 @@ impl Publisher {
         let worker_latest = Arc::clone(&latest);
         let worker_stop = Arc::clone(&stop);
         let worker_skipped = Arc::clone(&skipped);
+        let mouth_setting = std::env::current_exe().ok().and_then(|executable| {
+            Some(executable.parent()?.parent()?.join("mouth-sound.json"))
+        });
         let worker = thread::Builder::new().name("state-output".into()).spawn(move || {
             let mut next_temperature = Instant::now();
             let mut next_frame = Instant::now();
@@ -154,6 +157,9 @@ impl Publisher {
                     }
                     if let Some(throttle) = soc::cpu_throttle() {
                         state.cpu_throttle.store(Some(Arc::new(throttle)));
+                    }
+                    if let Some(enabled) = mouth_setting.as_deref().and_then(crate::sound::mouth_sound_setting) {
+                        state.mouth_sound_enabled.store(enabled, Ordering::Relaxed);
                     }
                     let skipped = worker_skipped.swap(0, Ordering::Relaxed);
                     if skipped > 0 { tracing::warn!(skipped, "state snapshots skipped: output slot busy"); }

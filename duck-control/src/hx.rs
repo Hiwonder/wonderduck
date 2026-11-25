@@ -39,7 +39,7 @@ use crate::io::{
     ImuStale, IoError, JointTargets, ReadFeedback, Result, RobotIo, Sensors, SentGoals,
     ServoFeedback, SlowSensors,
 };
-use crate::model::{BAUD_RATE, DEFAULT_POSITION, IMU_DXL_ID, JOINT_IDS, NUM_JOINTS};
+use crate::model::{BAUD_RATE, DEFAULT_POSITION, IMU_DXL_ID, JOINT_IDS, MOUTH_INDEX, NUM_JOINTS};
 use crate::read_diagnostic::{ReadFailure, ReadFailureReason};
 
 const BROADCAST_ID: u8 = 0xfe;
@@ -211,6 +211,7 @@ pub struct HxIo {
     /// the torque-off request rather than relying on the Dynamixel-specific behavior of ignoring
     /// goals while torque is disabled.
     torque_enabled: Option<bool>,
+    limp_mouth_goal: Option<u16>,
     accessory_motion: AccessoryMotion,
     accessory_torque: bool,
     /// Maintenance can change motion shaping; restore it with the next new target.
@@ -245,6 +246,7 @@ impl HxIo {
             torque_enabled: None,
             accessory_motion: AccessoryMotion::default(),
             accessory_torque: false,
+            limp_mouth_goal: None,
             motion_restore_pending: false,
             record_feedback: false,
             unoq_feedback: std::env::var_os("WONDERDUCK_UNOQ_FEEDBACK").is_some_and(|v| v == "1"),
@@ -537,7 +539,16 @@ impl HxIo {
         let accessory = if on { Ok(()) } else { self.release_accessory_torque() };
         self.set_torque_ids(&HX_BUS_JOINT_IDS, on)?;
         accessory?;
+        self.limp_mouth_goal = None;
         self.torque_enabled = Some(on);
+        Ok(())
+    }
+
+    fn release_limp_mouth(&mut self) -> Result<()> {
+        if self.limp_mouth_goal.is_some() {
+            self.set_torque_ids(&[JOINT_IDS[MOUTH_INDEX]], false)?;
+            self.limp_mouth_goal = None;
+        }
         Ok(())
     }
 
@@ -1184,6 +1195,7 @@ impl RobotIo for HxIo {
                 return Err(IoError::Bus("motor bus is already released".into()));
             }
             self.release_accessory_torque()?;
+            self.release_limp_mouth()?;
             self.port.take();
             self.observation = None;
         } else {
@@ -1259,6 +1271,7 @@ impl RobotIo for HxIo {
 
     fn torque_release_verified(&self) -> bool {
         !self.status_unconfirmed && self.port.is_some() && self.torque_enabled == Some(false)
+            && self.limp_mouth_goal.is_none()
     }
 
     fn recover_device_bus(&mut self) -> Result<()> {
@@ -1392,6 +1405,30 @@ impl RobotIo for HxIo {
     fn write_positions_raw(&mut self, ids: &[u8], positions: &[u16]) -> Result<()> {
         validate_raw_joint_positions(ids, positions)?;
         self.diagnostic_write_positions(ids, positions)
+    }
+
+    fn write_limp_mouth(&mut self, opening: Option<f64>) -> Result<()> {
+        let Some(opening) = opening.filter(|_| self.torque_enabled != Some(true)
+            && !self.recovery_imu_pending && !self.status_unconfirmed)
+        else {
+            return self.release_limp_mouth();
+        };
+        let raw = encode_position(MOUTH_INDEX, crate::model::mouth_target(opening))?;
+        if self.limp_mouth_goal == Some(raw) {
+            return Ok(());
+        }
+        let [lo, hi] = raw.to_le_bytes();
+        // Mark torque as potentially enabled before sending, so an interrupted write
+        // still takes the release path. Only the jaw receives this command.
+        let id = JOINT_IDS[MOUTH_INDEX];
+        let result = self.sync_write_ids(TORQUE_ENABLE, 8, &[id],
+                                         &[vec![1, 0, lo, hi, 0, 0, 0, 0]]);
+        if result.is_ok() {
+            self.limp_mouth_goal = Some(raw);
+        } else {
+            self.limp_mouth_goal = Some(u16::MAX);
+        }
+        result
     }
 
     fn write_accessory_trigger(&mut self, pressure: u8) -> Result<()> {

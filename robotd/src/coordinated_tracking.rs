@@ -46,6 +46,110 @@ pub fn geometry() -> Result<&'static VisualKinematics, &'static VisualTrackingEr
     GEOMETRY.as_ref()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use duck_ipc_proto::MotionTrackingAction;
+
+    #[test]
+    fn person_search_waits_before_turning_and_resets_when_reacquired() {
+        let mut tracker = Tracker::with_home([0.0; 2]);
+        let mut history = FeedbackHistory::default();
+        let joints = [0.0; 4];
+        let limits = MotionLimits {
+            forward: [-0.3, 0.3],
+            lateral: [-0.25, 0.25],
+            yaw: [-1.0, 1.0],
+        };
+        let mut params = CoordinatedTrackingParams {
+            action: MotionTrackingAction::Update, initial_pitch: None, target: None,
+            camera: Some(TrackingCamera {
+                width: 1280, height: 960, rotate: 0,
+                fx: 1065.0, fy: 1065.0, cx: 640.0, cy: 480.0, distortion: [0.0; 5],
+            }),
+            head_deadzone: [0.05; 2], head_gains: [[1.0, 0.0, 0.0]; 2],
+            head_target_point: None, body_gains: [1.0, 0.0, 1.0],
+            final_body_gains: [0.0; 3], approach_linear_limit: None,
+            final_linear_limit: 0.1, final_lateral_limit: 0.1,
+            final_point: [160.0, 90.0], final_tolerance: [10.0; 2],
+            stop_area_px: Some(20000), stop_area_deadzone_px: 0,
+            stop_distance_mm: None, stop_distance_deadzone_mm: 0,
+            arrival_delay_s: 1.0, arrival_skill: String::new(),
+            mouth_before: Default::default(), mouth_after: Default::default(), pickup_after: None,
+        };
+        let geometry = geometry().unwrap();
+        tracker.step(geometry, &history, joints, params.clone(), SEARCH_WAIT - 0.01, limits).unwrap();
+        assert!(tracker.search.and_then(Search::person_turn).is_none());
+        tracker.step(geometry, &history, joints, params.clone(), 0.02, limits).unwrap();
+        assert_eq!(tracker.search.and_then(Search::person_turn), Some(0));
+        assert!(!tracker.confirm_person_search_turn());
+        tracker.step(geometry, &history, joints, params.clone(),
+            SEARCH_WAYPOINT_SECONDS + PERSON_SEARCH_TURN_PAUSE_SECONDS, limits).unwrap();
+        assert!(tracker.confirm_person_search_turn());
+
+        for stamp in [10, 30] {
+            history.push_with_orientation(stamp, joints, [1.0, 0.0, 0.0, 0.0]);
+            params.target = Some(VisualTrackingTarget {
+                point: [0.0; 2], area: 0.02, area_px: Some(1000), captured_at_unix_us: stamp,
+            });
+            let Step::Following { twist, .. } = tracker
+                .step(geometry, &history, joints, params.clone(), 0.02, limits).unwrap()
+            else {
+                panic!("expected an approach after reacquiring the target");
+            };
+            assert_ne!(twist, [0.0; 3]);
+            assert!(tracker.search.is_none());
+            assert!(!tracker.confirm_person_follow_motion(twist, twist));
+            let arrival_stamp = stamp + 10;
+            history.push_with_orientation(arrival_stamp, joints, [1.0, 0.0, 0.0, 0.0]);
+            params.target = Some(VisualTrackingTarget {
+                point: [0.0; 2], area: 0.02, area_px: Some(20000), captured_at_unix_us: arrival_stamp,
+            });
+            let Step::Following { twist: stopped, .. } = tracker
+                .step(geometry, &history, joints, params.clone(), 0.02, limits).unwrap()
+            else {
+                panic!("expected following to continue at the target distance");
+            };
+            assert_eq!(stopped, [0.0; 3]);
+            assert!(!tracker.confirm_person_follow_motion(stopped, twist));
+            assert!(tracker.confirm_person_follow_motion(stopped, stopped));
+            assert!(!tracker.confirm_person_follow_motion(stopped, stopped));
+
+            params.target = None;
+            tracker.step(geometry, &history, joints, params.clone(), SEARCH_WAIT - 0.01, limits).unwrap();
+            assert!(tracker.search.and_then(Search::person_turn).is_none());
+            tracker.step(geometry, &history, joints, params.clone(), 0.02, limits).unwrap();
+            assert_eq!(tracker.search.and_then(Search::person_turn), Some(0));
+            assert!(!tracker.confirm_person_search_turn());
+        }
+        tracker.reset();
+        assert!(!tracker.confirm_person_search_turn());
+    }
+
+    #[test]
+    fn person_search_calls_after_every_two_sent_turns() {
+        let mut tracker = Tracker::with_home([0.0; 2]);
+        tracker.search = Some(Search {
+            elapsed: SEARCH_WAIT, from: [0.0; 2], person_follow: true,
+            last_sent_turn: None, turns_since_call: 0,
+        });
+        for _ in 0..20 {
+            assert!(!tracker.confirm_person_search_turn());
+        }
+        let period = SEARCH_WAYPOINT_SECONDS + PERSON_SEARCH_TURN_PAUSE_SECONDS;
+        // Calls in the stop interval and repeated frames of a turn do not count.
+        tracker.search.as_mut().unwrap().elapsed = SEARCH_WAIT + SEARCH_WAYPOINT_SECONDS + 0.1;
+        assert!(!tracker.confirm_person_search_turn());
+        for turn in 1..=3 {
+            tracker.search.as_mut().unwrap().elapsed = SEARCH_WAIT + period * f64::from(turn) + 0.01;
+            assert_eq!(tracker.confirm_person_search_turn(), turn % 2 == 1);
+            assert!(!tracker.confirm_person_search_turn());
+        }
+        tracker.reset();
+        assert!(!tracker.confirm_person_search_turn());
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct Feedback {
     unix_us: u64,
@@ -217,6 +321,18 @@ impl Frame {
 struct Search {
     elapsed: f64,
     from: [f64; 2],
+    person_follow: bool,
+    last_sent_turn: Option<u64>,
+    turns_since_call: u8,
+}
+
+impl Search {
+    fn person_turn(self) -> Option<u64> {
+        let elapsed = self.elapsed - SEARCH_WAIT;
+        let period = SEARCH_WAYPOINT_SECONDS + PERSON_SEARCH_TURN_PAUSE_SECONDS;
+        (self.person_follow && elapsed >= 0.0 && elapsed % period < SEARCH_WAYPOINT_SECONDS)
+            .then(|| (elapsed / period).floor() as u64)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -310,10 +426,10 @@ pub struct Tracker {
     body_phase: Option<BodyPhase>,
     follow_stopped: bool,
     follow_settled: bool,
+    person_follow_moved: bool,
     follow_restart: Option<FollowRestart>,
     follow_area: Option<FollowArea>,
     final_point_filter: Option<FinalPointFilter>,
-    tof_distance_mm: Option<u32>,
     confirmation: Option<ArrivalConfirmation>,
     target_motion_settled: bool,
     home: [f64; 2],
@@ -365,7 +481,8 @@ impl Default for Tracker {
             target_rotation_since_capture_rad: None,
             last_twist: [0.0; 3], last_deadzone: [false; 3], search: None, body_phase: None,
             follow_stopped: false, follow_settled: false, follow_restart: None, follow_area: None,
-            final_point_filter: None, tof_distance_mm: None,
+            person_follow_moved: false,
+            final_point_filter: None,
             confirmation: None, target_motion_settled: true,
             home: [home[6], home[7]], arrival: None,
         }
@@ -375,6 +492,7 @@ impl Default for Tracker {
 // The reference miss loop sleeps for 10 ms in the branch and another 10 ms at its end.
 const SEARCH_WAIT: f64 = 2.02;
 const SEARCH_WAYPOINT_SECONDS: f64 = 1.0;
+const PERSON_SEARCH_TURN_PAUSE_SECONDS: f64 = 0.25;
 // A person already at the target should not restart for a single noisy detection frame.
 const FOLLOW_RESTART_CONFIRM_S: f64 = 0.3;
 const FOLLOW_AREA_FILTER_TAU_S: f64 = 0.2;
@@ -786,8 +904,6 @@ impl Tracker {
     }
 
     /// The caller supplies only a valid, fresh sensor reading; None selects image area.
-    pub fn set_tof_distance(&mut self, distance_mm: Option<u32>) { self.tof_distance_mm = distance_mm; }
-
     pub fn target_follow_diagnostic(&self) -> TargetFollowDiagnostic {
         TargetFollowDiagnostic {
             accepted_target: self.frame.map(|frame| frame.target),
@@ -818,9 +934,7 @@ impl Tracker {
         let window = FinalWindow::new(params.final_point, params.final_tolerance);
         PersonFollowDiagnostic {
             accepted_target: frame.map(|frame| frame.target),
-            distance_source: range.map(|_| {
-                if self.tof_distance_mm.is_some() && params.stop_distance_mm.is_some() { "tof" } else { "area" }
-            }),
+            distance_source: range.map(|_| "area"),
             distance_error: range.map(|(_, error)| error),
             distance_in_deadzone: range.map(|(reached, _)| reached),
             position_in_window: frame.map(|frame| [
@@ -835,33 +949,18 @@ impl Tracker {
         }
     }
 
-    fn tof_range(distance: u32, target: u32, deadzone: u32) -> (bool, f64) {
-        let difference = i64::from(distance) - i64::from(target);
-        let deadzone = i64::from(deadzone);
-        if difference.abs() <= deadzone {
-            (true, 0.0)
-        } else {
-            let outside = difference - difference.signum() * deadzone;
-            (false, outside as f64 / f64::from(target))
-        }
-    }
-
     fn follow_range(&self, params: &CoordinatedTrackingParams, frame: Frame) -> Option<(bool, f64)> {
         let stop_area = params.stop_area_px?;
-        if let (Some(distance), Some(target)) = (self.tof_distance_mm, params.stop_distance_mm) {
-            Some(Self::tof_range(distance, target, params.stop_distance_deadzone_mm))
+        let area = self.follow_area.filter(|_| params.stop_area_deadzone_px > 0)
+            .map(|area| area.value_px.round() as u64)
+            .unwrap_or_else(|| frame.target.area_px.expect("following targets require pixel area"));
+        let difference = i128::from(stop_area) - i128::from(area);
+        let deadzone = i128::from(params.stop_area_deadzone_px);
+        if difference.abs() <= deadzone {
+            Some((true, 0.0))
         } else {
-            let area = self.follow_area.filter(|_| params.stop_area_deadzone_px > 0)
-                .map(|area| area.value_px.round() as u64)
-                .unwrap_or_else(|| frame.target.area_px.expect("following targets require pixel area"));
-            let difference = i128::from(stop_area) - i128::from(area);
-            let deadzone = i128::from(params.stop_area_deadzone_px);
-            if difference.abs() <= deadzone {
-                Some((true, 0.0))
-            } else {
-                let outside = difference - difference.signum() * deadzone;
-                Some((false, outside as f64 / stop_area as f64))
-            }
+            let outside = difference - difference.signum() * deadzone;
+            Some((false, outside as f64 / stop_area as f64))
         }
     }
 
@@ -929,16 +1028,9 @@ impl Tracker {
         Step::Following { head, twist: [0.0; 3], deadzone: [true; 3] }
     }
 
-    /// Confirm departures from a settled stop, while reacting immediately to a very close ToF target.
+    /// Confirm departures from a settled stop with fresh camera frames.
     fn wait_for_follow_restart(&mut self, params: &CoordinatedTrackingParams, frame: Frame, error: f64, dt: f64) -> bool {
         if !self.follow_settled { return false; }
-        if let (Some(distance), Some(target)) = (self.tof_distance_mm, params.stop_distance_mm)
-            && distance.saturating_add(params.stop_distance_deadzone_mm.saturating_mul(2)) < target
-        {
-            self.follow_settled = false;
-            self.follow_restart = None;
-            return false;
-        }
         let window = FinalWindow::new(params.final_point, params.final_tolerance);
         let horizontal = frame.target.point[0] - window.goal[0];
         let direction = [
@@ -954,8 +1046,7 @@ impl Tracker {
             restart.fresh_frames = restart.fresh_frames.saturating_add(1);
         }
         restart.elapsed += dt;
-        let needs_camera_confirmation = direction[1] != 0 || (direction[0] != 0
-            && (self.tof_distance_mm.is_none() || params.stop_distance_mm.is_none()));
+        let needs_camera_confirmation = direction != [0, 0];
         if restart.elapsed >= FOLLOW_RESTART_CONFIRM_S && (!needs_camera_confirmation || restart.fresh_frames >= 2) {
             self.follow_settled = false;
             self.follow_restart = None;
@@ -996,6 +1087,29 @@ impl Tracker {
             Some(BodyPhase::Alignment) => Phase::FinalAlignment,
             None => Phase::WaitingTarget,
         }
+    }
+
+    pub fn confirm_person_search_turn(&mut self) -> bool {
+        let Some(search) = self.search.as_mut() else { return false; };
+        let Some(turn) = search.person_turn() else { return false; };
+        if search.last_sent_turn == Some(turn) { return false; }
+        search.last_sent_turn = Some(turn);
+        search.turns_since_call += 1;
+        if search.turns_since_call < 2 { return false; }
+        search.turns_since_call = 0;
+        true
+    }
+
+    /// Acknowledge one stop at the desired range after physically commanding a follow movement.
+    pub fn confirm_person_follow_motion(&mut self, requested: [f64; 3], applied: [f64; 3]) -> bool {
+        if self.frame.is_none() || self.search.is_some() {
+            return false;
+        }
+        if !self.follow_stopped && requested != [0.0; 3] && applied != [0.0; 3] {
+            self.person_follow_moved = true;
+        }
+        self.follow_settled && self.follow_stopped && self.follow_restart.is_none()
+            && applied == [0.0; 3] && std::mem::take(&mut self.person_follow_moved)
     }
 
     pub fn linear_limits(&self, params: &CoordinatedTrackingParams) -> [Option<f64>; 2] {
@@ -1228,6 +1342,7 @@ impl Tracker {
     fn search(&mut self, joints: [f64; 4], dt: f64, limits: MotionLimits, fixed_head: bool) -> Result<Step, Error> {
         self.confirmation = None;
         self.follow_stopped = false;
+        self.person_follow_moved = false;
         let elapsed = self.search.map_or(0.0, |search| search.elapsed) + dt;
         if !elapsed.is_finite() { return Err(Error::InvalidParameters); }
         let measured = [
@@ -1242,7 +1357,8 @@ impl Tracker {
             self.head_deadzone_target = None;
             self.final_prepositioning = false;
             self.final_point_filter = None;
-            self.search = Some(Search { elapsed: 0.0, from });
+            self.search = Some(Search { elapsed: 0.0, from, person_follow: fixed_head,
+                last_sent_turn: None, turns_since_call: 0 });
             self.head_target = Some(from);
             if fixed_head { self.follow_body.reset(); self.follow_restart = None; }
         }
@@ -1259,10 +1375,11 @@ impl Tracker {
         if fixed_head {
             self.follow_settled = false;
             self.follow_restart = None;
+            let turning = search.person_turn().is_some();
             return Ok(Step::Following {
                 head: self.head_target.expect("search head was initialized"),
-                twist: limits.scale(0.0, 0.0, -5.0 / REFERENCE_TURN_PEAK),
-                deadzone: [true, true, false],
+                twist: if turning { limits.scale(0.0, 0.0, -5.0 / REFERENCE_TURN_PEAK) } else { [0.0; 3] },
+                deadzone: [true, true, !turning],
             });
         }
 
@@ -1305,20 +1422,6 @@ impl Tracker {
             return Ok(step);
         }
         let Some(target) = params.target else {
-            if let (Some(_), Some(target_distance), Some(distance)) =
-                (params.stop_area_px, params.stop_distance_mm, self.tof_distance_mm)
-                && self.last_twist[0] != 0.0
-            {
-                // Without a target, a fresh range may only slow the previous motion.
-                let limits = limits.with_linear_limits([params.approach_linear_limit; 2]);
-                let (_, error) = Self::tof_range(distance, target_distance, params.stop_distance_deadzone_mm);
-                let forward = (params.body_gains[0] * error).clamp(limits.forward[0], limits.forward[1]);
-                let cap = minimum_body_speed([forward, 0.0, 0.0], limits)[0];
-                self.last_twist[0] = if cap.signum() == self.last_twist[0].signum() {
-                    self.last_twist[0].abs().min(cap.abs()).copysign(cap)
-                } else { 0.0 };
-                self.last_deadzone[0] = self.last_twist[0] == 0.0;
-            }
             return if params.camera.is_some() {
                 self.search(joints, dt, limits, params.stop_area_px.is_some())
             } else {
@@ -1389,7 +1492,7 @@ impl Tracker {
             }
         }
         let frame = next.frame.ok_or(Error::InvalidParameters)?;
-        // Person following uses its independent image/ToF controller unchanged.
+        // Person following uses its own image-area controller.
         // Color-target geometry needs capture and current orientation in one IMU epoch.
         let (target_ray, target_point) = if params.stop_area_px.is_none() {
             let Some(ray) = frame.ray_now(history) else { return Ok(self.hold(joints, true)); };

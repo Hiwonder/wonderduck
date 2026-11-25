@@ -22,8 +22,8 @@ struct Reading {
     distance_mm: Option<u32>,
     sensor_status: proto::DistanceSensorStatus,
     sampled_monotonic_ns: u64,
-    #[serde(default)]
-    raw_distance_mm: Option<u32>,
+    #[serde(rename = "raw_distance_mm")]
+    _raw_distance_mm: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -31,12 +31,11 @@ pub struct SensorConfig {
     pub hz: u32,
     pub timing_budget_ms: Option<u32>,
     pub signal_rate_limit: Option<f64>,
-    pub record_raw: bool,
 }
 
 impl Default for SensorConfig {
     fn default() -> Self {
-        Self { hz: 20, timing_budget_ms: None, signal_rate_limit: None, record_raw: false }
+        Self { hz: 20, timing_budget_ms: None, signal_rate_limit: None }
     }
 }
 
@@ -112,12 +111,6 @@ impl Shared {
         self.frame(now_ns).and_then(|(distance, _)| distance)
     }
 
-    /// Return only a fresh, explicitly valid measurement.
-    pub fn valid_distance(&self, now_ns: u64) -> Option<u32> {
-        let status = self.status(now_ns);
-        (status.sensor_status == proto::DistanceSensorStatus::Valid).then_some(status.distance_mm).flatten()
-    }
-
     fn sensor_status(reading: Option<&Reading>, now_ns: u64) -> proto::DistanceSensorStatus {
         use proto::DistanceSensorStatus as Status;
         let Some(reading) = reading else {
@@ -143,21 +136,10 @@ impl Shared {
     }
 
     pub fn status(&self, now_ns: u64) -> proto::ObstacleStatus {
-        self.status_with_sample_time(now_ns).0
-    }
-
-    /// Status and timestamp from the same sensor snapshot, for following diagnostics.
-    pub fn status_with_sample_time(&self, now_ns: u64) -> (proto::ObstacleStatus, Option<u64>) {
-        let (status, sampled_at, _) = self.status_with_raw(now_ns);
-        (status, sampled_at)
-    }
-
-    /// The status, sample time, and optional unfiltered reading come from one snapshot.
-    pub fn status_with_raw(&self, now_ns: u64) -> (proto::ObstacleStatus, Option<u64>, Option<u32>) {
         let params = self.params();
         let reading = self.reading.load();
         let reading = reading.as_deref();
-        (proto::ObstacleStatus {
+        proto::ObstacleStatus {
             distance_mm: reading
                 .and_then(|reading| Self::reading_frame(reading, now_ns))
                 .and_then(|(distance, _)| distance),
@@ -170,7 +152,7 @@ impl Shared {
             threshold_mm: params.threshold_mm,
             clear_delay_ms: params.clear_delay_ms,
             active: params.enabled && self.active.load(Ordering::Relaxed),
-        }, reading.map(|reading| reading.sampled_monotonic_ns), reading.and_then(|reading| reading.raw_distance_mm))
+        }
     }
 }
 
@@ -258,7 +240,6 @@ async fn run_sensor_at(shared: Arc<Shared>, launcher: &Path, config: SensorConfi
         .kill_on_drop(true);
     if let Some(ms) = config.timing_budget_ms { command.arg("--timing-budget-ms").arg(ms.to_string()); }
     if let Some(rate) = config.signal_rate_limit { command.arg("--signal-rate-limit").arg(rate.to_string()); }
-    if config.record_raw { command.arg("--include-raw"); }
     tracing::info!(?config, "single-zone distance sensor configured");
     #[cfg(target_os = "linux")]
     {

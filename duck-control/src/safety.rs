@@ -315,6 +315,10 @@ impl<T: RobotIo> Safety<T> {
         self.io.write_positions_raw(ids, positions)
     }
 
+    pub fn write_limp_mouth(&mut self, opening: Option<f64>) -> Result<(), IoError> {
+        self.io.write_limp_mouth(opening)
+    }
+
     pub fn write_accessory_trigger(&mut self, pressure: u8) -> Result<(), IoError> {
         self.io.write_accessory_trigger(pressure)
     }

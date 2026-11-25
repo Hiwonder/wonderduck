@@ -258,15 +258,19 @@ impl PadParams {
 /// path cannot produce at all, and a pipeline that will not start costs the WebRTC *control*
 /// channel along with the video, because the two are bundled (`remote-webrtc.md`).
 ///
-/// So the ladder is fixed, and every rung is 16:9 — the sensor's own aspect. A mode that changed
-/// the shape of the picture would be cropping or squashing rather than lowering quality, which is
-/// not what anybody picking "smaller" is asking for.
+/// Each mode specifies both the delivery geometry and its capture rate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Quality {
     /// The sensor's full frame. The most detail, and the rung least likely to hold 30 fps on
     /// this ISP path — [`MediaParams`] says what is measured and what is not.
     #[serde(rename = "1080p30")]
     Q1080p30,
+    /// Full-field 4:3 output from the IMX219 binned readout on RK3566.
+    #[serde(rename = "960p30")]
+    Q960p30,
+    /// Full-width 4:3 output from the IMX219 full-array readout on RK3566.
+    #[serde(rename = "960p21")]
+    Q960p21,
     /// What every measurement in `mediad` was taken at, and the default.
     #[default]
     #[serde(rename = "720p30")]
@@ -283,12 +287,14 @@ pub enum Quality {
 ///
 /// One list, so the registry's choices, the file's values and [`Quality`] itself cannot disagree;
 /// [`tests::every_quality_label_round_trips`] pins it to the enum in both directions.
-pub const QUALITY_LABELS: &[&str] = &["1080p30", "720p30", "720p15", "360p30"];
+pub const QUALITY_LABELS: &[&str] = &["1080p30", "960p30", "960p21", "720p30", "720p15", "360p30"];
 
 impl Quality {
     /// The modes, in [`QUALITY_LABELS`] order.
-    pub const ALL: [Quality; 4] = [
+    pub const ALL: [Quality; 6] = [
         Quality::Q1080p30,
+        Quality::Q960p30,
+        Quality::Q960p21,
         Quality::Q720p30,
         Quality::Q720p15,
         Quality::Q360p30,
@@ -298,17 +304,19 @@ impl Quality {
     pub fn label(self) -> &'static str {
         match self {
             Quality::Q1080p30 => "1080p30",
+            Quality::Q960p30 => "960p30",
+            Quality::Q960p21 => "960p21",
             Quality::Q720p30 => "720p30",
             Quality::Q720p15 => "720p15",
             Quality::Q360p30 => "360p30",
         }
     }
 
-    /// Frame size in pixels. Every rung is 16:9 and every dimension is a multiple of 8, which
-    /// is what the ISP's scaler and the encoder's macroblocks both want.
+    /// Frame size in pixels aligned for the ISP and encoder.
     pub fn size(self) -> (u32, u32) {
         match self {
             Quality::Q1080p30 => (1920, 1080),
+            Quality::Q960p30 | Quality::Q960p21 => (1280, 960),
             Quality::Q720p30 | Quality::Q720p15 => (1280, 720),
             Quality::Q360p30 => (640, 360),
         }
@@ -324,6 +332,7 @@ impl Quality {
 
     pub fn fps(self) -> u32 {
         match self {
+            Quality::Q960p21 => 21,
             Quality::Q720p15 => 15,
             _ => 30,
         }
@@ -338,6 +347,8 @@ impl Quality {
     pub fn default_bitrate(self) -> u32 {
         match self {
             Quality::Q1080p30 => 4_000_000,
+            Quality::Q960p30 => 2_700_000,
+            Quality::Q960p21 => 2_000_000,
             Quality::Q720p30 => 2_000_000,
             Quality::Q720p15 => 1_000_000,
             Quality::Q360p30 => 800_000,

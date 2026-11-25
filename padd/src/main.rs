@@ -461,7 +461,7 @@ fn pad_neutral(pad: &gilrs::Gamepad<'_>, deadzone: f64, head_drive: bool, r2: u8
             .iter()
             .all(|button| {
                 pad.button_data(*button)
-                    .is_none_or(|data| data.value() <= 0.2)
+                    .is_none_or(|data| f64::from(data.value()) < proto::mouth_gesture::PRESSURE_START)
             })
 }
 
@@ -677,6 +677,7 @@ fn run_session(
     let mut center_sticks = false;
     let mut rest_rearm_required = false;
     let mut pick_mouth = PickMouth::default();
+    let mut mouth_gesture = proto::mouth_gesture::MouthGesture::default();
     // The continuous intents, and the buffer this tick's are built in. Both live across
     // ticks so a steady state neither allocates nor re-sends — see [`Continuous`].
     let mut continuous = Continuous::default();
@@ -786,6 +787,7 @@ fn run_session(
             // "The pad went away" is the single most useful line in the journal when the robot
             // stops responding mid-drive, and one line per tick would bury it.
             pick_mouth.cancel();
+            mouth_gesture.cancel();
             gate.expire(Instant::now());
             let cancellation = reset_precision(
                 &mut precision,
@@ -863,9 +865,10 @@ fn run_session(
         if start_action == Some(StartAction::Rest) {
             gate.expire(Instant::now());
             if gate.driving() {
-                if pick_mouth.cancel()
-                    && let Err(error) = notify(&mut stream, &proto::Call::RobotMouth(proto::MouthParams::default()))
-                {
+                pick_mouth.cancel();
+                mouth_gesture.cancel();
+                let close = proto::Call::RobotMouth(proto::MouthParams::default());
+                if let Err(error) = notify(&mut stream, &close) {
                     tracing::error!(%error, "closing mouth before rest failed");
                     return std::process::ExitCode::FAILURE;
                 }
@@ -977,6 +980,7 @@ fn run_session(
         }
         if !gate.driving() {
             pick_mouth.cancel();
+            mouth_gesture.cancel();
             if let Some(precision) = precision.as_mut() {
                 precision.reset();
                 precision.awaiting_completion = false;
@@ -1099,14 +1103,10 @@ fn run_session(
 
         // An accepted pick opens and closes the mouth; L2 can take over manually.
         let lt = pad.button_data(Button::LeftTrigger2).map(|d| d.value()).unwrap_or(0.0) as f64;
-        let mouth = pick_mouth.output(Instant::now(), lt);
-        if let Err(e) = notify(
-            &mut stream,
-            &proto::Call::RobotMouth(proto::MouthParams { open: mouth }),
-        ) {
-            tracing::error!(error = %e, "send failed");
-            return std::process::ExitCode::FAILURE;
-        }
+        let now = Instant::now();
+        let mouth = pick_mouth.output(now, lt);
+        mouth_gesture.update(lt, true, now);
+        let press_sound = mouth_gesture.take_press(now, period);
 
         let walk_drive = walking_limits(&drive, &args, args.max_linear.max(0.0), args.max_angular.max(0.0));
         let limits = DriveLimits {
@@ -1136,6 +1136,11 @@ fn run_session(
             &walk_drive,
             roller,
         )));
+        frame.push(proto::Call::RobotMouth(proto::MouthParams {
+            open: mouth,
+            repeat_sound: mouth_gesture.repeating(now),
+        }));
+        frame.extend(press_sound.map(proto::Call::RobotSound));
 
         if head_drive {
             let head = imu_head_pose.unwrap_or(proto::HeadParams {

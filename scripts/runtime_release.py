@@ -68,9 +68,8 @@ MEDIA_ROOT = 'media-runtime-candidate'
 ONNX_RUNTIME = 'onnxruntime-linux-aarch64-1.28.0'
 OBJECT_MODEL = 'models/object-detection.rknn'
 RKNN_RUNTIME = 'models/librknnrt.so'
-STARTUP_SOUND = 'target/prompt-sounds/startup.wav'
-LOW_BATTERY_SOUND = 'target/prompt-sounds/low_battery.wav'
-SOUND_COMPONENTS = (STARTUP_SOUND, LOW_BATTERY_SOUND)
+SOUND_FILES = ('startup.wav', 'low_battery.wav') + tuple('duck%d.wav' % i for i in range(1, 17))
+SOUND_COMPONENTS = tuple('target/prompt-sounds/' + name for name in SOUND_FILES)
 COMPONENTS = (ROBOTD, PADD, WEBPADD, STUDIO_WEB, MEDIA_ROOT, ONNX_RUNTIME, OBJECT_MODEL, RKNN_RUNTIME) + SOUND_COMPONENTS
 DIRECTORIES = frozenset((STUDIO_WEB, MEDIA_ROOT, ONNX_RUNTIME))
 MEDIA_COMPONENTS = tuple('media-runtime-candidate/' + name for name in
@@ -230,12 +229,12 @@ def package(args):
         if main_revision.encode('ascii') not in path.read_bytes():
             raise ValueError('程序未嵌入当前源码版本，请重新构建：' + str(path))
     require_studio_web(web)
+    sounds_source = root / 'assets/prompt-sounds'
     for file in (assets / 'models/object-detection.rknn',
                  assets / 'models/librknnrt.so',
                  assets / 'onnxruntime-linux-aarch64-1.28.0/lib/libonnxruntime.so.1.28.0',
                  root / MEDIA_RUN_SOURCE,
-                 root / 'assets/prompt-sounds/startup.wav',
-                 root / 'assets/prompt-sounds/low_battery.wav'):
+                 *(sounds_source / name for name in SOUND_FILES)):
         if not file.is_file():
             raise ValueError('缺少运行资源：' + str(file))
     require_arm64(assets / 'models/librknnrt.so')
@@ -267,8 +266,8 @@ def package(args):
             shutil.copy2(assets / 'models' / name, payload / 'models' / name)
         sounds = payload / 'target/prompt-sounds'
         sounds.mkdir(parents=True, exist_ok=True)
-        for name in ('startup.wav', 'low_battery.wav'):
-            shutil.copy2(root / 'assets/prompt-sounds' / name, sounds / name)
+        for name in SOUND_FILES:
+            shutil.copy2(sounds_source / name, sounds / name)
         archive = output / ARCHIVE_NAME
         with tarfile.open(str(archive), 'w:gz', compresslevel=4) as tar:
             tar.add(str(payload), arcname='payload', recursive=True)

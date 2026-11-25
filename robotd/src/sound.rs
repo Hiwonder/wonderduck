@@ -38,12 +38,23 @@ use std::time::{Duration, Instant};
 
 use sounds::{Personality, Stream};
 
-use crate::intents::WheeeHold;
+use crate::intents::{SoundHold, WheeeHold};
 use clip::{Clip, block_sigpipe};
 
 /// How long the blocking goodbye peck may hold up the power-off. The longest bank sound is
 /// well under a second; this is a ceiling on a wedged PCM, not a playback budget.
 const BLOCKING_PLAY_MAX: Duration = Duration::from_millis(1500);
+const MOUTH_CLIP_COUNT: usize = 16;
+const MOUTH_SOUND_DIR: &str = "target/prompt-sounds";
+
+pub(crate) fn mouth_sound_setting(path: &Path) -> Option<bool> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .ok()?.get("enabled")?.as_bool(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(true),
+        Err(_) => None,
+    }
+}
 
 /// Audio block the theremin writer renders at a time: 10 ms.
 ///
@@ -188,6 +199,10 @@ pub struct Sound {
     /// `Some(None)` once it has been asked for and there is no seed to be had.
     personality: Option<Option<Personality>>,
     clip: Option<Clip>,
+    last_mouth_clip: Option<usize>,
+    next_mouth_repeat: Option<Instant>,
+    mouth_enabled: bool,
+    mouth_playing: bool,
 }
 
 impl Sound {
@@ -205,6 +220,10 @@ impl Sound {
             singing: None,
             personality: None,
             clip: None,
+            last_mouth_clip: None,
+            next_mouth_repeat: None,
+            mouth_enabled: true,
+            mouth_playing: false,
         }
     }
 
@@ -239,6 +258,7 @@ impl Sound {
     /// Stop whatever is on the PCM, now. The ride's abrupt exit, and what every one-shot
     /// does to its predecessor.
     fn stop_child(&mut self) {
+        self.mouth_playing = false;
         self.wheee_held.store(false, Ordering::Relaxed);
         // A theremin writer blocked in `write_all` on a pipe whose reader is about to die
         // needs telling as well: clearing this is what gets it out of its loop, and the
@@ -288,6 +308,12 @@ impl Sound {
     /// Play a voice-bank sound, cutting off any still-playing one. `blocking` waits for
     /// playback — used right before poweroff so the goodbye peck is heard.
     pub fn play(&mut self, tag: &str, blocking: bool) {
+        if tag == "mouth" {
+            if self.mouth_enabled && self.ride == Ride::Off {
+                self.play_mouth_clip();
+            }
+            return;
+        }
         // A ride owns the single-client PCM for as long as it lasts. Cutting it for a
         // 200 ms chirp would restart the wheee from its start segment on every press of the
         // other trigger — and holding both triggers is the expected way to use them, since
@@ -323,6 +349,70 @@ impl Sound {
             Ok(mut c) if blocking => wait_bounded(&mut c, BLOCKING_PLAY_MAX),
             Ok(c) => self.child = Some(c),
             Err(e) => tracing::warn!(error = %e, tag, "audio player failed"),
+        }
+    }
+
+    pub fn update_hold(&mut self, hold: SoundHold) {
+        match hold {
+            SoundHold::Wheee(hold) => {
+                self.release_clip();
+                self.wheee(hold);
+            }
+            SoundHold::Clip(name) => self.hold_clip(name),
+        }
+    }
+
+    pub fn repeat_mouth_if_idle(&mut self, held: bool, now: Instant) {
+        if !held || !self.mouth_enabled {
+            self.next_mouth_repeat = None;
+            return;
+        }
+        if self.ride != Ride::Off
+            || self.next_mouth_repeat.is_some_and(|next| now < next)
+            || self.child.as_mut().is_some_and(|child| !matches!(child.try_wait(), Ok(Some(_))))
+        {
+            return;
+        }
+        // Bound retries if the audio player exits immediately or fails to start.
+        self.next_mouth_repeat = Some(now + Duration::from_millis(150));
+        self.play_mouth_clip();
+    }
+
+    pub fn set_mouth_enabled(&mut self, enabled: bool) {
+        self.mouth_enabled = enabled;
+        if !enabled && self.mouth_playing {
+            self.stop_child();
+        }
+    }
+
+    fn play_mouth_clip(&mut self) {
+        self.stop_child();
+        let choices = MOUTH_CLIP_COUNT - usize::from(self.last_mouth_clip.is_some());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |time| time.subsec_nanos() as usize);
+        let mut index = 1 + nanos % choices;
+        if self.last_mouth_clip.is_some_and(|last| index >= last) {
+            index += 1;
+        }
+        let wav = Path::new(MOUTH_SOUND_DIR).join(format!("duck{index}.wav"));
+        // Explicit ALSA buffering bypasses the board player's announcement pre-roll.
+        let child = self
+            .player_command()
+            .args(["-q", "-D", &self.device, "--buffer-time=120000"])
+            .arg(&wav)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn();
+        match child {
+            Ok(child) => {
+                self.last_mouth_clip = Some(index);
+                self.mouth_playing = true;
+                self.child = Some(child);
+                tracing::debug!(path = %wav.display(), "mouth sound");
+            }
+            Err(error) => tracing::warn!(%error, path = %wav.display(), "cannot start mouth sound"),
         }
     }
 

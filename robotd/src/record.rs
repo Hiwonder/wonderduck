@@ -340,7 +340,6 @@ pub struct PersonFollowSample {
     pub tracking_stopped: bool,
     pub deadzone: [bool; 3],
     pub settings: PersonFollowSettings,
-    pub tof: PersonFollowTof,
     pub decision: crate::coordinated_tracking::PersonFollowDiagnostic,
 }
 
@@ -399,24 +398,9 @@ impl From<&duck_ipc_proto::CoordinatedTrackingParams> for TargetFollowSettings {
 }
 
 #[derive(Debug, Serialize)]
-pub struct PersonFollowTof {
-    pub observed_at_t_ns: u64,
-    pub sampled_t_ns: Option<u64>,
-    /// Unfiltered VL53L0X result, present only for person-follow recording.
-    pub raw_distance_mm: Option<u32>,
-    pub distance_mm: Option<u32>,
-    pub sensor_status: duck_ipc_proto::DistanceSensorStatus,
-    /// False means the controller was not eligible to use the reading this tick.
-    pub supplied_to_tracker: bool,
-    pub obstacle_assistance_active: bool,
-}
-
-#[derive(Debug, Serialize)]
 pub struct PersonFollowSettings {
     pub stop_area_px: Option<u64>,
     pub area_deadzone_px: u64,
-    pub stop_distance_mm: Option<u32>,
-    pub distance_deadzone_mm: u32,
     pub goal_px: [f64; 2],
     pub tolerance_px: [f64; 2],
     pub body_gains: [f64; 3],
@@ -428,8 +412,6 @@ impl From<&duck_ipc_proto::CoordinatedTrackingParams> for PersonFollowSettings {
         Self {
             stop_area_px: params.stop_area_px,
             area_deadzone_px: params.stop_area_deadzone_px,
-            stop_distance_mm: params.stop_distance_mm,
-            distance_deadzone_mm: params.stop_distance_deadzone_mm,
             goal_px: params.final_point,
             tolerance_px: params.final_tolerance,
             body_gains: params.body_gains,

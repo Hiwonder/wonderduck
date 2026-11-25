@@ -21,7 +21,7 @@ MAIN_DATA = (
     'calibrations', 'records', 'actions', 'action-groups', 'exports',
     'pet-detect/models', 'deploy/calibration', 'deploy/imu-pose-standing.json',
 )
-STUDIO_DATA = ('console/actions', 'console/action-groups', 'console/calibrations',
+STUDIO_DATA = ('console/actions', 'console/action-groups', 'console/offset-profiles', 'console/calibrations',
                'console/servo-layout.json')
 VERSION = re.compile(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\Z')
 DEVELOPMENT_VERSION = re.compile(

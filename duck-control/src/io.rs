@@ -397,6 +397,11 @@ pub trait RobotIo {
         Err(IoError::Bus("raw servo position write is unsupported".into()))
     }
 
+    /// Drive only the jaw while the other joints are released, or release the jaw.
+    fn write_limp_mouth(&mut self, _opening: Option<f64>) -> Result<()> {
+        Ok(())
+    }
+
     /// Apply the optional accessory servos' gamepad pressure.
     fn write_accessory_trigger(&mut self, _pressure: u8) -> Result<()> {
         Ok(())

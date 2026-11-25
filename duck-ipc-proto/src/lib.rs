@@ -2403,6 +2403,9 @@ pub struct LowVoltageStatus {
     /// Continuous time below the threshold; absent when normal or not sampled recently.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub low_for_ms: Option<u64>,
+    /// Audible low-voltage warning, after one second of continuous low voltage.
+    #[serde(default)]
+    pub warning_active: bool,
     /// Latched once the protection has requested its sit-and-release sequence.
     #[serde(default)]
     pub triggered: bool,
@@ -2592,9 +2595,11 @@ pub struct CoordinatedTrackingParams {
     pub stop_area_px: Option<u64>,
     /// Half-width of the pixel-area following deadzone, in pixels squared.
     pub stop_area_deadzone_px: u64,
-    /// Desired ToF distance in millimetres for continuous following. None uses pixel area alone.
+    /// Legacy wire field for interoperability with older daemons.
+    #[serde(default)]
     pub stop_distance_mm: Option<u32>,
-    /// Half-width of the ToF following deadzone, in millimetres.
+    /// Legacy wire field for interoperability with older daemons.
+    #[serde(default)]
     pub stop_distance_deadzone_mm: u32,
     /// Arrival delay in seconds.
     pub arrival_delay_s: f64,
@@ -2632,8 +2637,6 @@ impl CoordinatedTrackingParams {
                     && (self.stop_area_px.is_none() || target.area_px.is_some())
             })
             && self.stop_area_px.is_none_or(|area| area > 0)
-            && self.stop_distance_mm.is_none_or(|distance| distance > 0)
-            && (self.stop_distance_mm.is_none() || self.stop_area_px.is_some())
             && self.head_deadzone.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.head_gains.iter().flatten().all(|value| value.is_finite())
             && self.head_target_point.is_none_or(valid_tracking_image_point)
@@ -2725,6 +2728,8 @@ pub struct LookResult {
     pub clamped: bool,
 }
 
+pub mod mouth_gesture;
+
 /// A voice-bank tag — what kind of sound, not which file: the robot picks a random
 /// variant per play, which is what keeps the duck from sounding like a stuck recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2744,6 +2749,8 @@ pub enum SoundTag {
     Coo,
     /// The held joy ride: start → loop while held → end.
     Wheee,
+    /// A random mouth sound from the robot’s prompt sounds.
+    Mouth,
 }
 
 impl SoundTag {
@@ -2757,6 +2764,7 @@ impl SoundTag {
             SoundTag::Chirp => "chirp",
             SoundTag::Coo => "coo",
             SoundTag::Wheee => "wheee",
+            SoundTag::Mouth => "mouth",
         }
     }
 }
@@ -2766,9 +2774,9 @@ impl SoundTag {
 #[serde(deny_unknown_fields)]
 pub struct SoundParams {
     pub tag: SoundTag,
-    /// Only meaningful for [`SoundTag::Wheee`]: `Some(true)` starts/keeps the ride,
-    /// `Some(false)` releases it. The hold decays on its own if the trues stop arriving,
-    /// so a client that dies mid-ride does not leave the robot going "wheee" forever.
+    /// Omit for one-shot sounds, including [`SoundTag::Mouth`].
+    /// For [`SoundTag::Wheee`], true or omission starts the ride and false releases it.
+    /// Held sounds expire when their refreshes stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold: Option<bool>,
 }
@@ -2927,6 +2935,9 @@ impl Default for PoseParams {
 pub struct MouthParams {
     /// 0 closed, 1 fully open. Clamped by the robot.
     pub open: f64,
+    /// Request another mouth sound when playback becomes idle while this intent is refreshed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub repeat_sound: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

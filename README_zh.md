@@ -86,7 +86,7 @@ git ls-files scripts/ assets/prompt-sounds/network/ | rsync -a --files-from=- ./
 git -C extensions/wonderduck_studio ls-files console/ webpadd/web/ | rsync -a --files-from=- extensions/wonderduck_studio/ "${robot}:/home/wonderduck/wonderduck/extensions/wonderduck_studio/"
 rsync -a extensions/wonderduck_studio/console/web/build/ "${robot}:/home/wonderduck/wonderduck/extensions/wonderduck_studio/console/web/build/"
 scp target/aarch64-unknown-linux-gnu/release/{robotd,padd,robotctl} extensions/wonderduck_studio/webpadd/target/aarch64-unknown-linux-gnu/release/webpadd "${robot}:/home/wonderduck/wonderduck/target/release/"
-scp assets/prompt-sounds/{startup,low_battery}.wav "${robot}:/home/wonderduck/wonderduck/target/prompt-sounds/"
+scp assets/prompt-sounds/*.wav "${robot}:/home/wonderduck/wonderduck/target/prompt-sounds/"
 ssh "$robot" 'sudo systemctl restart wonderduck-prompt-sounds && sudo systemctl start robotd'
 )
 ```
@@ -162,7 +162,7 @@ test -s "$build/web/debug.html"
 sudo systemctl stop robotd
 install -m 0755 "$build"/release/{robotd,padd,robotctl,webpadd} target/release/
 rsync -a --delete "$build/web/" extensions/wonderduck_studio/console/web/build/
-install -m 0644 assets/prompt-sounds/{startup,low_battery}.wav target/prompt-sounds/
+install -m 0644 assets/prompt-sounds/*.wav target/prompt-sounds/
 sudo systemctl restart wonderduck-prompt-sounds
 sudo systemctl start robotd
 systemctl is-active robotd

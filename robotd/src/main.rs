@@ -1064,6 +1064,7 @@ struct RobotState {
     /// paired with the ceiling from a different sample would describe a board that never
     /// existed. `None` until the first sample, and forever on a board with no `cpufreq` sysfs.
     cpu_throttle: ArcSwapOption<proto::CpuThrottle>,
+    mouth_sound_enabled: AtomicBool,
     /// Mirrors of the bus's own IMU diagnostics, refreshed with the thermal sample. Held here
     /// so the IPC side can report them without touching the loop's IO.
     imu_stale_blocks: AtomicU64,
@@ -1261,6 +1262,7 @@ impl RobotState {
             motor_hottest: AtomicU32::new(0),
             cpu_temp_c: AtomicU64::new(0),
             cpu_throttle: ArcSwapOption::empty(),
+            mouth_sound_enabled: AtomicBool::new(true),
             imu_stale_blocks: AtomicU64::new(0),
             imu_stale_run: AtomicU64::new(0),
             imu_ready: AtomicBool::new(false),
@@ -1765,6 +1767,7 @@ async fn main() -> ExitCode {
     state.obstacle = Arc::new(obstacle::Shared::new(tof_enabled));
     state.status_bus_fault.store(status_fault_at_startup, Ordering::Release);
     state.low_voltage_lock = low_voltage_lock;
+    state.low_voltage.use_prompt_marker = physical_status_bus;
     state.startup_voltage_ready.store(!requires_voltage_recovery, Ordering::Relaxed);
     state.startup_read_only.store(requires_voltage_recovery, Ordering::Relaxed);
     state.status_journal = status_journal.clone();
@@ -1876,7 +1879,7 @@ async fn main() -> ExitCode {
     let camera = camera_enabled.then(|| camera_process::CameraSupervisor::start(args.with_camera));
     let sensor = obstacle::start_sensor(sensor_enabled && tof_enabled, Arc::clone(&state.obstacle), obstacle::SensorConfig {
         hz: args.tof_hz, timing_budget_ms: args.tof_timing_budget_ms,
-        signal_rate_limit: args.tof_signal_rate_limit, record_raw: args.record_person_follow,
+        signal_rate_limit: args.tof_signal_rate_limit,
     });
     let start_web = || {
         match web_process::WebProcess::start(&args.socket, &params_path, args.record.as_deref(),
@@ -2819,6 +2822,13 @@ impl RobotIo for BusIo {
         match self {
             Self::Dynamixel(io) => RobotIo::write_positions_raw(io, ids, positions),
             Self::Hx(io) => RobotIo::write_positions_raw(io, ids, positions),
+        }
+    }
+
+    fn write_limp_mouth(&mut self, opening: Option<f64>) -> duck_control::io::Result<()> {
+        match self {
+            Self::Hx(io) => io.write_limp_mouth(opening),
+            Self::Dynamixel(_) => Ok(()),
         }
     }
 
@@ -4926,6 +4936,8 @@ async fn control_loop<T: RobotIo>(
     let mut target_head_rate = target_follow_stability::HeadRate::default();
     let mut target_geometry_missing = false;
     let mut coordinated_mouth = coordinated_mouth::Sequence::default();
+    let mut person_loss_mouth: Option<(u64, Option<Instant>)> = None;
+    let mut mouth_close_until = None;
     let mut coordinated_initial_head = coordinated_tracking::InitialHead::default();
     let mut coordinated_tracking_sequence = None;
     let mut pickup_action_completed = None;
@@ -5354,11 +5366,9 @@ async fn control_loop<T: RobotIo>(
             safety.reset_fall();
             state.fallen.store(false, Ordering::Relaxed);
             if let Some(voice) = voice.as_mut() {
+                voice.set_mouth_enabled(state.mouth_sound_enabled.load(Ordering::Relaxed));
                 voice.theremin_settle();
-                match intents.sound_hold() {
-                    intents::SoundHold::Wheee(hold) => { voice.release_clip(); voice.wheee(hold); }
-                    intents::SoundHold::Clip(name) => voice.hold_clip(name),
-                }
+                voice.update_hold(intents.sound_hold());
                 for tag in intents.take_sounds() { voice.play(tag.as_str(), false); }
                 if let Some(name) = intents.take_sound_clip() { voice.play_clip(Arc::from(name.as_str())); }
                 voice.poll_clip();
@@ -5529,6 +5539,10 @@ async fn control_loop<T: RobotIo>(
             && shutdown_sit.is_none() && shutdown_rest.is_none() && !powered_off
             && safety.supports_individual_device_observation()
         {
+            if let Err(error) = safety.write_limp_mouth(None) {
+                tracing::warn!(%error, "cannot release jaw before observing the motor bus");
+                continue;
+            }
             // Stop before the normal control read in this very tick. The next
             // tick will read only individual devices while the guard is active.
             if let Err(error) = status_bus::begin_session(&state.status_journal) {
@@ -5845,7 +5859,6 @@ async fn control_loop<T: RobotIo>(
         let mut tracking_deadzone = [false; 3];
         let mut coordinated_head = None;
         let mut coordinated_eligible = false;
-        let mut follow_tof_sample = None;
         let mut maze_head = None;
         let mut maze_immediate_stop = false;
         let mut maze_wait_reason = None;
@@ -6039,16 +6052,6 @@ async fn control_loop<T: RobotIo>(
                 if tracking.params.stop_area_px.is_none() {
                     coordinated_tracker.set_target_motion_settled(
                         target_follow_motion_settled(twist_ema, sensors.imu.gyro));
-                }
-                let now_ns = proto::clock::monotonic_ns();
-                if recorder.is_some() && tracking.params.stop_area_px.is_some() {
-                    let (status, sampled_ns, raw) = state.obstacle.status_with_raw(now_ns);
-                    let valid_distance = (status.sensor_status == proto::DistanceSensorStatus::Valid)
-                        .then_some(status.distance_mm).flatten();
-                    coordinated_tracker.set_tof_distance(valid_distance);
-                    follow_tof_sample = Some((now_ns, status, sampled_ns, raw));
-                } else {
-                    coordinated_tracker.set_tof_distance(state.obstacle.valid_distance(now_ns));
                 }
                 let output = coordinated_initial_head.step(joints, elapsed)
                     .map_err(|error| error.to_string())
@@ -6494,19 +6497,14 @@ async fn control_loop<T: RobotIo>(
 
         // Held sounds own the PCM ahead of one-shots, including custom clips.
         if let Some(voice) = voice.as_mut() {
+            voice.set_mouth_enabled(state.mouth_sound_enabled.load(Ordering::Relaxed));
             let hold = if powered_off {
                 intents::SoundHold::Wheee(intents::WheeeHold::Released)
             } else {
                 intents.sound_hold()
             };
             voice.theremin_settle();
-            match hold {
-                intents::SoundHold::Wheee(hold) => {
-                    voice.release_clip();
-                    voice.wheee(hold);
-                }
-                intents::SoundHold::Clip(name) => voice.hold_clip(name),
-            }
+            voice.update_hold(hold);
             for tag in intents.take_sounds() {
                 voice.play(tag.as_str(), false);
             }
@@ -6514,6 +6512,13 @@ async fn control_loop<T: RobotIo>(
                 voice.play_clip(Arc::from(name.as_str()));
             }
             voice.poll_clip();
+            voice.repeat_mouth_if_idle(
+                !powered_off && !status_page_active && maintenance.is_none()
+                    && shutdown_sit.is_none() && shutdown_rest.is_none()
+                    && !state.stopping.load(Ordering::Acquire) && !state.low_voltage_lock.requires_rearm()
+                    && intents.mouth_sound_repeating(),
+                tick_start,
+            );
 
             // Petting: coo, exactly when the prototype coos — not fallen, no scripted move
             // in flight. The verdict is used bare here (not the armed fall gate): this is a
@@ -7870,7 +7875,7 @@ async fn control_loop<T: RobotIo>(
                 target_keep_walking, target_lateral_release, policy_twist));
         }
         let manual_command = PolicyCommand { twist: policy_twist, ..PolicyCommand::default() };
-        let avoidance_eligible = !unsafe_motion && snapshot.maze.is_none()
+        let avoidance_eligible = !unsafe_motion && !person_follow && snapshot.maze.is_none()
             && driving
             && controller.as_ref().is_some_and(|controller| controller.walks_for(&manual_command));
         let mut assisted_twist = obstacle_assistance.apply(
@@ -8487,13 +8492,37 @@ async fn control_loop<T: RobotIo>(
             }
         }
 
+        // A manual jaw request can operate without the walking policy. After the
+        // operator releases it, allow time to close before releasing its torque.
+        let jaw_available = state.startup_voltage_ready.load(Ordering::Acquire)
+            && !state.low_voltage_lock.requires_rearm()
+            && !status_page_active && maintenance.is_none()
+            && shutdown_sit.is_none() && shutdown_rest.is_none() && !powered_off
+            && !state.stopping.load(Ordering::Acquire) && state.exit_sit.load(Ordering::Acquire) == 0;
+        let jaw = if !jaw_available {
+            mouth_close_until = None;
+            None
+        } else if snapshot.mouth >= duck_ipc_proto::mouth_gesture::PRESSURE_START {
+            mouth_close_until = Some(tick_start + Duration::from_millis(450));
+            Some(snapshot.mouth)
+        } else if mouth_close_until.is_some_and(|deadline| tick_start < deadline) {
+            Some(0.0)
+        } else {
+            None
+        };
         // An idle mouth default must not turn a current-pose hold into a new target.
         let torque_only_passive_hold = state.init_torque_only && bringup == Bringup::Ready
             && !policy_enabled_for_tick && shutdown_sit.is_none() && shutdown_rest.is_none()
             && !powered_off && targets.iter().zip(hold.iter()).enumerate().all(|(index, (target, current))|
                 index == duck_control::model::MOUTH_INDEX || target == current);
         if torque_only_passive_hold {
-            targets[duck_control::model::MOUTH_INDEX] = hold[duck_control::model::MOUTH_INDEX];
+            let index = duck_control::model::MOUTH_INDEX;
+            if let Some(open) = jaw {
+                targets[index] = duck_control::model::mouth_target(open);
+                if open == 0.0 { hold[index] = targets[index]; }
+            } else {
+                targets[index] = hold[index];
+            }
         }
 
         let status_actively_holding = status_page_active && state.exit_sit.load(Ordering::Acquire) == 0
@@ -8508,12 +8537,40 @@ async fn control_loop<T: RobotIo>(
         if let Some(RestMotion::Action { playback, .. }) = shutdown_rest.as_ref() {
             targets = playback.target();
         }
-        read_timing.mark_stage(4);
 
+        let write_guard = state.human_control.lock();
+        let mut person_loss_mouth_starting = false;
+        if let Some((sequence, opened_at)) = person_loss_mouth {
+            let current = intents.snapshot();
+            let can_open = coordinated_eligible && head_available && !unsafe_motion
+                && !manual_action_started && !coordinated_action_cancelled
+                && jaw_available && jaw.is_none() && !coordinated_mouth.active()
+                && !maintenance_holding && !write_guard.emergency_release_active()
+                && !write_guard.maintenance_transition_blocked() && !write_guard.status_blocked()
+                && theremin_state.is_none() && chorale_state.is_none()
+                && fresh.as_ref().is_some_and(|sample| sample.positions[duck_control::model::MOUTH_INDEX].is_finite())
+                && current.enabled && current.stop_generation == snapshot.stop_generation
+                && current.mouth < proto::mouth_gesture::PRESSURE_START
+                && current.coordinated_tracking.as_ref().is_some_and(|tracking| {
+                    tracking.sequence == sequence && tracking.fresh && tracking.params.camera.is_some()
+                        && tracking.params.stop_area_px.is_some()
+                        && (opened_at.is_some() || tracking.params.target.is_none())
+                });
+            if can_open && opened_at.is_none_or(|at| tick_start.duration_since(at) < Duration::from_millis(350)) {
+                targets[duck_control::model::MOUTH_INDEX] = duck_control::model::mouth_target(1.0);
+                person_loss_mouth_starting = opened_at.is_none();
+            } else {
+                person_loss_mouth = None;
+            }
+        }
+        read_timing.mark_stage(4);
         last_targets = targets;
         let apply_start_t_ns = proto::clock::monotonic_ns();
-        let write_guard = state.human_control.lock();
-        let wrote_targets = !maintenance_holding && !write_guard.emergency_release_active();
+        let limp_jaw = jaw.filter(|_| bringup == Bringup::Limp && !policy_enabled_for_tick
+            && !write_guard.emergency_release_active() && !write_guard.maintenance_transition_blocked()
+            && !write_guard.status_blocked() && fresh.is_some());
+        let wrote_targets = !maintenance_holding && !write_guard.emergency_release_active()
+            && limp_jaw.is_none();
         let write_ok = if !wrote_targets {
             true
         } else {
@@ -8537,7 +8594,7 @@ async fn control_loop<T: RobotIo>(
                     } else if status_pose_latched && status_actively_holding {
                         safety.hold_torque_only(targets, gain)
                     } else if torque_only_passive_hold {
-                        safety.hold_torque_only(hold, gain)
+                        safety.hold_torque_only(targets, gain)
                     } else {
                         safety.apply(targets, hold, gain)
                     }
@@ -8555,6 +8612,9 @@ async fn control_loop<T: RobotIo>(
                 }
             }
         };
+        if let Err(error) = safety.write_limp_mouth(limp_jaw) {
+            tracing::warn!(%error, "isolated jaw write failed");
+        }
         // A due R2 reversal is a single write behind the main motor command.
         // Skipping it when a tick has little spare time leaves a pause at the endpoint.
         if wrote_targets && write_ok && gamepad_ready && !stop_changed && fresh.is_some()
@@ -8566,6 +8626,38 @@ async fn control_loop<T: RobotIo>(
             tracing::warn!(%error, "accessory servo write failed");
         }
         drop(write_guard);
+        if person_follow && coordinated_eligible && !unsafe_motion && !tracking_stopped
+            && driving && !inference_failed
+            && wrote_targets && write_ok && !limits.contains(&duck_control::safety::Limit::NotFinite)
+        {
+            if snapshot.coordinated_tracking.as_ref().is_some_and(|tracking| tracking.params.target.is_some()) {
+                if coordinated_tracker.confirm_person_follow_motion(requested.twist, command.twist)
+                    && intents.snapshot().coordinated_tracking.is_some_and(|current| {
+                        current.fresh && Some(current.sequence) == coordinated_tracking_sequence
+                            && current.params.target.is_some()
+                    })
+                    && let Some(voice) = voice.as_mut()
+                {
+                    voice.play(proto::SoundTag::Mouth.as_str(), false);
+                    tracing::info!("person follow mouth sound requested at the target distance");
+                }
+            } else if requested.twist[2] < 0.0 && command.twist[2] < 0.0
+                && coordinated_tracker.confirm_person_search_turn() && person_loss_mouth.is_none()
+            {
+                person_loss_mouth = coordinated_tracking_sequence.map(|sequence| (sequence, None));
+            }
+        }
+        if person_loss_mouth_starting && wrote_targets && write_ok
+            && !limits.contains(&duck_control::safety::Limit::NotFinite)
+        {
+            if let Some((_, opened_at)) = &mut person_loss_mouth {
+                *opened_at = Some(tick_start);
+            }
+            if let Some(voice) = voice.as_mut() {
+                voice.play(proto::SoundTag::Mouth.as_str(), false);
+                tracing::info!("person search mouth sound requested after two turns");
+            }
+        }
         if wrote_targets && write_ok && !limits.contains(&duck_control::safety::Limit::NotFinite)
             && rest_sitting && driving && !inference_failed && fresh.is_some() && policy_label.as_ref() == "sit"
         {
@@ -8697,12 +8789,6 @@ async fn control_loop<T: RobotIo>(
             if let Some(tracking) = snapshot.coordinated_tracking.as_ref()
                 .filter(|tracking| tracking.params.stop_area_px.is_some())
             {
-                let supplied = follow_tof_sample.is_some();
-                let (observed_at, status, sampled_at, raw) = follow_tof_sample.unwrap_or_else(|| {
-                    let now = proto::clock::monotonic_ns();
-                    let (status, sampled_at, raw) = state.obstacle.status_with_raw(now);
-                    (now, status, sampled_at, raw)
-                });
                 sample.person_follow = Some(record::PersonFollowSample {
                     realtime_ns: proto::clock::realtime_ns(),
                     sequence: tracking.sequence,
@@ -8718,15 +8804,6 @@ async fn control_loop<T: RobotIo>(
                     tracking_stopped,
                     deadzone: tracking_deadzone,
                     settings: (&tracking.params).into(),
-                    tof: record::PersonFollowTof {
-                        observed_at_t_ns: observed_at,
-                        sampled_t_ns: sampled_at,
-                        raw_distance_mm: raw,
-                        distance_mm: status.distance_mm,
-                        sensor_status: status.sensor_status,
-                        supplied_to_tracker: supplied,
-                        obstacle_assistance_active: state.obstacle.status(proto::clock::monotonic_ns()).active,
-                    },
                     decision: coordinated_tracker.person_follow_diagnostic(&tracking.params),
                 });
             }
@@ -9564,7 +9641,7 @@ fn clear_human_motion(intents: &Intents, smooth: bool) {
         intents.stop();
     }
     intents.set_pose(intents::PoseIntent::default());
-    intents.set_mouth(0.0);
+    intents.set_mouth(proto::MouthParams::default());
     let _ = intents.take_skills();
     let _ = intents.take_sounds();
     let _ = intents.take_sound_clip();
@@ -10065,14 +10142,12 @@ async fn handle_session(
             let result = {
                 let mut guard = state.human_control.lock();
                 let web = session.source() == Some(proto::HumanControlSource::Web);
-                let needs_disabled_tof = params.stop_distance_mm.is_some() && !state.obstacle.sensor_enabled();
                 match params.action {
                     proto::MotionTrackingAction::Start => {
                         let snapshot = intents.snapshot();
                         let reason = if !web { Some("网页控制连接未注册") }
                             else if guard.status_blocked() || guard.maintenance_transition_blocked() { Some("维护页面禁止运动") }
                             else if !params.valid() { Some("目标、相机或联合追踪参数无效") }
-                            else if needs_disabled_tof { Some("ToF 测距已关闭") }
                             else if coordinated_tracking::geometry().is_err() { Some("公共头部运动学模型不可用") }
                             else if intents.maze_active() { Some("迷宫模式正在运行") }
                             else if intents.motion_tracking_active() || intents.head_tracking_active() {
@@ -10101,9 +10176,7 @@ async fn handle_session(
                         }
                     }
                     proto::MotionTrackingAction::Update => {
-                        if needs_disabled_tof {
-                            Err("ToF 测距已关闭".to_owned())
-                        } else if let Some(reason) = arrival_skill_error(&state.policies.load(), params) {
+                        if let Some(reason) = arrival_skill_error(&state.policies.load(), params) {
                             Err(reason.to_owned())
                         }
                         else if !web || guard.access(session) != human_control::Access::Owner {
@@ -10656,7 +10729,7 @@ fn apply_intent(state: &RobotState, intents: &Intents, call: &proto::Call) -> bo
             true
         }
         proto::Call::RobotMouth(p) => {
-            intents.set_mouth(p.open);
+            intents.set_mouth(*p);
             true
         }
         // A beacon `btd` heard. A notification because it is one-way and frequent, and because
@@ -11407,7 +11480,7 @@ fn dispatch(
             }
         }
         proto::Call::RobotLowVoltageStatus => proto::Response::ok(
-            Some(id), &state.low_voltage.status(),
+            Some(id), &state.low_voltage.client_status(),
         ),
         proto::Call::RobotLowVoltageRearm => proto::Response::ok(
             Some(id), &proto::IntentResult::refused("需要已登记的控制连接"),
@@ -11876,7 +11949,7 @@ enum ShutdownSignal {
 async fn wait_for_exit_sit(state: &RobotState, intents: &Intents, timeout: Duration) -> bool {
     intents.stop();
     intents.set_pose(intents::PoseIntent::default());
-    intents.set_mouth(0.0);
+    intents.set_mouth(proto::MouthParams::default());
     let _ = intents.take_skills();
     tokio::time::timeout(timeout, async {
         while state.exit_sit.load(Ordering::Acquire) != EXIT_SIT_DONE {

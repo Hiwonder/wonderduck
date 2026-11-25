@@ -14,6 +14,8 @@ CONNECTION = BUS_NAME + ".Settings.Connection"
 ACTIVATED = 2
 DEACTIVATING = 3
 DEVICE_ACTIVATED = 100
+DEVICE_DISCONNECTED = 30
+DEVICE_FAILED = 120
 CONNECT_TIMEOUT = 30
 
 
@@ -27,6 +29,10 @@ class Snapshot:
     mode: str = ""
     uuid: str = ""
     name: str = ""
+
+    @property
+    def can_activate(self):
+        return self.mode == "ap" or self.device_state in (DEVICE_DISCONNECTED, DEVICE_FAILED)
 
 
 class NetworkManager:
@@ -152,8 +158,6 @@ class NetworkManager:
     def activate_saved(self, uuid):
         try:
             profile = self.settings.GetConnectionByUuid(uuid)
-            active = self.manager.ActivateConnection(profile, self._device(),
-                                                     self.dbus.ObjectPath("/"))
-            self._wait_active(active)
-        except (self.dbus.DBusException, NetworkError) as error:
+            self.manager.ActivateConnection(profile, self._device(), self.dbus.ObjectPath("/"))
+        except self.dbus.DBusException as error:
             raise NetworkError("saved Wi-Fi activation failed: " + str(error)) from error

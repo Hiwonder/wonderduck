@@ -238,6 +238,7 @@ const SKILL_BITS: usize = 2;
 /// (20 ms) while the trigger is down, so anything much older means the client stopped
 /// holding — or stopped existing. The stale hold lands the ride instead of looping forever.
 pub const WHEEE_HOLD_FRESH: Duration = Duration::from_millis(300);
+const MOUTH_REPEAT_FRESH: Duration = Duration::from_millis(300);
 
 /// What the wheee level says, as the loop consumes it. Three states rather than a bool
 /// because the two ways of *not* being held are different sounds: a client that spells out
@@ -296,9 +297,8 @@ pub struct Intents {
     maze_epoch: std::sync::atomic::AtomicU64,
     /// Standing body pose. Unstamped: `active: false` is its own "nobody is posing".
     pose: ArcSwap<PoseIntent>,
-    /// Mouth opening, 0..1, as `f64::to_bits`. Continuous like the twist, unstamped like
-    /// the pose — a mouth left open by a dead client is exactly what the prototype does.
-    mouth: std::sync::atomic::AtomicU64,
+    /// Continuous jaw position and the most recent request to repeat its sound.
+    mouth: ArcSwap<Stamped<duck_ipc_proto::MouthParams>>,
     accessory_trigger: ArcSwapOption<Stamped<u8>>,
     /// Whether the policy should drive. Discrete, so a plain flag rather than a slot.
     enabled: AtomicBool,
@@ -515,7 +515,10 @@ impl Intents {
             maze: ArcSwap::from_pointee(MazeIntent::default()),
             maze_epoch: std::sync::atomic::AtomicU64::new(0),
             pose: ArcSwap::from_pointee(PoseIntent::default()),
-            mouth: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
+            mouth: ArcSwap::from_pointee(Stamped {
+                value: duck_ipc_proto::MouthParams::default(),
+                at_us: 0,
+            }),
             accessory_trigger: ArcSwapOption::empty(),
             enabled: AtomicBool::new(false),
             power: AtomicU8::new(POWER_NONE),
@@ -986,9 +989,15 @@ impl Intents {
         self.pose.store(Arc::new(pose));
     }
 
-    pub fn set_mouth(&self, open: f64) {
-        self.mouth
-            .store(open.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    pub fn set_mouth(&self, mouth: duck_ipc_proto::MouthParams) {
+        self.mouth.store(Arc::new(Stamped { value: mouth, at_us: self.now_us() }));
+    }
+
+    pub fn mouth_sound_repeating(&self) -> bool {
+        let mouth = self.mouth.load();
+        mouth.value.repeat_sound
+            && mouth.value.open >= duck_ipc_proto::mouth_gesture::PRESSURE_START
+            && Duration::from_micros(self.now_us().saturating_sub(mouth.at_us)) < MOUTH_REPEAT_FRESH
     }
 
     pub fn set_accessory_trigger(&self, pressure: u8) {
@@ -1047,21 +1056,23 @@ impl Intents {
         self.manual_skill.lock().expect("manual skill mutex").take()
     }
 
-    /// Queue a sound for the loop's next tick. The wheee is the exception — it is a level,
-    /// not an event, so it lands in its stamped slot instead of the mask (a bare
-    /// `tag: wheee` with no `hold` is a hold that immediately starts decaying: one short
-    /// ride).
+    /// Queue a one-shot or refresh the current held sound.
     pub fn request_sound(&self, params: duck_ipc_proto::SoundParams) {
         use duck_ipc_proto::SoundTag;
+        if params.tag == SoundTag::Mouth && params.hold.is_some() {
+            // Legacy hold refreshes are not opening events.
+            return;
+        }
         if params.tag == SoundTag::Wheee {
+            let target = SoundHoldTarget::Wheee;
             if params.hold.unwrap_or(true) {
                 self.sound_hold.store(Arc::new(Stamped {
-                    value: SoundHoldTarget::Wheee,
+                    value: target,
                     at_us: self.now_us(),
                 }));
-            } else {
+            } else if self.sound_hold.load().value == target {
                 self.sound_hold.rcu(|previous| {
-                    if matches!(&previous.value, SoundHoldTarget::Wheee) {
+                    if previous.value == target {
                         Arc::new(Stamped { value: SoundHoldTarget::Released, at_us: self.now_us() })
                     } else {
                         Arc::clone(previous)
@@ -1118,6 +1129,7 @@ impl Intents {
             SoundTag::Peck,
             SoundTag::Chirp,
             SoundTag::Coo,
+            SoundTag::Mouth,
         ]
         .into_iter()
         .filter(|tag| bits & (1u32 << (*tag as u32)) != 0)
@@ -1426,7 +1438,7 @@ impl Intents {
                 .then_some(maze.params).flatten().map(|params| MazeSnapshot { params, sequence: maze.sequence }),
             enabled: self.enabled.load(Ordering::Relaxed),
             pose,
-            mouth: f64::from_bits(self.mouth.load(std::sync::atomic::Ordering::Relaxed)),
+            mouth: self.mouth.load().value.open,
         }
     }
 }

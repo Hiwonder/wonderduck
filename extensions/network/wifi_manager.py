@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 
-from wifi_network import CONNECT_TIMEOUT, NetworkError, NetworkManager
+from wifi_network import CONNECT_TIMEOUT, DEVICE_DISCONNECTED, NetworkError, NetworkManager
 
 
 LOGGER = logging.getLogger("wifi-manager")
@@ -22,6 +22,7 @@ DISCOVERY_REQUEST = b"LOBOT_NET_DISCOVER"
 RESET_REQUEST = b"resetwifi"
 DISCOVERY_TYPE = "WonderDuck"
 HOTSPOT_PREFIX = "WD-"
+STATION_RETRY_INTERVAL = 5
 
 
 def device_id(ethernet=Path("/sys/class/net/eth0/address"),
@@ -74,7 +75,9 @@ class Controller:
         self.state = store.load()
         self.actions = queue.Queue()
         self.disconnected_since = clock()
-        self.saved_attempted = False
+        self.station_disconnected_since = None
+        self.next_station_attempt = 0
+        self.recovery_hotspot = False
         self.last_error = None
 
     def connect(self, ssid, password):
@@ -87,7 +90,9 @@ class Controller:
         self.store.save(state)
         self.state = state
         self.disconnected_since = self.clock()
-        self.saved_attempted = False
+        self.station_disconnected_since = None
+        self.next_station_attempt = 0
+        self.recovery_hotspot = False
 
     def _hotspot(self):
         for band, channel in (("a", 36), ("bg", 6)):
@@ -104,6 +109,14 @@ class Controller:
         self._set_state({"mode": "ap"})
         self._hotspot()
 
+    def _recover_hotspot(self):
+        if self.state is not None and self.state["mode"] == "station":
+            LOGGER.info("starting recovery hotspot while keeping saved station profile")
+            self.recovery_hotspot = True
+            self._hotspot()
+        else:
+            self._switch_to_hotspot()
+
     def process_action(self, action):
         if action[0] == "reset":
             self._switch_to_hotspot()
@@ -113,7 +126,7 @@ class Controller:
                 uuid = self.network.connect(ssid, password)
             except NetworkError as error:
                 LOGGER.warning("phone provisioning failed: %s", error)
-                self._switch_to_hotspot()
+                self._recover_hotspot()
             else:
                 self._set_state({"mode": "station", "uuid": uuid})
                 LOGGER.info("phone provisioning completed")
@@ -146,21 +159,34 @@ class Controller:
                 self._hotspot()
             return
 
-        if current.mode == "station" and current.uuid == self.state["uuid"]:
-            self.disconnected_since = self.clock()
-            self.saved_attempted = False
+        # NetworkManager can activate another usable profile while the saved
+        # profile is still waiting for the device or supplicant to initialize.
+        if current.mode == "station":
+            self.station_disconnected_since = None
+            self.next_station_attempt = 0
+            self.recovery_hotspot = False
             return
-        if not self.saved_attempted:
-            self.saved_attempted = True
+        if self.recovery_hotspot:
+            if current.mode != "ap" or current.name != self.hotspot_name:
+                self._hotspot()
+            return
+        if current.device_state < DEVICE_DISCONNECTED:
+            # The device may take time to become available during boot.
+            self.station_disconnected_since = None
+            self.next_station_attempt = 0
+            return
+        now = self.clock()
+        if self.station_disconnected_since is None:
+            self.station_disconnected_since = now
+        if now - self.station_disconnected_since >= CONNECT_TIMEOUT:
+            self._recover_hotspot()
+            return
+        if current.can_activate and now >= self.next_station_attempt:
+            self.next_station_attempt = now + STATION_RETRY_INTERVAL
             try:
                 self.network.activate_saved(self.state["uuid"])
             except NetworkError as error:
                 LOGGER.warning("saved Wi-Fi unavailable: %s", error)
-            else:
-                self.disconnected_since = self.clock()
-                return
-        if self.clock() - self.disconnected_since >= CONNECT_TIMEOUT:
-            self._switch_to_hotspot()
 
     def run(self):
         while True:
