@@ -71,11 +71,6 @@ POOL=https://radxa-repo.github.io/bullseye/pool/main
 RKAIQ_DEB="$POOL/c/camera-engine-rkaiq/camera_engine_rkaiq_rk3568_arm64-fixed.deb"
 IQ_DEB="$POOL/r/rockchip-iqfiles/rockchip-iqfiles-rk356x_0.1.16_all.deb"
 
-# The sensor mode the engine must agree with `mediad` about. See `pin_mode` below for why this
-# is here at all, and keep it in step with `pin_sensor_mode` in `mediad/src/pipeline.rs`.
-SENSOR_W=1920
-SENSOR_H=1080
-
 say()  { printf '== %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -183,6 +178,63 @@ else:
 PY
 fi
 
+# Legacy ISP21 tuning is keyed by sensor resolution. Use the full-array gain
+# tables on a grid that matches the ISP crop for the binned mode.
+if [ "$SENSOR" = imx219 ]; then
+    python3 - "$IQ_DIR" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+from tempfile import NamedTemporaryFile
+
+full_size = "3280x2464"
+binned_size = "1640x1232"
+# The RKISP sink crops four pixels from each edge. Each half of the
+# 1632x1224 crop is covered by eight LSC sections along each axis.
+binned_sections = {"lsc_sect_size_x": [102] * 8, "lsc_sect_size_y": [76, 77] * 4}
+
+
+for path in Path(sys.argv[1]).glob("imx219_*.json"):
+    if path.is_symlink():
+        path = path.resolve()
+    calibration = json.loads(path.read_text(encoding="utf-8"))
+    changed = False
+    for main in calibration.get("main_scene", []):
+        for scene in main.get("sub_scene", []):
+            lsc = scene.get("scene_isp21", {}).get("lsc_v2", {})
+            common = lsc.get("common", {})
+            table = lsc.get("tbl", {})
+            resolutions = common.get("resolutionAll", [])
+            entries = table.get("tableAll", [])
+            grid = next((entry for entry in resolutions if entry.get("name") == binned_size), None)
+            if grid is not None:
+                if any(grid.get(key) != sections for key, sections in binned_sections.items()):
+                    grid.update(binned_sections)
+                    changed = True
+                continue
+            full = next((entry for entry in resolutions if entry.get("name") == full_size), None)
+            profiles = [entry for entry in entries if entry.get("resolution") == full_size]
+            if full is None or not profiles:
+                continue
+            resolutions.append(dict(full, name=binned_size, **binned_sections))
+            common["resolutionAll_len"] = len(resolutions)
+            entries.extend(dict(profile, name=profile["name"].replace(full_size, binned_size),
+                                resolution=binned_size) for profile in profiles)
+            table["tableAll_len"] = len(entries)
+            changed = True
+    if changed:
+        metadata = path.stat()
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as tmp:
+            os.fchown(tmp.fileno(), metadata.st_uid, metadata.st_gid)
+            os.fchmod(tmp.fileno(), metadata.st_mode & 0o777)
+            json.dump(calibration, tmp, ensure_ascii=False, indent=2)
+            tmp.write("\n")
+        os.replace(tmp.name, path)
+        print(f"   aligned {binned_size} lens shading calibration to the ISP crop in {path.name}")
+PY
+fi
+
 # ── the ioctl shim ────────────────────────────────────────────────────────────
 #
 # Without this, `rkaiq_3A_server` segfaults on this kernel before it ever reaches a frame; the
@@ -223,27 +275,22 @@ fi
 
 # ── the sensor-mode pin ───────────────────────────────────────────────────────
 #
-# `rkaiq_3A_server` reads the sensor's resolution once, at startup, and programs the ISP input
-# with it for every stream afterwards. The IMX219 boots in 3280x2464; `mediad` captures from
-# the 1920x1080 mode (`pin_sensor_mode`, which is also what gets 30 fps rather than 21). The
-# engine starts long before `mediad` does, so without this it reads the boot mode and every
-# later capture dies with CIF_ISP_PIC_SIZE_ERROR — the camera delivers no frame at all, which
-# reads as "the camera is broken" rather than "two components disagree by a resolution".
-#
-# So pin the mode before the engine starts, to the same geometry `mediad` pins. Both pinning it
-# is deliberate: `mediad` cannot rely on this script having run, and this script cannot rely on
-# `mediad` having started.
-
+# rkaiq reads the input mode at startup. Follow the same quality setting as mediad.
 say "installing the sensor-mode pin at ${PIN}"
 cat > "$PIN" <<PIN_HEAD
 #!/bin/sh
-# Pin the ${SENSOR} into its ${SENSOR_W}x${SENSOR_H} mode before rkaiq_3A_server reads it.
-# Installed by scripts/setup-rkaiq.sh. Keep in step with pin_sensor_mode in
-# mediad/src/pipeline.rs.
 SENSOR="${SENSOR}"
-WANT="${SENSOR_W}x${SENSOR_H}"
 PIN_HEAD
 cat >> "$PIN" <<'PIN_BODY'
+QUALITY=$(awk '
+    /^[[:space:]]*\[/ { media = $0 ~ /^[[:space:]]*\[media\]/ }
+    media && /^[[:space:]]*quality[[:space:]]*=/ { split($0, parts, "\""); print parts[2]; exit }
+' /etc/robot/robotd.toml 2>/dev/null)
+case "$QUALITY" in
+    960p30) WANT=1640x1232 ;;
+    960p21) WANT=3280x2464 ;;
+    *) WANT=1920x1080 ;;
+esac
 # This runs at sysinit, which can be before the camera driver has probed — so wait for the
 # entity rather than concluding there is no camera. Ten seconds, then give up quietly: a board
 # with no camera module must still boot, and the engine's own log says the rest.

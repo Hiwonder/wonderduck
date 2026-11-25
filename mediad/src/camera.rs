@@ -8,18 +8,10 @@
 //! # Derived from the field of view, so it can be checked rather than trusted
 //!
 //! The IMX219's full array is 3280×2464 at a 1.12 µm pitch — 3.67 mm wide — behind the head
-//! camera's ~3.05 mm M12 lens, a **horizontal field of view of ~62°** across the full width. On
-//! this board's Rockchip driver the production **1920×1080@30** mode is a *scaled full-frame
-//! readout* (the whole 62° width, downscaled and cropped to 16:9), **not** the native-pixel 39°
-//! crop the datasheet's "1080p" implies. The family default in `robotd-params` carries this geometry
-//! (`fx` ≈ 1062 at 1280×720). So the **field of view** — not a native focal length — is what the
-//! nominal geometry rests on, because the field of view is what stays fixed as the ISP scales the
-//! frame to whatever `[media] quality` asks for:
-//!
-//! - Focal length in pixels of a delivered frame `W` wide: `fx = (W/2) / tan(62°/2)`, so 1280 wide
-//!   gives `fx` ≈ 1065; a uniform scale moves `fy`, `cx`, `cy` with it.
-//! - The vertical is the 16:9 crop of that, and the principal point is *assumed* central — which is
-//!   the part a real calibration corrects (the measured `cy` sits ~110 px low).
+//! camera's ~3.05 mm M12 lens, about 62° horizontally across the full width. The
+//! Rockchip driver's 1920×1080 mode reads a centered sensor window. The 1280×960
+//! profiles use either full-array readout or 2×2 binning, with a centered
+//! ISP crop for uniform scaling. Nominal intrinsics assume a centered principal point.
 //!
 //! # And when the pinned mode is not confirmed, this publishes nothing
 //!
@@ -59,21 +51,7 @@ fn nominal_focal_px(width: u32) -> f64 {
 /// [`Intrinsics::nominal`] can tell "the mode we pinned" from "we could not confirm it", and refuse
 /// a delivered frame whose aspect ratio is not the mode's.
 ///
-/// # Both modes this driver offers are the full ~62° field
-///
-/// The IMX219's full array is 3280×2464 at a 1.12 µm pitch behind the ~3.05 mm M12 lens — `2·atan(
-/// 3280·1.12µm / 2 / 3.05mm)` ≈ **62°** horizontally. On this board's Rockchip driver `1920×1080`
-/// is a *scaled full-frame* readout, not a native crop, so it is the same 62° field (validated on
-/// hardware; see the module header):
-///
-/// | mode | how | horizontal FOV | note |
-/// |---|---|---|---|
-/// | 1920×1080 | full field, scaled/cropped to 16:9 | **62°** | what this daemon pins, at 30 fps |
-/// | 3280×2464 | full 4:3 array | **62°** | the boot mode, at 21 fps |
-///
-/// So the field of view does not change with the mode — only the resolution and frame rate do, and
-/// the geometry a consumer needs is the same either way. `1920×1080` is pinned for the frame rate;
-/// there is no wide-vs-fast trade to make here, because the wide field is already the fast mode.
+/// The driver offers a centered 1080p mode, a full-array readout and 2×2 binning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SensorMode {
     pub width: u32,
@@ -81,11 +59,31 @@ pub struct SensorMode {
 }
 
 impl SensorMode {
-    /// The mode `pipeline::pin_sensor_mode` asks for: the full field at 30 fps.
+    /// The centered 16:9 window.
     pub const PINNED: Self = Self {
         width: 1920,
         height: 1080,
     };
+
+    pub const FULL_ARRAY: Self = Self {
+        width: 3280,
+        height: 2464,
+    };
+
+    pub const BINNED: Self = Self {
+        width: 1640,
+        height: 1232,
+    };
+
+    /// Main-path sampling rectangle as left, top, width and height.
+    pub fn isp_crop(self) -> [u32; 4] {
+        match self {
+            Self::FULL_ARRAY => [0, 2, 3280, 2460],
+            // Keep the crop centered and satisfy the ISP's 16×8 RAW alignment.
+            Self::BINNED => [4, 4, 1632, 1224],
+            _ => [0, 0, self.width, self.height],
+        }
+    }
 }
 
 /// Where the optical axis is and how long the focal length is, in pixels of a delivered frame.
@@ -141,18 +139,16 @@ impl Intrinsics {
             return None;
         }
 
-        // The delivered frame has to be a uniform scale of the mode — the same 16:9 aspect. The ISP
-        // *can* scale the axes independently, and then part of the frame was cropped or squashed on
-        // the way out, which the output size alone cannot tell apart from a resize.
-        let scale_x = f64::from(width) / f64::from(mode.width);
-        let scale_y = f64::from(height) / f64::from(mode.height);
+        let [_, _, crop_width, crop_height] = mode.isp_crop();
+        let scale_x = f64::from(width) / f64::from(crop_width);
+        let scale_y = f64::from(height) / f64::from(crop_height);
         if (scale_x - scale_y).abs() > 0.01 {
             return None;
         }
 
-        // The focal length is fixed by the field of view and the delivered width. The field of view
-        // is the sensor's full ~62° in every mode, so it does not depend on which mode fed the frame.
-        let focal = nominal_focal_px(width);
+        let physical_width = if mode == SensorMode::BINNED { crop_width * 2 } else { crop_width };
+        let focal = nominal_focal_px(width) * f64::from(SensorMode::FULL_ARRAY.width)
+            / f64::from(physical_width);
         Some(Self {
             fx: focal,
             fy: focal,
@@ -225,7 +221,9 @@ impl Intrinsics {
     /// different 4:3→16:9 framing and principal point) would place it slightly wrong — so an
     /// unconfirmed mode publishes nothing rather than the family's numbers off by that framing.
     pub fn family(mode: Option<SensorMode>, width: u32, height: u32) -> Option<Self> {
-        mode?;
+        if mode? != SensorMode::PINNED {
+            return None;
+        }
         Self::scaled(
             &robotd_params::CameraIntrinsics::alpha(),
             width,

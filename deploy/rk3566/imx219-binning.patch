@@ -1,0 +1,156 @@
+--- a/imx219.c
++++ b/imx219.c
+@@ -73,6 +73,7 @@
+ 	struct v4l2_fract max_fps;
+ 	u32 hts_def;
+ 	u32 vts_def;
++	bool binning;
+ 	const struct imx219_reg *reg_list;
+ };
+ 
+@@ -282,6 +283,19 @@
+ 		.vts_def = 0x0a40,
+ 		.reg_list = imx219_init_tab_3280_2464_21fps,
+ 	},
++	{
++		.width = 1640,
++		.height = 1232,
++		.max_fps = {
++			.numerator = 10000,
++			.denominator = 300000,
++		},
++		/* Keep the board's 25 MHz clock and 190 MHz pixel rate. */
++		.hts_def = 0x0d78,
++		.vts_def = 0x072d,
++		.binning = true,
++		.reg_list = imx219_init_tab_1920_1080_30fps,
++	},
+ };
+ 
+ static struct imx219 *to_imx219(const struct i2c_client *client)
+@@ -357,6 +371,8 @@
+ {
+ 	struct i2c_client *client = v4l2_get_subdevdata(sd);
+ 	struct imx219 *priv = to_imx219(client);
++	const struct imx219_mode *mode = priv->cur_mode;
++	u8 binning = mode->binning ? 0x01 : 0x00;
+ 	u8 reg = 0x00;
+ 	int ret;
+ 
+@@ -367,8 +383,12 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	/* Handle crop */
+-	ret = reg_write(client, 0x0164, priv->crop_rect.left >> 8);
++	/* RAW10 uses digital 2x2 binning. Program the sensor window before binning. */
++	ret = reg_write(client, 0x0174, binning);
++	ret |= reg_write(client, 0x0175, binning);
++	ret |= reg_write(client, 0x0274, binning);
++	ret |= reg_write(client, 0x0275, binning);
++	ret |= reg_write(client, 0x0164, priv->crop_rect.left >> 8);
+ 	ret |= reg_write(client, 0x0165, priv->crop_rect.left & 0xff);
+ 	ret |= reg_write(client, 0x0166, (priv->crop_rect.left + priv->crop_rect.width - 1) >> 8);
+ 	ret |= reg_write(client, 0x0167, (priv->crop_rect.left + priv->crop_rect.width - 1) & 0xff);
+@@ -376,10 +396,10 @@
+ 	ret |= reg_write(client, 0x0169, priv->crop_rect.top & 0xff);
+ 	ret |= reg_write(client, 0x016A, (priv->crop_rect.top + priv->crop_rect.height - 1) >> 8);
+ 	ret |= reg_write(client, 0x016B, (priv->crop_rect.top + priv->crop_rect.height - 1) & 0xff);
+-	ret |= reg_write(client, 0x016C, priv->crop_rect.width >> 8);
+-	ret |= reg_write(client, 0x016D, priv->crop_rect.width & 0xff);
+-	ret |= reg_write(client, 0x016E, priv->crop_rect.height >> 8);
+-	ret |= reg_write(client, 0x016F, priv->crop_rect.height & 0xff);
++	ret |= reg_write(client, 0x016C, mode->width >> 8);
++	ret |= reg_write(client, 0x016D, mode->width & 0xff);
++	ret |= reg_write(client, 0x016E, mode->height >> 8);
++	ret |= reg_write(client, 0x016F, mode->height & 0xff);
+ 
+ 	if (ret)
+ 		return ret;
+@@ -418,10 +438,10 @@
+ 		ret |= reg_write(client, 0x0621, priv->crop_rect.left & 0xff);
+ 		ret |= reg_write(client, 0x0622, priv->crop_rect.top >> 8);
+ 		ret |= reg_write(client, 0x0623, priv->crop_rect.top & 0xff);
+-		ret |= reg_write(client, 0x0624, priv->crop_rect.width >> 8);
+-		ret |= reg_write(client, 0x0625, priv->crop_rect.width & 0xff);
+-		ret |= reg_write(client, 0x0626, priv->crop_rect.height >> 8);
+-		ret |= reg_write(client, 0x0627, priv->crop_rect.height & 0xff);
++		ret |= reg_write(client, 0x0624, mode->width >> 8);
++		ret |= reg_write(client, 0x0625, mode->width & 0xff);
++		ret |= reg_write(client, 0x0626, mode->height >> 8);
++		ret |= reg_write(client, 0x0627, mode->height & 0xff);
+ 	} else {
+ 		ret = reg_write(client, 0x0600, 0x00);
+ 		ret |= reg_write(client, 0x0601, 0x00);
+@@ -727,14 +747,14 @@
+ 	const struct imx219_mode *mode;
+ 	s64 h_blank, v_blank;
+ 
+-	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
+-		return 0;
+-
+ 	mode = imx219_find_best_fit(fmt);
+ 	fmt->format.code = imx219_mbus_code(priv);
+ 	fmt->format.width = mode->width;
+ 	fmt->format.height = mode->height;
+ 	fmt->format.field = V4L2_FIELD_NONE;
++	if (fmt->which == V4L2_SUBDEV_FORMAT_TRY)
++		return 0;
++
+ 	priv->cur_mode = mode;
+ 	h_blank = mode->hts_def - mode->width;
+ 	v4l2_ctrl_modify_range(priv->hblank, h_blank,
+@@ -745,15 +765,11 @@
+ 					1, v_blank);
+ 	v4l2_ctrl_s_ctrl(priv->vblank, v_blank);
+ 
+-	/* reset crop window */
+-	priv->crop_rect.left = 1640 - (mode->width / 2);
+-	if (priv->crop_rect.left < 0)
+-		priv->crop_rect.left = 0;
+-	priv->crop_rect.top = 1232 - (mode->height / 2);
+-	if (priv->crop_rect.top < 0)
+-		priv->crop_rect.top = 0;
+-	priv->crop_rect.width = mode->width;
+-	priv->crop_rect.height = mode->height;
++	/* Center the pre-binning window in the 3280x2464 active array. */
++	priv->crop_rect.width = mode->width * (mode->binning ? 2 : 1);
++	priv->crop_rect.height = mode->height * (mode->binning ? 2 : 1);
++	priv->crop_rect.left = (3280 - priv->crop_rect.width) / 2;
++	priv->crop_rect.top = (2464 - priv->crop_rect.height) / 2;
+ 
+ 	return 0;
+ }
+@@ -860,6 +876,24 @@
+ }
+ #endif
+ 
++static int imx219_enum_frame_size(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_pad_config *cfg,
++				  struct v4l2_subdev_frame_size_enum *fse)
++{
++	struct i2c_client *client = v4l2_get_subdevdata(sd);
++	struct imx219 *priv = to_imx219(client);
++	const struct imx219_mode *mode;
++
++	if (fse->pad != 0 || fse->index >= priv->cfg_num ||
++	    fse->code != imx219_mbus_code(priv))
++		return -EINVAL;
++
++	mode = &supported_modes[fse->index];
++	fse->min_width = fse->max_width = mode->width;
++	fse->min_height = fse->max_height = mode->height;
++	return 0;
++}
++
+ static int imx219_enum_frame_interval(struct v4l2_subdev *sd,
+ 				       struct v4l2_subdev_pad_config *cfg,
+ 				       struct v4l2_subdev_frame_interval_enum *fie)
+@@ -911,6 +945,7 @@
+ 
+ static const struct v4l2_subdev_pad_ops imx219_subdev_pad_ops = {
+ 	.enum_mbus_code = imx219_enum_mbus_code,
++	.enum_frame_size = imx219_enum_frame_size,
+ 	.enum_frame_interval = imx219_enum_frame_interval,
+ 	.set_fmt = imx219_set_fmt,
+ 	.get_fmt = imx219_get_fmt,

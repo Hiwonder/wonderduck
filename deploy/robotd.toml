@@ -462,18 +462,9 @@ mode = "walk"
 # and drawing a 720p30 one in software cost five times what the camera it stands in for does.
 # source = "camera"
 
-# Frame size and rate, as one name: 1080p30, 720p30, 720p15 or 360p30.
-#
-# One key rather than a width, a height and an fps, because they do not vary independently — a
-# rung the capture path cannot produce is a mediad that will not start, and every rung here is
-# 16:9 so that "smaller" never means "cropped".
-#
-# 720p30 is the rung every measurement in mediad was taken at: 29.3 fps off the ISP main path,
-# with a capture format and a buffer depth that took three bench sessions to find. The sensor is
-# pinned to a 1920x1080 mode that runs at 30 and the ISP scales down from it, so 1080p30 asks for
-# no scaling at all — what is unmeasured is whether the capture path and the encoder hold 30 fps
-# at 2.25x the pixels. A rung that does not hold runs slower rather than failing.
-quality = "720p30"
+# On RK3566, 960p21 uses the full IMX219 readout for 1280x960.
+# 960p30 requires the driver with 1640x1232 binned readout support.
+quality = "960p21"
 
 # Starting video bitrate, bits per second. Unset follows the quality — 4 Mb/s at 1080p30,
 # 2 Mb/s at 720p30, 1 Mb/s at 720p15, 800 kb/s at 360p30 — which is what almost every robot

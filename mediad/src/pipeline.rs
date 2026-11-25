@@ -465,8 +465,16 @@ pub fn start(
         }
         #[cfg(target_os = "linux")]
         Source::Camera(camera) => {
-            let src = camera_source(camera, fps)?;
-            let rate = camera_framerate(&src, width, height, target_rate)?;
+            use crate::camera::SensorMode;
+            let mode = match (width * 3 == height * 4, fps) {
+                (true, 21) => SensorMode::FULL_ARRAY,
+                (true, _) => SensorMode::BINNED,
+                (false, _) => SensorMode::PINNED,
+            };
+            let src = camera_source(camera, mode, fps)?;
+            // The nominal 21 fps mode can enumerate a fractional rate just above 21.
+            let limit = if mode == SensorMode::FULL_ARRAY { gst::Fraction::new(22, 1) } else { target_rate };
+            let rate = camera_framerate(&src, width, height, limit)?;
             (src, rate)
         }
         // Not "unsupported": `[media] camera = true` off a robot is a config file copied from one,
@@ -1593,8 +1601,24 @@ fn generic_camera_source(camera: &Camera, width: u32, height: u32) -> Result<gst
 /// belong to the *subprocess* shape: `v4l2src` attaches a `GstVideoMeta` describing the real
 /// layout, and the frame loss has a cause with a small fix — see [`raise_capture_buffers`].
 #[cfg(target_os = "linux")]
-fn camera_source(camera: &Camera, fps: u32) -> Result<gst::Element> {
-    pin_sensor_mode(fps)?;
+fn camera_source(camera: &Camera, mode: crate::camera::SensorMode, fps: u32) -> Result<gst::Element> {
+    pin_sensor_mode(mode, fps)?;
+
+    if mode != crate::camera::SensorMode::PINNED {
+        let [mut left, mut top, width, height] = mode.isp_crop();
+        if mode == crate::camera::SensorMode::BINNED {
+            // pin_sensor_mode applies the centered crop on the ISP sink.
+            [left, top] = [0, 0];
+        }
+        let crop = format!("--set-selection=target=crop,left={left},top={top},width={width},height={height}");
+        let output = std::process::Command::new("v4l2-ctl")
+            .args(["-d", &camera.device, &crop])
+            .output()
+            .context("could not set the ISP 4:3 crop")?;
+        if !output.status.success() {
+            return Err(anyhow!("could not set the ISP 4:3 crop: {}", String::from_utf8_lossy(&output.stderr).trim()));
+        }
+    }
 
     // Exposure and gain go through `extra-controls` rather than a `v4l2-ctl` call, so they are
     // applied by whoever opens the device — including after a re-open we did not initiate.
@@ -1863,41 +1887,67 @@ pub fn sensor_mode() -> Option<crate::camera::SensorMode> {
     *SENSOR_MODE.get().unwrap_or(&None)
 }
 
-/// Switch the IMX219 out of its boot mode, which caps capture at 21 fps.
-///
-/// The sensor boots in 3280x2464 and the rkisp scaler will happily give us 1280x720 from it — at
-/// the full-res frame rate. 1920x1080 is the mode that runs at 30, and the ISP scales down from
-/// there, so nothing else in the pipeline changes with it.
+/// Select the readout for the current preview profile.
 ///
 /// This shells out to `media-ctl` once at startup, because the switch is a subdev ioctl on an
 /// entity whose name embeds its I2C bus and address (`m00_b_imx219 2-0010`) and therefore has to
 /// be discovered from the topology rather than named. Doing it here rather than in the unit means
 /// a run with `[media] camera` off needs no camera at all.
 #[cfg(target_os = "linux")]
-fn pin_sensor_mode(fps: u32) -> Result<()> {
+fn pin_sensor_mode(mode: crate::camera::SensorMode, fps: u32) -> Result<()> {
     let (media, entity) = find_sensor()?;
 
-    let format = format!("\"{entity}\":0[fmt:SRGGB10_1X10/1920x1080]");
+    let (width, height) = (mode.width, mode.height);
+    let format = format!("\"{entity}\":0[fmt:SRGGB10_1X10/{width}x{height}]");
     let output = std::process::Command::new("media-ctl")
         .args(["-d", &media, "--set-v4l2", &format])
         .output()
         .context("could not run media-ctl; it comes from v4l-utils")?;
 
-    if !output.status.success() {
-        // Not fatal: capture still works, just slower. Said loudly because a third of the frames
-        // going missing looks like a network problem from the far end.
+    let checked = if output.status.success() {
+        let pad = format!("\"{entity}\":0");
+        let check = std::process::Command::new("media-ctl")
+            .args(["-d", &media, "--get-v4l2", &pad])
+            .output()
+            .context("could not read back the sensor mode")?;
+        let size = format!("/{width}x{height}");
+        let readback = String::from_utf8_lossy(&check.stdout);
+        let bayer = readback.split_whitespace().find_map(|field| {
+            let format = field.trim_start_matches('[').strip_prefix("fmt:")?;
+            format.split('@').next()?.trim_end_matches(']').strip_suffix(&size)
+        });
+        match bayer.filter(|_| check.status.success()) {
+            Some(bayer) if mode == crate::camera::SensorMode::BINNED => {
+                let [left, top, crop_width, crop_height] = mode.isp_crop();
+                let formats = format!(
+                    "\"rkisp-isp-subdev\":0 [fmt:{bayer}/{width}x{height} field:none crop:({left},{top})/{crop_width}x{crop_height}], \
+                     \"rkisp-isp-subdev\":2 [fmt:YUYV8_2X8/{crop_width}x{crop_height} field:none crop:(0,0)/{crop_width}x{crop_height}]"
+                );
+                let isp = std::process::Command::new("media-ctl")
+                    .args(["-d", &media, "--set-v4l2", &formats])
+                    .output()
+                    .context("could not configure the binned ISP input")?;
+                if isp.status.success() { Ok(()) }
+                else { Err(String::from_utf8_lossy(&isp.stderr).trim().to_owned()) }
+            }
+            Some(_) => Ok(()),
+            None => Err(readback.trim().to_owned()),
+        }
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    };
+    if let Err(error) = checked {
+        if mode != crate::camera::SensorMode::PINNED {
+            return Err(anyhow!("could not select {width}x{height} sensor mode: {error}"));
+        }
         tracing::warn!(
-            %media, %entity,
-            why = %String::from_utf8_lossy(&output.stderr).trim(),
-            "media-ctl would not set the 1920x1080 sensor mode — capture stays in the boot \
-             mode, which caps it at 21 fps, and `media.video` publishes no camera intrinsics \
-             because the exact framing is then the boot mode's (same ~62 deg field, different \
-             4:3->16:9 crop) rather than the pinned mode the calibration is for"
+            %media, %entity, width, height, %error,
+            "could not select sensor mode; camera intrinsics unavailable"
         );
         let _ = SENSOR_MODE.set(None);
     } else {
-        let _ = SENSOR_MODE.set(Some(crate::camera::SensorMode::PINNED));
-        tracing::info!(%media, %entity, target_fps = fps, "sensor mode 1920x1080");
+        let _ = SENSOR_MODE.set(Some(mode));
+        tracing::info!(%media, %entity, width, height, target_fps = fps, "sensor mode selected");
     }
     Ok(())
 }
