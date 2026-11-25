@@ -80,6 +80,8 @@ mod control;
 mod precision_drive;
 mod precision_input;
 #[cfg(target_os = "linux")]
+mod ps3_idle;
+#[cfg(target_os = "linux")]
 mod ps3_trigger;
 
 use control::StartAction;
@@ -684,6 +686,8 @@ fn run_session(
     let mut frame: Vec<proto::Call> = Vec::with_capacity(if accessory_trigger { 3 } else { 2 });
     #[cfg(target_os = "linux")]
     let mut ps3_r2 = None;
+    #[cfg(target_os = "linux")]
+    let mut ps3_idle = ps3_idle::Ps3Idle::default();
     let mut precision = args
         .gamepad_precision
         .then(|| PrecisionDrive::new(period.min(control::REFRESH_INTERVAL)));
@@ -737,6 +741,8 @@ fn run_session(
         let mut button_activity = false;
         let mut pad_disconnected = false;
         while let Some(event) = gilrs.next_event() {
+            #[cfg(target_os = "linux")]
+            ps3_idle.event(event, tick, args.deadzone);
             if Some(event.id) != pad_id {
                 continue;
             }
@@ -823,6 +829,8 @@ fn run_session(
             gate.lost();
             idle_since = None;
             previous_imu_pose = None;
+            #[cfg(target_os = "linux")]
+            ps3_idle.poll(gilrs, tick, args.deadzone, None);
             std::thread::sleep(IDLE_POLL);
             continue;
         };
@@ -886,6 +894,8 @@ fn run_session(
             }
         }
         if suppress_motion || (rest_rearm_required && !pad_neutral(&pad, args.deadzone, head_drive, r2)) {
+            #[cfg(target_os = "linux")]
+            ps3_idle.poll(gilrs, tick, args.deadzone, (r2 > 0).then_some(pad.id()));
             if let Some(precision) = precision.as_mut() {
                 precision.reset();
                 precision.awaiting_completion = false;
@@ -934,6 +944,8 @@ fn run_session(
         }
         let neutral = pad_neutral(&pad, args.deadzone, head_drive, r2);
         let activity = button_activity || imu_moving || !neutral;
+        #[cfg(target_os = "linux")]
+        ps3_idle.poll(gilrs, tick, args.deadzone, activity.then_some(pad.id()));
         if activity {
             idle_since = None;
         }
