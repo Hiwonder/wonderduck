@@ -108,7 +108,10 @@ pub const PHYSICAL_HOME_ENCODER_TARGETS: [u16; NUM_JOINTS] = [
 ];
 
 /// Manual head travel in HX encoder counts, ordered by pitch (ID 31) and yaw (ID 32).
-pub const MANUAL_HEAD_POSITION_LIMITS: [(u16, u16); 2] = [(1100, 2300), (1024, 3072)];
+pub const MANUAL_HEAD_POSITION_LIMITS: [(u16, u16); 2] = [
+    (*duck_ipc_proto::HEAD_PITCH_POSITION_RANGE.start(), *duck_ipc_proto::HEAD_PITCH_POSITION_RANGE.end()),
+    (1024, 3072),
+];
 
 /// Fixed physical Home, separate from the policy's observation and action reference.
 pub fn home_target() -> [f64; NUM_JOINTS] {

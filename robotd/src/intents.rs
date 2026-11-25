@@ -107,6 +107,7 @@ struct MotionTrackingIntent {
     sequence: u64,
     target: Option<[f64; 2]>,
     line_speed: Option<f64>,
+    line_target_x: Option<f64>,
     reference_area: f64,
     deadzone: [f64; 2],
     gains: [[f64; 3]; 2],
@@ -117,6 +118,7 @@ pub struct MotionTrackingSnapshot {
     pub initial_pitch: Option<u16>,
     pub target: Option<[f64; 2]>,
     pub line_speed: Option<f64>,
+    pub line_target_x: Option<f64>,
     pub reference_area: f64,
     pub deadzone: [f64; 2],
     pub gains: [[f64; 3]; 2],
@@ -874,9 +876,10 @@ impl Intents {
                 match params.action {
                     MotionTrackingAction::Start | MotionTrackingAction::Update => {
                         next = MotionTrackingIntent { owner, active: true, at_us: now, epoch,
-                            initial_pitch: if params.action == MotionTrackingAction::Start { initial_pitch } else { previous.initial_pitch },
+                            initial_pitch: if params.action == MotionTrackingAction::Start { initial_pitch }
+                                else { params.initial_pitch.or(previous.initial_pitch) },
                             sequence: if params.action == MotionTrackingAction::Start { previous.sequence.wrapping_add(1) } else { previous.sequence },
-                            target: params.target, line_speed: params.line_speed,
+                            target: params.target, line_speed: params.line_speed, line_target_x: params.line_target_x,
                             reference_area: params.reference_area, deadzone: params.deadzone, gains: params.gains };
                     }
                     MotionTrackingAction::Stop => next.active = false,
@@ -1391,7 +1394,7 @@ impl Intents {
             motion_tracking: (tracking.active && now.saturating_sub(tracking.at_us) <= MOTION_TRACKING_TIMEOUT_US
                 && tracking.epoch == self.motion_tracking_epoch.load(Ordering::Acquire))
                 .then_some(MotionTrackingSnapshot { initial_pitch: tracking.initial_pitch, target: tracking.target,
-                    line_speed: tracking.line_speed, reference_area: tracking.reference_area,
+                    line_speed: tracking.line_speed, line_target_x: tracking.line_target_x, reference_area: tracking.reference_area,
                     deadzone: tracking.deadzone, gains: tracking.gains, sequence: tracking.sequence }),
             coordinated_tracking: (coordinated.epoch == self.coordinated_tracking_epoch.load(Ordering::Acquire))
                 .then(|| coordinated.params.clone()).flatten()
@@ -1439,7 +1442,7 @@ mod autonomous_timeout_tests {
         intents.epoch = Instant::now() - Duration::from_secs(2);
         let mut params = MotionTrackingParams {
             action: Action::Start, initial_pitch: None, target: Some([0.2, 1.0]),
-            line_speed: Some(0.15), reference_area: 0.01, deadzone: [0.0; 2],
+            line_speed: Some(0.15), line_target_x: None, reference_area: 0.01, deadzone: [0.0; 2],
             gains: [[0.0; 3]; 2],
         };
         assert!(intents.update_motion_tracking(1, params));
@@ -1450,9 +1453,16 @@ mod autonomous_timeout_tests {
         assert!(intents.motion_tracking_active());
 
         params.action = Action::Update;
+        params.initial_pitch = Some(1900);
         assert!(!intents.update_motion_tracking(2, params));
         assert!(intents.update_motion_tracking(1, params));
-        assert_eq!(intents.snapshot().motion_tracking.unwrap().target, params.target);
+        let tracking = intents.snapshot().motion_tracking.unwrap();
+        assert_eq!(tracking.target, params.target);
+        assert_eq!(tracking.initial_pitch, Some(1900));
+        assert_eq!(tracking.sequence, old.sequence);
+        params.initial_pitch = None;
+        assert!(intents.update_motion_tracking(1, params));
+        assert_eq!(intents.snapshot().motion_tracking.unwrap().initial_pitch, Some(1900));
         intents.cancel_motion_tracking();
         assert!(!intents.update_motion_tracking(1, params));
     }
@@ -1543,7 +1553,7 @@ mod pickup_tests {
     fn pickup_switch_preserves_live_vision_and_rejects_an_expired_handoff() {
         let config = CoordinatedTrackingParams {
             action: MotionTrackingAction::Start, initial_pitch: Some(1400), target: None, camera: None,
-            head_deadzone: [0.05; 2], head_gains: [[1.0, 0.0, 0.0]; 2], body_gains: [1.0, 0.0, 0.0],
+            head_deadzone: [0.05; 2], head_gains: [[1.0, 0.0, 0.0]; 2], head_target_point: None, body_gains: [1.0, 0.0, 0.0],
             final_body_gains: [1.0, 0.0, 0.0], approach_linear_limit: None, final_linear_limit: 0.1,
             final_lateral_limit: 0.1, final_point: [160.0, 100.0], final_tolerance: [10.0; 2],
             stop_area_px: None, stop_area_deadzone_px: 0, stop_distance_mm: None, stop_distance_deadzone_mm: 0,

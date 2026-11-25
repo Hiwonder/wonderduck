@@ -147,7 +147,8 @@ impl HeadReturn {
             // Proportional compensation cannot wind up indefinitely against a stalled servo.
             let compensated = self.home[axis] + RETURN_FEEDBACK_GAIN * (self.home[axis] - measured[axis]);
             let correction = ((compensated - self.confirmed[axis]) * dt).clamp(-step, step);
-            (self.confirmed[axis] + correction).clamp(TRACKING_LIMITS[axis].0, TRACKING_LIMITS[axis].1)
+            let (min, max) = TRACKING_LIMITS[axis];
+            (self.confirmed[axis] + correction).clamp(min.min(self.home[axis]), max.max(self.home[axis]))
         })
     }
 

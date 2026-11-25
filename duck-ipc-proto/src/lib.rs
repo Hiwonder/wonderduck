@@ -2437,6 +2437,16 @@ pub enum MotionTrackingAction {
     Stop,
 }
 
+/// Default head tracking target in the fixed 320×180 image coordinates.
+pub const HEAD_TRACKING_DEFAULT_POINT: [f64; 2] = [160.0, 90.0];
+
+pub fn valid_tracking_image_point(point: [f64; 2]) -> bool {
+    (0.0..=320.0).contains(&point[0]) && (0.0..=180.0).contains(&point[1])
+}
+
+/// Safe raw encoder travel for commanded ID 31 positions.
+pub const HEAD_PITCH_POSITION_RANGE: std::ops::RangeInclusive<u16> = 1100..=2300;
+
 /// Session-bound head tracking. Coordinates are image offsets in [-1, 1].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2455,7 +2465,7 @@ pub struct HeadTrackingParams {
 impl HeadTrackingParams {
     pub fn valid(&self) -> bool {
         self.target.is_none_or(|target| target.iter().all(|value| value.is_finite() && value.abs() <= 1.0))
-            && self.pitch_position.is_none_or(|value| (1024..=2250).contains(&value) && self.target.is_none())
+            && self.pitch_position.is_none_or(|value| HEAD_PITCH_POSITION_RANGE.contains(&value) && self.target.is_none())
             && self.deadzone.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.gains.iter().all(|axis| axis.iter().all(|value| value.is_finite()))
     }
@@ -2465,7 +2475,7 @@ impl HeadTrackingParams {
 #[serde(deny_unknown_fields)]
 pub struct MotionTrackingParams {
     pub action: MotionTrackingAction,
-    /// Optional raw head pitch handed over when tracking starts.
+    /// Optional raw head pitch on start, or a replacement pitch while following a line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_pitch: Option<u16>,
     /// Horizontal offset and relative area. For line following the second value
@@ -2474,6 +2484,9 @@ pub struct MotionTrackingParams {
     /// Fixed forward velocity in m/s for line following.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_speed: Option<f64>,
+    /// Desired horizontal line position in the upright 320px reference image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_target_x: Option<f64>,
     pub reference_area: f64,
     /// Relative area error and horizontal error as fractions of image width.
     pub deadzone: [f64; 2],
@@ -2548,7 +2561,7 @@ impl TimedMouthPosition {
 #[serde(deny_unknown_fields)]
 pub struct CoordinatedTrackingParams {
     pub action: MotionTrackingAction,
-    /// Optional raw head pitch at start, or a new fixed pitch during continuous following.
+    /// Optional raw head pitch on start, or a replacement pitch during person or head-only tracking.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub initial_pitch: Option<u16>,
     pub target: Option<VisualTrackingTarget>,
@@ -2557,6 +2570,9 @@ pub struct CoordinatedTrackingParams {
     pub head_deadzone: [f64; 2],
     /// Head pitch and yaw PID gains.
     pub head_gains: [[f64; 3]; 2],
+    /// Optional head aiming point in 320×180 image coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_target_point: Option<[f64; 2]>,
     /// Approach-stage forward, lateral, and yaw gains.
     pub body_gains: [f64; 3],
     /// Final-alignment forward, lateral, and yaw gains, in the same units as body_gains.
@@ -2593,10 +2609,20 @@ pub struct CoordinatedTrackingParams {
 }
 
 impl CoordinatedTrackingParams {
+    /// Head-only tracking uses no body gains or arrival actions.
+    pub fn head_only(&self) -> bool {
+        self.stop_area_px.is_none()
+            && self.body_gains == [0.0; 3]
+            && self.final_body_gains == [0.0; 3]
+            && self.arrival_skill.is_empty()
+            && !self.mouth_before.enabled
+            && !self.mouth_after.enabled
+    }
+
     pub fn valid(&self) -> bool {
-        self.initial_pitch.is_none_or(|value| (1024..=2250).contains(&value)
+        self.initial_pitch.is_none_or(|value| HEAD_PITCH_POSITION_RANGE.contains(&value)
             && (self.action == MotionTrackingAction::Start
-                || (self.action == MotionTrackingAction::Update && self.stop_area_px.is_some())))
+                || (self.action == MotionTrackingAction::Update && (self.stop_area_px.is_some() || self.head_only()))))
             && self.camera.is_none_or(|camera| camera.valid())
             && self.target.is_none_or(|target| {
                 self.camera.is_some()
@@ -2610,13 +2636,13 @@ impl CoordinatedTrackingParams {
             && (self.stop_distance_mm.is_none() || self.stop_area_px.is_some())
             && self.head_deadzone.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.head_gains.iter().flatten().all(|value| value.is_finite())
+            && self.head_target_point.is_none_or(valid_tracking_image_point)
             && self.body_gains.iter().all(|value| value.is_finite())
             && self.final_body_gains.iter().all(|value| value.is_finite())
             && self.approach_linear_limit.is_none_or(|value| value.is_finite() && value >= 0.0)
             && self.final_linear_limit.is_finite() && self.final_linear_limit >= 0.0
             && self.final_lateral_limit.is_finite() && self.final_lateral_limit >= 0.0
-            && self.final_point[0].is_finite() && (0.0..=320.0).contains(&self.final_point[0])
-            && self.final_point[1].is_finite() && (0.0..=180.0).contains(&self.final_point[1])
+            && valid_tracking_image_point(self.final_point)
             && self.final_tolerance.iter().all(|value| value.is_finite() && *value >= 0.0)
             && self.arrival_delay_s.is_finite() && self.arrival_delay_s >= 0.0
             && self.mouth_before.valid() && self.mouth_after.valid()
@@ -2657,8 +2683,11 @@ impl MazeParams {
 
 impl MotionTrackingParams {
     pub fn valid(&self) -> bool {
-        self.initial_pitch.is_none_or(|value| self.action == MotionTrackingAction::Start && (1024..=2250).contains(&value))
+        self.initial_pitch.is_none_or(|value| HEAD_PITCH_POSITION_RANGE.contains(&value)
+            && (self.action == MotionTrackingAction::Start
+                || (self.action == MotionTrackingAction::Update && self.line_speed.is_some())))
             && self.line_speed.is_none_or(|value| (0.0..=0.4).contains(&value))
+            && self.line_target_x.is_none_or(|x| self.line_speed.is_some() && (0.0..=320.0).contains(&x))
             && self.reference_area.is_finite() && (0.0..=1.0).contains(&self.reference_area)
             && self.reference_area > 0.0
             && self.target.is_none_or(|[x, secondary]| x.abs() <= 1.0 && secondary > 0.0

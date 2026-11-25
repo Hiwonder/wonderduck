@@ -1513,8 +1513,8 @@ impl Tracker {
             })
         };
         let head_yaw_per_body_yaw = -(inverse[1][0] * body_image[0] + inverse[1][1] * body_image[1]);
-        // Continuous following aims at the configured image position while it approaches.
-        let goal = if params.stop_area_px.is_some() { window.goal } else { [0.0; 2] };
+        let goal = params.head_target_point.map(final_point)
+            .unwrap_or_else(|| if params.stop_area_px.is_some() { window.goal } else { [0.0; 2] });
         let head_errors = [point[1] - goal[1], point[0] - goal[0]];
         let head_deadzone_limit = if params.stop_area_px.is_some() {
             [params.final_tolerance[1] / 180.0, params.final_tolerance[0] / 320.0]
@@ -1525,7 +1525,7 @@ impl Tracker {
         ];
         let stamp = frame.target.captured_at_unix_us;
         // PID order is pitch/yaw, while the image Jacobian uses x/y rows.
-        let head_sample_errors = [point[1] - goal[1], point[0] - goal[0]];
+        let head_sample_errors = head_errors;
         let previous_head = next.head;
         let mut head_output = [0.0; 2];
         for axis in 0..2 {

@@ -35,6 +35,7 @@ impl MotionTracker {
         &mut self,
         target: Option<[f64; 2]>,
         speed: f64,
+        target_x: f64,
         deadzone: f64,
         gains: [f64; 3],
         dt: f64,
@@ -43,12 +44,13 @@ impl MotionTracker {
             self.reset();
             return None;
         };
-        let centered = horizontal.abs() / 2.0 <= deadzone;
+        let error = horizontal - (target_x / 160.0 - 1.0);
+        let centered = error.abs() / 2.0 <= deadzone;
         let yaw = if centered {
             self.yaw = Axis::default();
             0.0
         } else {
-            let angle = -(horizontal * aspect).atan();
+            let angle = -(error * aspect).atan();
             self.yaw.step(angle, dt, gains)
         };
         Some(TrackingOutput { twist: [speed, 0.0, yaw], in_deadzone: [false, centered] })
@@ -95,12 +97,12 @@ mod tests {
     fn line_pid_uses_image_angle_and_resets_on_loss() {
         let mut tracker = MotionTracker::default();
         let gains = [1.1, 0.0, 0.1];
-        let centered = tracker.follow_line(Some([0.01, 16.0 / 9.0]), 0.15, 0.01, gains, 0.02).unwrap();
+        let centered = tracker.follow_line(Some([0.01, 16.0 / 9.0]), 0.15, 160.0, 0.01, gains, 0.02).unwrap();
         assert_eq!(centered.twist, [0.15, 0.0, 0.0]);
-        let right = tracker.follow_line(Some([0.5, 16.0 / 9.0]), 0.15, 0.01, gains, 0.02).unwrap();
+        let right = tracker.follow_line(Some([0.5, 16.0 / 9.0]), 0.15, 160.0, 0.01, gains, 0.02).unwrap();
         assert_eq!(right.twist, [0.15, 0.0, -1.1 * (8.0_f64 / 9.0).atan()]);
-        assert!(tracker.follow_line(None, 0.15, 0.01, gains, 0.02).is_none());
-        let left = tracker.follow_line(Some([-0.5, 16.0 / 9.0]), 0.15, 0.01, gains, 0.02).unwrap();
+        assert!(tracker.follow_line(None, 0.15, 160.0, 0.01, gains, 0.02).is_none());
+        let left = tracker.follow_line(Some([-0.5, 16.0 / 9.0]), 0.15, 160.0, 0.01, gains, 0.02).unwrap();
         assert_eq!(left.twist[2], -right.twist[2]);
     }
 }

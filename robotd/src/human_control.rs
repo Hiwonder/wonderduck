@@ -644,7 +644,7 @@ mod tests {
                 initial_pitch: None,
                 target: None,
                 line_speed: Some(0.1),
-                reference_area: 1.0,
+                line_target_x: None, reference_area: 1.0,
                 deadzone: [0.0; 2],
                 gains: [[0.0; 3]; 2],
             }));

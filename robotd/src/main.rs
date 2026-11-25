@@ -3568,16 +3568,6 @@ fn target_follow_motion_settled(twist: [f64; 3], gyro: [f64; 3]) -> bool {
         && gyro[2].abs() < 0.25
 }
 
-/// The target UI selects the existing head-only controller by requesting zero body
-/// gains and no arrival actions. Person follow and staged target control remain unchanged.
-fn coordinated_target_head_only(params: &proto::CoordinatedTrackingParams) -> bool {
-    params.stop_area_px.is_none()
-        && params.body_gains == [0.0; 3]
-        && params.final_body_gains == [0.0; 3]
-        && params.arrival_skill.is_empty()
-        && !params.mouth_before.enabled && !params.mouth_after.enabled
-}
-
 /// Keep walking during actual movement and head homing. Merely entering the visual
 /// confirmation window must not switch a stopped robot back to the walking policy:
 /// a target near the boundary can alternate between confirmation and alignment.
@@ -5952,7 +5942,7 @@ async fn control_loop<T: RobotIo>(
             maze_previous_phase = maze_state;
         }
         if let Some(tracking) = snapshot.coordinated_tracking.as_ref() {
-            let head_only = coordinated_target_head_only(&tracking.params);
+            let head_only = tracking.params.head_only();
             if coordinated_tracking_sequence != Some(tracking.sequence)
                 || coordinated_head_only_mode != Some(head_only)
             {
@@ -6067,8 +6057,12 @@ async fn control_loop<T: RobotIo>(
                         None => {
                             if head_only {
                                 let _ = coordinated_initial_head.take_handoff();
-                                let point = tracking.params.target.map(|target| target.point);
-                                target_head_tracker.step([joints[1], joints[2]], point,
+                                let target_point = tracking.params.head_target_point.unwrap_or(proto::HEAD_TRACKING_DEFAULT_POINT);
+                                let error = tracking.params.target.map(|target| [
+                                    target.point[0] - (target_point[0] / 160.0 - 1.0),
+                                    target.point[1] - (target_point[1] / 90.0 - 1.0),
+                                ]);
+                                target_head_tracker.step([joints[1], joints[2]], error,
                                     tracking.params.head_deadzone, tracking.params.head_gains, elapsed.min(0.1))
                                     .map(|head| coordinated_tracking::Step::Following {
                                         head, twist: [0.0; 3], deadzone: [true; 3],
@@ -6222,7 +6216,8 @@ async fn control_loop<T: RobotIo>(
                 && controller.as_ref().is_some_and(|controller| !controller.busy() && !controller.is_sitting());
             let target = if eligible { tracking.target } else { None };
             let twist = if let Some(speed) = tracking.line_speed {
-                motion_tracker.follow_line(target, speed, tracking.deadzone[1], tracking.gains[1], dt)
+                motion_tracker.follow_line(target, speed, tracking.line_target_x.unwrap_or(160.0),
+                    tracking.deadzone[1], tracking.gains[1], dt)
             } else {
                 motion_tracker.step(target, tracking.reference_area, tracking.deadzone, tracking.gains, dt)
             };
@@ -8651,7 +8646,7 @@ async fn control_loop<T: RobotIo>(
             else if !snapshot.enabled || !driving || bringup != Bringup::Ready { Phase::WaitingRobot }
             else if !coordinated_initial_head.arrived() { Phase::InitialHead }
             // Reuse existing wire phases without changing the shared IPC version.
-            else if coordinated_target_head_only(&tracking.params) {
+            else if tracking.params.head_only() {
                 if tracking.params.target.is_some() { Phase::Approach } else { Phase::WaitingTarget }
             }
             else { coordinated_tracker.phase() }
@@ -8736,7 +8731,7 @@ async fn control_loop<T: RobotIo>(
             if let Some(tracking) = snapshot.coordinated_tracking.as_ref()
                 .filter(|tracking| tracking.params.stop_area_px.is_none())
             {
-                let head_only = coordinated_target_head_only(&tracking.params);
+                let head_only = tracking.params.head_only();
                 sample.target_follow = Some(record::TargetFollowSample {
                     realtime_ns: proto::clock::realtime_ns(), sequence: tracking.sequence,
                     mode: if head_only { "head_only" } else { "coordinated" },
@@ -9611,10 +9606,10 @@ async fn handle(
     let mut session = human_control::Session::new();
     let result = handle_session(Arc::clone(&state), Arc::clone(&intents), stream, is_gamepad, &mut session).await;
     intents.update_head_tracking(session.id(), proto::HeadTrackingParams { pitch_position: None, action: proto::MotionTrackingAction::Stop, target: None, deadzone: [0.0; 2], gains: [[0.0; 3]; 2] });
-    intents.update_motion_tracking(session.id(), proto::MotionTrackingParams { initial_pitch: None, action: proto::MotionTrackingAction::Stop, target: None, line_speed: None, reference_area: 1.0, deadzone: [0.0; 2], gains: [[0.0; 3]; 2] });
+    intents.update_motion_tracking(session.id(), proto::MotionTrackingParams { initial_pitch: None, action: proto::MotionTrackingAction::Stop, target: None, line_speed: None, line_target_x: None, reference_area: 1.0, deadzone: [0.0; 2], gains: [[0.0; 3]; 2] });
     intents.update_coordinated_tracking(session.id(), proto::CoordinatedTrackingParams { initial_pitch: None,
         action: proto::MotionTrackingAction::Stop, target: None, camera: None,
-        head_deadzone: [0.0; 2], head_gains: [[0.0; 3]; 2], body_gains: [0.0; 3],
+        head_deadzone: [0.0; 2], head_gains: [[0.0; 3]; 2], head_target_point: None, body_gains: [0.0; 3],
         final_body_gains: [0.0; 3], approach_linear_limit: None,
         final_linear_limit: proto::COORDINATED_TRACKING_DEFAULT_FINAL_LINEAR_LIMIT,
         final_lateral_limit: proto::COORDINATED_TRACKING_DEFAULT_FINAL_LINEAR_LIMIT,
