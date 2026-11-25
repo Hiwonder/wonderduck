@@ -2,13 +2,19 @@
 
 English | [简体中文](README_zh.md)
 
-WonderDuck provides robot control software and WonderDuck Studio. It is based on Pollen Robotics Microduck. [WonderDuck Studio on GitHub](https://github.com/Hiwonder/wonderduck_studio) · [Microduck](https://github.com/pollen-robotics/microduck)
+WonderDuck provides robot control software and [WonderDuck Studio](https://github.com/Hiwonder/wonderduck_studio). It is based on [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck).
 
 ## Update and deployment
 
-On a configured device, open **System settings → Software version → Check for updates** in Studio. The English interface checks GitHub and the Chinese interface checks Gitee. Confirm the version to start the update. Studio shows download progress, installation, and recovery if installation or startup fails.
+Both update methods require a device with the system image installed and configured. Before updating, open **Network → Wi-Fi network** in Studio and connect the robot to a trusted Wi-Fi network with internet access.
 
-On a device with a configured system image, select **Rest** and wait for it to finish. Run the following command in the device terminal.
+### Studio 0.2.0 and later
+
+In Studio, open **Settings → Software version → Check for updates**. Confirm the version to start the update. Studio shows download progress, installation, and recovery if installation or startup fails.
+
+### Studio versions earlier than 0.2.0
+
+Update from the device terminal. Select **Rest** in Studio, wait for it to finish, then run the following command in the device terminal.
 
 ```bash
 python3 <(curl -fsSL --connect-timeout 10 https://raw.githubusercontent.com/Hiwonder/wonderduck/main/scripts/update.py) --lang en
@@ -18,11 +24,7 @@ Select **1 (GitHub)**. Enter a version or press Enter for the latest stable rele
 
 Installation updates the startup configuration and preserves device calibration, models, and action groups. If a local file conflicts with the new version, the update stops and keeps the original file. Resolve the conflict and run the commands again.
 
-Studio provides control over the local network. Connect the robot to a trusted network.
-
 ## Cross-compile on a computer
-
-When adding or changing user-facing text, maintain and verify the Simplified Chinese and English versions together. Include control labels, dialogs, status messages, and error explanations.
 
 These steps are for an x86-64 Ubuntu computer and a robot with a configured WonderDuck image. On the computer, install Git, curl, rsync, pkg-config, Python 3 with `venv`, a C compiler and Node.js 20, then clone the repository.
 
@@ -72,7 +74,9 @@ npm ci --prefix extensions/wonderduck_studio/console/web
 npm run build --prefix extensions/wonderduck_studio/console/web
 ```
 
-To deploy this local build, select **Rest** on the robot and wait for it to finish, then run the following in the same computer terminal. Newly added source files must first be tracked by Git. These commands replace program files but preserve models, action groups, calibration and `/etc/robot`:
+To deploy the local build, select **Rest** in Studio and wait for it to finish. Run the commands below in the same terminal you used to build the software.
+
+Source synchronization copies only files tracked by Git. Deployment replaces program files and preserves device models, action groups, calibration, and `/etc/robot`.
 
 ```bash
 (
@@ -89,7 +93,7 @@ ssh "$robot" 'sudo systemctl restart wonderduck-prompt-sounds && sudo systemctl 
 )
 ```
 
-If a command fails, the robot service may remain stopped; resolve the error and run the deployment again. This developer deployment does not update firmware, drivers or system service configuration. It can leave the device's Git checkout modified; resolve any conflicts reported by the official updater before installing a release.
+If deployment fails, the robot service may remain stopped. Resolve the error and run the deployment again. Update firmware, drivers, or system service configuration separately as needed. If a later release update reports local file conflicts on the device, resolve them and retry.
 
 ## Build and deploy on the robot
 

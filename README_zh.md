@@ -2,13 +2,19 @@
 
 [English](README.md) | 简体中文
 
-WonderDuck 提供机器人控制程序和 WonderDuck Studio。本项目基于 Pollen Robotics Microduck。 [WonderDuck Studio（Gitee）](https://gitee.com/hiwonder_official/wonderduck_studio) · [Microduck](https://github.com/pollen-robotics/microduck)
+WonderDuck 提供机器人控制程序和 [WonderDuck Studio](https://gitee.com/hiwonder_official/wonderduck_studio)。本项目基于 [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck)。
 
 ## 更新与部署
 
-已配置的设备可在 Studio 打开「系统设置 → 软件版本 → 检查更新」。中文界面检查 Gitee，英文界面检查 GitHub。确认版本后开始更新。页面显示下载进度、安装状态，以及安装或启动失败后的恢复结果。
+以下两种更新方式均适用于已烧录并完成配置的设备。更新前，先在 Studio 的「网络管理 → 局域网模式」中将机器人连接到可访问互联网的可信 Wi-Fi 网络。
 
-适用于已烧录并完成配置的设备镜像。先在网页点击「休息」并等待完成，然后在设备终端执行下方命令。
+### Studio 0.2.0 及以上
+
+在 Studio 打开「系统设置 → 软件版本 → 检查更新」。确认版本后开始更新。页面显示下载进度、安装状态，以及安装或启动失败后的恢复结果。
+
+### Studio 0.2.0 之前的版本
+
+通过设备终端更新。先在 Studio 点击「休息」并等待完成，然后在设备终端执行以下命令。
 
 ```bash
 python3 <(curl -fsSL --connect-timeout 10 https://gitee.com/hiwonder_official/wonderduck/raw/main/scripts/update.py) --lang zh
@@ -18,11 +24,7 @@ python3 <(curl -fsSL --connect-timeout 10 https://gitee.com/hiwonder_official/wo
 
 安装时会覆盖开机启动配置，保留设备标定、模型和动作组。如果本地文件与新版本冲突，更新会停止并提示，原文件会保留。处理问题后可重新执行更新命令。
 
-Studio 提供局域网控制功能；使用时请将机器人接入可信网络。
-
 ## 在电脑上交叉编译
-
-新增或修改面向用户的文字时，同步维护并验证简体中文和英文，包括控件名称、弹窗、状态提示和错误说明。
 
 以下步骤适用于 x86-64 Ubuntu 电脑，以及已配置 WonderDuck 镜像的设备。在电脑上安装 Git、curl、rsync、pkg-config、带 `venv` 的 Python 3、C 编译器和 Node.js 20，再克隆仓库。
 
@@ -72,7 +74,7 @@ npm ci --prefix extensions/wonderduck_studio/console/web
 npm run build --prefix extensions/wonderduck_studio/console/web
 ```
 
-部署本机编译结果时，先在网页点击“休息”并等待完成，再在同一个电脑终端执行以下命令。新增的源码文件需先纳入 Git 跟踪。这些命令会覆盖程序文件，并保留模型、动作组、标定和 `/etc/robot`：
+部署本机编译结果前，先在 Studio 点击「休息」并等待完成，再回到电脑上用于编译的终端执行以下命令。源码同步只包含 Git 已跟踪的文件。部署会覆盖程序文件，并保留设备上的模型、动作组、标定和 `/etc/robot`。
 
 ```bash
 (
@@ -89,7 +91,7 @@ ssh "$robot" 'sudo systemctl restart wonderduck-prompt-sounds && sudo systemctl 
 )
 ```
 
-如果执行失败，机器人服务可能保持停止；请排除错误后重新执行部署。此开发部署不会更新固件、驱动或系统服务配置，也可能使设备的 Git 工作区出现修改；之后安装正式版时，请先处理更新程序提示的文件冲突。
+如果部署失败，机器人服务可能保持停止。请排除错误后重新部署。如需更新固件、驱动或系统服务配置，请单独操作。若之后安装正式版时提示设备上的本地文件有冲突，请先处理冲突再重试。
 
 ## 在实机上编译和部署
 
