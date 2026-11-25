@@ -1,23 +1,30 @@
 {
   "microphone": "alsa_input.platform-sound-audio.stereo-fallback",
   "kws": {
+    "provider": "rknn",
     "tokens": "kws-vad/wenetspeech/tokens.txt",
-    "encoder": "kws-vad/wenetspeech/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-    "decoder": "kws-vad/wenetspeech/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
-    "joiner": "kws-vad/wenetspeech/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx",
+    "encoder": "rknn-models/kws/encoder.rknn",
+    "decoder": "rknn-models/kws/decoder.rknn",
+    "joiner": "rknn-models/kws/joiner.rknn",
     "keywords_file": "kws-vad/keywords-wonderduck.txt"
   },
-  "vad": "kws-vad/official-silero-vad.onnx",
+  "vad": {
+    "provider": "rknn",
+    "model": "rknn-models/silero-vad-v4-rk3566.rknn"
+  },
   "asr": {
+    "provider": "rknn",
     "tokens": "asr/zipformer14/tokens.txt",
-    "encoder": "asr/zipformer14/encoder-epoch-99-avg-1.int8.onnx",
-    "decoder": "asr/zipformer14/decoder-epoch-99-avg-1.int8.onnx",
-    "joiner": "asr/zipformer14/joiner-epoch-99-avg-1.int8.onnx",
+    "encoder": "rknn-models/asr/encoder.rknn",
+    "decoder": "rknn-models/asr/decoder.rknn",
+    "joiner": "rknn-models/asr/joiner.rknn",
     "model_type": "zipformer"
   },
   "tts": {
-    "type": "vits",
-    "model": "tts/models/vits-piper-zh_CN-huayan-medium/zh_CN-huayan-medium.onnx",
-    "tokens": "tts/models/vits-piper-zh_CN-huayan-medium/tokens.txt"
+    "type": "vits-rknn",
+    "provider": "rknn",
+    "encoder": "rknn-models/tts/encoder.onnx",
+    "decoder": "rknn-models/tts/decoder.rknn",
+    "phoneme_config": "rknn-models/tts/phoneme.json"
   }
 }

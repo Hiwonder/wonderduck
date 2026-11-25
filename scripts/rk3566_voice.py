@@ -2,23 +2,54 @@
 
 import argparse
 from contextlib import contextmanager
+import ctypes
 from itertools import chain
 import json
+import os
 from pathlib import Path
 import resource
 import subprocess
 import sys
+from tempfile import NamedTemporaryFile
+from threading import Thread
 import time
 import wave
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-# The RK3566 deployment keeps the ARM64 wheels beside the test programs.
-for dependency in (SCRIPT_DIR / "runtime/python", SCRIPT_DIR / "tts/frontend"):
+# Source launchers and the installed test programs share the deployed runtime.
+VOICE_DIR = SCRIPT_DIR
+if SCRIPT_DIR.name == "scripts" and (SCRIPT_DIR.parent / "target/voice-demo/runtime").is_dir():
+    VOICE_DIR = SCRIPT_DIR.parent / "target/voice-demo"
+for dependency in (VOICE_DIR / "runtime/python", VOICE_DIR / "tts/frontend"):
     if dependency.is_dir():
         sys.path.insert(0, str(dependency))
 
 import numpy as np
-import sherpa_onnx as sherpa
+
+
+def speech_runtime(root):
+    runtime = root / "runtime"
+    return runtime if runtime.is_dir() else VOICE_DIR / "runtime"
+
+
+def load_sherpa(root, *, use_rknn):
+    runtime = speech_runtime(root)
+    module = runtime / "python"
+    if use_rknn:
+        module = runtime / "python-rknn"
+        library = runtime / "lib/librknnrt.so"
+        if not module.is_dir() or not library.is_file():
+            raise RuntimeError(f"RKNN Sherpa-ONNX runtime is missing from {runtime}")
+        ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+    if module.is_dir() and str(module) not in sys.path:
+        sys.path.insert(0, str(module))
+    try:
+        import sherpa_onnx
+    except ModuleNotFoundError as error:
+        if error.name != "sherpa_onnx":
+            raise
+        raise RuntimeError(f"Sherpa-ONNX is missing from {speech_runtime(root)}") from error
+    return sherpa_onnx
 
 
 SAMPLE_RATE = 16000
@@ -27,17 +58,36 @@ VAD_WINDOW = 512
 
 def test_parser(description):
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--config", type=Path, default=SCRIPT_DIR / "rk3566-voice-demo.json")
+    parser.add_argument("--config", type=Path, default=VOICE_DIR / "rk3566-voice-demo.json")
     return parser
 
 
-def add_microphone_arguments(parser):
-    parser.add_argument("--source", help="Override the configured PulseAudio microphone")
+def add_microphone_arguments(parser, *, source=None):
+    parser.add_argument("--source", default=source, help="Override the configured PulseAudio microphone")
     parser.epilog = "Press Ctrl+C to stop listening."
 
 
-def load_config(path):
-    return path.resolve().parent, json.loads(path.read_text(encoding="utf-8"))
+def load_config(path, *, section=None, overrides=None):
+    path = path.resolve()
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if section is not None:
+        model = config.get(section, {})
+        if section == "vad" and isinstance(model, str):
+            model = {"model": model}
+        model.update({key: value for key, value in (overrides or {}).items() if value is not None})
+        config[section] = model
+
+    active = config if section is None else {section: config[section]}
+    use_rknn = active.get("tts", {}).get("type") == "vits-rknn"
+    for name in ("kws", "vad", "asr"):
+        model = active.get(name, {})
+        if isinstance(model, dict) and model.get("provider") == "rknn":
+            use_rknn = True
+            break
+
+    global sherpa
+    sherpa = load_sherpa(path.parent, use_rknn=use_rknn)
+    return path.parent, config
 
 
 def available_memory_mib():
@@ -92,12 +142,33 @@ def open_microphone(args, config):
                     capture.wait()
 
 
-def load_spotter(root, config):
-    return sherpa.KeywordSpotter(
-        **model_files(root, config, "tokens", "encoder", "decoder", "joiner", "keywords_file"),
-        num_threads=1, keywords_threshold=config.get("threshold", 0.25),
-        keywords_score=config.get("score", 1.0), num_trailing_blanks=config.get("trailing_blanks", 1),
+def speech_threads(config, provider):
+    # Sherpa passes this value to RKNN as a core selection. Use automatic
+    # selection for the RK3566's single core.
+    return 1 if provider == "rknn" else config.get("threads", 1)
+
+
+def load_spotter(root, config, *, keywords=None):
+    provider = config.get("provider", "cpu")
+    settings = dict(
+        **model_files(root, config, "tokens", "encoder", "decoder", "joiner"),
+        provider=provider,
+        num_threads=speech_threads(config, provider),
+        keywords_threshold=config.get("threshold", 0.25),
+        keywords_score=config.get("score", 1.0),
+        num_trailing_blanks=config.get("trailing_blanks", 1),
     )
+    emit("kws_backend", provider=provider)
+    if keywords is None:
+        return sherpa.KeywordSpotter(**settings, keywords_file=str(root / config["keywords_file"]))
+
+    if not keywords.strip():
+        raise ValueError("KEYWORDS must contain a Sherpa-ONNX keyword entry")
+    # Sherpa reads the keyword file when the spotter is constructed.
+    with NamedTemporaryFile(mode="w", encoding="utf-8") as keyword_file:
+        keyword_file.write(keywords.strip() + "\n")
+        keyword_file.flush()
+        return sherpa.KeywordSpotter(**settings, keywords_file=keyword_file.name)
 
 
 def detect_keyword(spotter, stream):
@@ -124,32 +195,45 @@ def emit_speech(segment, offset=0):
     return samples
 
 
-def make_vad(path):
+def make_vad(root, model):
+    if isinstance(model, str):
+        model = {"model": model}
     config = sherpa.VadModelConfig()
     config.sample_rate = SAMPLE_RATE
-    config.num_threads = 1
-    config.silero_vad.model = str(path)
+    config.provider = model.get("provider", "cpu")
+    config.num_threads = speech_threads(model, config.provider)
+    config.silero_vad.model = str(root / model["model"])
     config.silero_vad.window_size = VAD_WINDOW
-    config.silero_vad.min_silence_duration = 0.4
-    config.silero_vad.min_speech_duration = 0.25
-    return sherpa.VoiceActivityDetector(config, 30.0)
+    if "threshold" in model:
+        config.silero_vad.threshold = model["threshold"]
+    config.silero_vad.min_silence_duration = model.get("min_silence_duration", 0.4)
+    config.silero_vad.min_speech_duration = model.get("min_speech_duration", 0.25)
+    detector = sherpa.VoiceActivityDetector(config, 30.0)
+    emit("vad_backend", provider=config.provider)
+    return detector
 
 
 def load_recognizer(root, config, *, enable_endpoints=False):
     started = time.perf_counter()
-    threads = config.get("threads", 1)
+    provider = config.get("provider", "cpu")
+    settings = dict(
+        provider=provider,
+        num_threads=speech_threads(config, provider),
+        enable_endpoint_detection=enable_endpoints,
+        rule1_min_trailing_silence=config.get("rule1_min_trailing_silence", 2.4),
+        rule2_min_trailing_silence=config.get("rule2_min_trailing_silence", 1.2),
+        rule3_min_utterance_length=config.get("rule3_min_utterance_length", 20.0),
+    )
     if config["model_type"] == "zipformer2_ctc":
         recognizer = sherpa.OnlineRecognizer.from_zipformer2_ctc(
-            **model_files(root, config, "tokens", "model"), num_threads=threads,
-            enable_endpoint_detection=enable_endpoints,
+            **model_files(root, config, "tokens", "model"), **settings,
         )
     else:
         recognizer = sherpa.OnlineRecognizer.from_transducer(
             **model_files(root, config, "tokens", "encoder", "decoder", "joiner"),
-            model_type=config["model_type"], num_threads=threads,
-            enable_endpoint_detection=enable_endpoints,
+            model_type=config["model_type"], **settings,
         )
-    emit("asr_loaded", load_ms=elapsed_ms(started), peak_rss_mib=peak_rss_mib())
+    emit("asr_loaded", provider=provider, load_ms=elapsed_ms(started), peak_rss_mib=peak_rss_mib())
     return recognizer
 
 
@@ -163,6 +247,14 @@ def finish_recognition(recognizer, stream):
 
 def load_synthesizer(root, config):
     started = time.perf_counter()
+    if config["type"] == "vits-rknn":
+        from rk3566_tts import RknnPiper
+
+        engine = RknnPiper(root, config, speech_runtime(root))
+        emit("tts_loaded", provider="rknn", encoder_provider="cpu",
+             load_ms=elapsed_ms(started), peak_rss_mib=peak_rss_mib())
+        return engine
+
     threads = config.get("threads", 2)
     rules = ""
     if config["type"] == "vits":
@@ -187,13 +279,16 @@ def load_synthesizer(root, config):
 
 def synthesize(engine, model_type, text, output):
     started = time.perf_counter()
-    generation = sherpa.GenerationConfig()
-    generation.num_steps = 3
-    if model_type == "vits":
-        from piper_phonemize import phonemize_espeak
-        phonemes = phonemize_espeak(text, "cmn")
-        generation.phoneme_codepoints = [[ord(char) for char in sentence] for sentence in phonemes]
-    audio = engine.generate(text, generation)
+    if model_type == "vits-rknn":
+        audio = engine.generate(text)
+    else:
+        generation = sherpa.GenerationConfig()
+        generation.num_steps = 3
+        if model_type == "vits":
+            from piper_phonemize import phonemize_espeak
+            phonemes = phonemize_espeak(text, "cmn")
+            generation.phoneme_codepoints = [[ord(char) for char in sentence] for sentence in phonemes]
+        audio = engine.generate(text, generation)
     generation_ms = elapsed_ms(started)
 
     samples = np.asarray(audio.samples, dtype=np.float32)
@@ -212,8 +307,15 @@ def synthesize(engine, model_type, text, output):
 
 
 def play_audio(output, duration):
+    player = SCRIPT_DIR / "audio-output.py"
+    if not player.is_file() and SCRIPT_DIR.parent.name == "target":
+        player = SCRIPT_DIR.parents[1] / "scripts/audio-output.py"
+    if not player.is_file():
+        raise RuntimeError(f"Robot speaker player is missing: {player}")
+    # Reuse the robot's amplifier enable, warm-up and output lock while
+    # PulseAudio shares the codec with microphone capture.
     subprocess.run(
-        ["paplay", "--client-name=WonderDuck voice test", str(output)],
+        [str(player), "-q", "-D", "pulse", str(output.resolve())],
         check=True, timeout=duration + 10,
     )
 
@@ -228,8 +330,38 @@ def emit_done(status, **fields):
          available_mib=available_memory_mib())
 
 
-def run_microphone_test(main):
-    try:
-        main()
-    except KeyboardInterrupt:
-        emit_done("stopped")
+@contextmanager
+def filter_rknn_stderr():
+    # Sherpa calls rknn_set_core_mask for multi-core chips. The RK3566 uses
+    # its single core automatically, yet this notice can repeat every frame.
+    warning = (b"Failed to select npu core to run the model "
+               b"(You can ignore it if you are not using RK3588.")
+    with os.fdopen(os.dup(2), "wb", buffering=0) as stderr:
+        read_fd, write_fd = os.pipe()
+
+        def forward():
+            with os.fdopen(read_fd, "rb") as reader:
+                for line in reader:
+                    if b"/csrc/rknn/utils.cc:SetCoreMask:" in line and line.rstrip().endswith(warning):
+                        continue
+                    stderr.write(line)
+
+        worker = Thread(target=forward)
+        worker.start()
+        try:
+            os.dup2(write_fd, 2)
+        finally:
+            os.close(write_fd)
+        try:
+            yield
+        finally:
+            os.dup2(stderr.fileno(), 2)
+            worker.join()
+
+
+def run_speech_test(main):
+    with filter_rknn_stderr():
+        try:
+            main()
+        except KeyboardInterrupt:
+            emit_done("stopped")

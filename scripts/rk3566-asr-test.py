@@ -6,17 +6,40 @@ import time
 from rk3566_voice import (
     SAMPLE_RATE, add_microphone_arguments, emit, emit_done, emit_ready,
     finish_recognition, load_config, load_recognizer, open_microphone,
-    run_microphone_test, test_parser,
+    run_speech_test, test_parser,
 )
+
+
+# 配置 / Settings
+# None 继承 JSON 或程序默认值。相对模型路径以 JSON 所在目录为基准。
+# None inherits JSON or program defaults. Model paths are relative to the JSON file.
+SOURCE = None  # PulseAudio source, overridable with --source
+SHOW_PARTIAL = False  # Overridable with --partial or --no-partial
+MODEL_OVERRIDES = {
+    "provider": None,  # rknn or cpu
+    "model_type": None,  # zipformer or zipformer2_ctc
+    "tokens": None,
+    "encoder": None,  # Transducer models
+    "decoder": None,
+    "joiner": None,
+    "model": None,  # zipformer2_ctc only
+    "threads": None,  # CPU only, default 1
+    "rule1_min_trailing_silence": None,  # Seconds without decoded tokens, default 2.4
+    "rule2_min_trailing_silence": None,  # Seconds after decoded tokens, default 1.2
+    "rule3_min_utterance_length": None,  # Seconds to force an endpoint, default 20.0
+}
 
 
 def main():
     parser = test_parser(__doc__)
-    add_microphone_arguments(parser)
-    parser.add_argument("--partial", action="store_true", help="Show the transcript as it changes")
+    add_microphone_arguments(parser, source=SOURCE)
+    partial = parser.add_mutually_exclusive_group()
+    partial.add_argument("--partial", action="store_true", help="Show the transcript as it changes")
+    partial.add_argument("--no-partial", action="store_false", dest="partial", help="Show final transcripts only")
+    parser.set_defaults(partial=SHOW_PARTIAL)
     args = parser.parse_args()
 
-    root, config = load_config(args.config)
+    root, config = load_config(args.config, section="asr", overrides=MODEL_OVERRIDES)
     started = time.perf_counter()
     recognizer = load_recognizer(root, config["asr"], enable_endpoints=True)
     stream = recognizer.create_stream()
@@ -58,4 +81,4 @@ def main():
 
 
 if __name__ == "__main__":
-    run_microphone_test(main)
+    run_speech_test(main)
