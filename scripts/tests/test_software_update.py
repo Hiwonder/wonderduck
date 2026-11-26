@@ -1,8 +1,10 @@
 import fcntl
 import importlib.util
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
+import io
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -108,6 +110,71 @@ class SoftwareUpdateTests(unittest.TestCase):
         with patch.object(UPDATE, 'read_url', side_effect=[b'{"studio": true}', b'<html></html>']):
             with self.assertRaisesRegex(ValueError, 'Studio 页面'):
                 UPDATE.check_studio(8090)
+
+    def test_legacy_installer_diagnostics_follow_the_update_language(self):
+        original = '运行包操作失败：发布清单签名校验失败'
+        error = subprocess.CalledProcessError(1, ['runtime_release.py'], stderr=original.encode())
+        for language, message in (
+            ('zh', original),
+            ('en', 'Runtime bundle operation failed: Release manifest signature verification failed'),
+        ):
+            with self.subTest(language=language):
+                with redirect_stderr(io.StringIO()) as terminal, \
+                        patch.object(UPDATE, 'check_worktrees'), patch.object(UPDATE, 'command'), \
+                        patch.object(UPDATE, 'prepare_release', side_effect=error):
+                    result = UPDATE.install_release(self.runtime, UPDATE.SOURCES['1'], '0.1.6',
+                                                    UPDATE.TEXT[language], 'main', unattended=True)
+                self.assertEqual(result, 1)
+                self.assertIn(message, terminal.getvalue())
+                job = json.loads((self.root / UPDATE.STATUS_FILE).read_text())
+                self.assertEqual(job['error'], message)
+
+    def test_legacy_installer_progress_and_completion_in_english(self):
+        text = UPDATE.TEXT['en']
+        with redirect_stdout(io.StringIO()) as terminal:
+            progress = UPDATE.DownloadProgressOutput(sys.stdout, text)
+            progress.write('下载进度： 50% (1.0/2.0 MiB)\n')
+            child = '运行包 0.1.6 安装完成；请按现有方式启动机器人。\n'.encode()
+            with patch.object(UPDATE, 'command', return_value=SimpleNamespace(stdout=child)):
+                UPDATE.install_command(['runtime_release.py'], text)
+        self.assertEqual(terminal.getvalue().splitlines(), [
+            'Download progress:  50% (1.0/2.0 MiB)',
+            'Runtime bundle 0.1.6 installed. Start the robot service when ready.',
+        ])
+
+    def test_boot_recovery_keeps_the_selected_language(self):
+        UPDATE.record_recovery(self.stage, '0.1.6', self.checkpoint, 'update',
+                               phase='applying', language='en')
+        with patch.object(UPDATE, 'load_installer', return_value=self.runtime), \
+                patch.object(UPDATE, 'checkpoint_paths', return_value=[self.binary]), \
+                patch.object(UPDATE, 'restore_checkpoint',
+                             side_effect=ValueError('无法读取更新前的源码版本：/device')):
+            with self.assertRaises(ValueError):
+                self.boot()
+        job = json.loads((self.root / UPDATE.STATUS_FILE).read_text())
+        self.assertEqual(job['error'], 'The software update was interrupted before completion.')
+        self.assertEqual(job['rollback_error'], 'Could not read the source revision before the update: /device')
+
+    def test_prepare_release_supports_the_installer_in_the_original_image(self):
+        def download(url, destination, limit, expected_size=None):
+            destination.write_bytes(b'archive')
+
+        device = self.root / 'device-version.json'
+        device.write_text('{"hardware_version": "1.0.0", "image_version": "1.0.0"}')
+        manifest = {
+            'min_hardware_version': '1.0.0', 'min_image_version': '1.0.0',
+            'archive': 'aarch64.tar.gz', 'size': 7, 'sha256': 'checksum',
+        }
+        runtime = SimpleNamespace(PUBLIC_KEY='public.key', DEVICE_VERSION=device,
+                                  verify_signature=Mock(), validate_manifest=Mock(),
+                                  version=lambda value: tuple(map(int, value.split('.'))),
+                                  download=download, digest_file=Mock(return_value='checksum'))
+        report = Mock()
+        with patch.object(UPDATE, 'read_url', side_effect=[json.dumps(manifest).encode(), b'signature']):
+            actual = UPDATE.prepare_release(runtime, UPDATE.SOURCES['1'], '0.1.6', self.stage,
+                                            report, UPDATE.TEXT['en'])
+        self.assertEqual(actual, manifest)
+        self.assertEqual(report.call_args_list[1].kwargs, {'progress': 100})
 
 
 if __name__ == '__main__':

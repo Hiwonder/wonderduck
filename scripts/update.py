@@ -2,7 +2,7 @@
 """Interactively install an official WonderDuck release."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 import fcntl
 from html.parser import HTMLParser
 import importlib.util
@@ -70,6 +70,9 @@ TEXT = {
         'failed': '更新失败，请检查上面的错误后重试。',
         'stopped': '机器人服务保持停止；请处理问题后重新运行更新命令。',
         'cancelled': '更新已取消。',
+        'interrupted': '软件更新在完成前中断',
+        'restored': '已恢复更新前的软件。',
+        'download_progress': '下载进度：',
     },
     'en': {
         'source_prompt': 'Update source [1 GitHub / 2 Gitee, default 1]: ',
@@ -94,8 +97,226 @@ TEXT = {
         'failed': 'Update failed. Check the error above and try again.',
         'stopped': 'The robot service remains stopped. Resolve the problem and rerun the update.',
         'cancelled': 'Update cancelled.',
+        'interrupted': 'The software update was interrupted before completion.',
+        'restored': 'The previous software has been restored.',
+        'download_progress': 'Download progress: ',
     },
 }
+
+# The terminal bootstrap also runs with older installed and signed release
+# scripts. Translate their diagnostics here so both CLI and Studio receive them.
+UPDATE_DIAGNOSTICS = {
+    '发布响应无效': 'Invalid release response',
+    '发布清单无效': 'Invalid release manifest',
+    '发布版本缺少源码更新程序': 'The release is missing the source update script',
+    '发布列表格式无效': 'Invalid release list',
+    '找不到完整的软件发布包': 'No complete software release found',
+    '设备版本低于运行包要求': 'This hardware or system image does not meet the release requirements',
+    '无法读取源码状态': 'Could not read the source checkout status',
+    '回退路径包含符号链接': 'A rollback path contains a symbolic link',
+    '开机配置路径应为文件': 'A startup configuration path must be a file',
+    '无法读取更新前的源码版本': 'Could not read the source revision before the update',
+    '未能恢复更新前的源码版本': 'Could not restore the previous source revision',
+    '发布版本缺少软件更新恢复程序': 'The release is missing the update recovery script',
+    '软件更新恢复阶段无效': 'Invalid update recovery stage',
+    '软件更新恢复目录无效': 'Invalid update recovery directory',
+    '没有找到软件更新恢复文件': 'Update recovery files were not found',
+    '软件更新恢复仓库无效': 'Invalid repository in the update recovery record',
+    '软件更新恢复版本无效': 'Invalid revision in the update recovery record',
+    '软件更新恢复文件清单无效': 'Invalid file list in the update recovery record',
+    '软件更新正在安装，暂不能启动机器人': 'Wait for the software installation to finish before starting the robot',
+    '安装前无法确认机器人已休息并锁定控制': 'Could not confirm that the robot was at rest and lock the controls before installation',
+    'Studio 服务尚未就绪': 'Studio is not ready',
+    'Studio 页面缺少构建资源': 'Studio is missing built page assets',
+    'Studio 静态资源无效': 'A Studio static asset is invalid',
+    '网页操控服务尚未就绪': 'The web control service is not ready',
+    '没有收到机器人健康状态': 'No robot health status was received',
+    '运行程序与发布版本不一致': 'The running program does not match the release revision',
+    '机器人健康检查失败': 'The robot health check failed',
+    '等待机器人启动超时': 'Timed out waiting for the robot to start',
+    '上次软件更新尚未恢复，请启动机器人服务以完成恢复': 'Start the robot service to complete recovery from the previous update',
+    '发布标签与签名清单的源码版本不一致': 'The release tag and signed manifest refer to different source revisions',
+    '更新任务编号无效': 'Invalid update job ID',
+    'Studio 端口无效': 'Invalid Studio port',
+    'Git 操作失败': 'Git operation failed',
+    'WonderDuck 仓库地址无效': 'Invalid WonderDuck repository URL',
+    '版本包含未识别的子模块': 'The release contains an unrecognized submodule',
+    '用户数据路径包含符号链接，已停止更新': 'Update stopped because a user data path contains a symbolic link',
+    '用户数据与新版本同名，已停止更新': 'Update stopped because a release file conflicts with user data',
+    '请先从官方仓库获取指定版本': 'Fetch the requested version from the official repository first',
+    '发布分支无效': 'Invalid release branch',
+    'Studio 版本无效': 'Invalid Studio revision',
+    'Studio 路径包含符号链接，请先检查': 'Check the symbolic link in the Studio path',
+    'Studio 路径不是目录': 'The Studio path is not a directory',
+    'Studio 仓库信息无效，请先检查': 'Check the Studio repository metadata',
+    '正式版格式为 0.1.0，开发版格式为 0.1.0-dev.1.1': 'Use a version such as 0.1.0 or 0.1.0-dev.1.1',
+    '请在设备的 WonderDuck 仓库目录中执行': 'Run this command from the WonderDuck repository on the device',
+    '发布版本无效': 'Invalid release revision',
+    '发布版本缺少 Studio 子模块': 'The release is missing the Studio submodule',
+    '发布版本的 Studio 地址无效': 'Invalid Studio repository URL in the release',
+    'Studio 源码状态不完整，请先检查': 'Check the incomplete Studio checkout',
+    'Studio 目录在更新期间发生变化，请检查后重试': 'The Studio directory changed during the update. Check it and try again.',
+    '源码版本切换未完成，请检查后重试': 'The source checkout did not finish. Check the source tree and try again.',
+    '源码已更新；设备模型、动作组和标定数据已保留。': 'Source updated. Device models, action groups, and calibration data were preserved.',
+    '找不到设备安装程序': 'The device installer was not found',
+    '源码更新失败': 'Source update failed',
+    '安装未执行；请检查上述原因后重试。': 'Installation did not run. Check the error and try again.',
+    '版本必须为三段数字，例如 0.1.0': 'Use a three-part version such as 0.1.0',
+    '发布版本格式应为 0.1.0 或 0.1.0-dev.1.1': 'Use a release version such as 0.1.0 or 0.1.0-dev.1.1',
+    '源码仓库存在未提交的修改': 'The source checkout has uncommitted changes',
+    'Studio 子模块版本与主仓库记录不一致': 'The Studio revision does not match the main repository',
+    '不是 ARM64 Linux 可执行文件或动态库': 'Expected an ARM64 Linux executable or shared library',
+    '运行包缺少 Studio 网页入口': 'The runtime bundle is missing a Studio entry page',
+    '运行包缺少网页入口': 'The runtime bundle is missing a web entry page',
+    'Studio 网页资源缺失': 'Studio web asset missing',
+    '发布清单格式不正确': 'Invalid release manifest format',
+    '发布标签与版本不一致': 'The release tag and version do not match',
+    '不支持的运行包架构或文件名': 'Unsupported runtime bundle architecture or file name',
+    '发布清单中的源码版本无效': 'Invalid source revision in the manifest',
+    '发布清单中的摘要无效': 'Invalid checksum in the manifest',
+    '发布清单中的包大小无效': 'Invalid bundle size in the manifest',
+    '发布清单签名校验失败': 'Release manifest signature verification failed',
+    '下载进度需要有效的文件大小': 'Download progress requires a valid file size',
+    '下载进度': 'Download progress',
+    '下载文件超过允许大小': 'The download exceeded the allowed file size',
+    '运行包大小与发布清单不一致': 'The runtime bundle size does not match the manifest',
+    '运行包 SHA-256 不匹配': 'The runtime bundle SHA-256 checksum does not match',
+    '运行包包含无效路径': 'The runtime bundle contains an invalid path',
+    '运行包包含越界链接': 'The runtime bundle contains a link outside the installation tree',
+    '运行包链接超出资源目录': 'A link in the runtime bundle points outside its resource directory',
+    '运行包解压后过大': 'The unpacked runtime bundle is too large',
+    '运行包包含不支持的文件类型': 'The runtime bundle contains an unsupported file type',
+    '运行包文件位于链接目录下': 'A file in the runtime bundle is under a linked directory',
+    '运行包缺少必要文件': 'The runtime bundle is missing a required file',
+    '运行包缺少摄像头运行文件': 'The runtime bundle is missing a required camera file',
+    '运行文件包含不支持的文件类型': 'A runtime file has an unsupported type',
+    '安装状态文件无效': 'Invalid installation state file',
+    '安装状态文件格式无效': 'Invalid installation state file format',
+    '上次安装未完成，请先重新安装版本 未知': 'Identify the previous version before resuming the interrupted installation',
+    '安装路径不能包含符号链接': 'The installation path must not contain symbolic links',
+    '安装目录超出运行目录': 'The installation directory is outside the runtime tree',
+    '不允许提权创建非运行包目录': 'Privileged creation of a directory outside the runtime bundle is not allowed',
+    '安装事务目录异常': 'Invalid installation transaction directory',
+    '发现旧版安装事务，请先检查': 'Check the unfinished installation from an older installer',
+    '安装事务记录无效': 'Invalid installation transaction record',
+    '无法读取安装事务': 'Could not read the installation transaction',
+    '安装事务状态无效': 'Invalid installation transaction state',
+    '挂载信息格式无效': 'Invalid mount information',
+    '运行目录包含挂载点': 'A runtime directory contains a mount point',
+    '无法检查运行目录挂载状态': 'Could not check the runtime directory for mount points',
+    '安装目标超出运行目录': 'The installation target is outside the runtime tree',
+    '不允许清理非运行包目录': 'A directory outside the runtime bundle cannot be removed',
+    '安装源或目标超出运行目录': 'The installation source or target is outside the runtime tree',
+    '不允许提权替换非运行包文件': 'Privileged replacement of a file outside the runtime bundle is not allowed',
+    '安装目标不能是符号链接': 'The installation target must not be a symbolic link',
+    '安装目标类型不匹配': 'The installation target has an unexpected file type',
+    '旧运行文件超出运行目录': 'An old runtime file is outside the runtime tree',
+    '不允许清理非运行包文件': 'A file outside the runtime bundle cannot be removed',
+    '已有检测模型不是文件': 'The existing object detection model is not a regular file',
+    '摄像头启动脚本不存在或不可执行': 'The camera startup script is missing or not executable',
+    '摄像头启动路径无效': 'Invalid camera launcher path',
+    '摄像头启动入口不是符号链接，请检查': 'Check the camera launcher because it is not a symbolic link',
+    '摄像头运行目录无效': 'Invalid camera runtime directory',
+    '旧摄像头构建信息不是普通文件': 'The old camera build information is not a regular file',
+    '旧程序目录无效': 'Invalid directory for old executables',
+    '旧程序不是普通文件': 'The old executable is not a regular file',
+    '无法确认进程状态': 'Could not determine the process state',
+    '无法创建机器人锁文件，请先配置设备 sudo 权限': 'Configure device sudo permissions to create the robot lock file',
+    '运行程序或其他安装操作正在占用': 'The runtime or another installation is holding the lock',
+    '运行程序启动检查失败': 'The runtime startup check failed',
+    '无法获取开机配置所需的 sudo 权限': 'Could not obtain the sudo permissions needed for startup configuration',
+    '开机配置重载失败': 'Could not reload the startup configuration',
+    '开机配置文件内容无效': 'Invalid startup configuration contents',
+    '开机配置文件权限无效': 'Invalid startup configuration permissions',
+    '开机配置安装失败': 'Could not install the startup configuration',
+    '提示音服务安装失败': 'Could not install the prompt sound service',
+    '开发版格式为 0.1.0-dev.1.1': 'Use a development version such as 0.1.0-dev.1.1',
+    '运行包仅支持 ARM64 设备': 'The runtime bundle requires an ARM64 device',
+    '开机配置只支持安装目录': 'Startup configuration requires this installation directory',
+    '已清理上次中断的安装暂存文件': 'Removed temporary files from the previous interrupted installation',
+    '源码版本与发布包不一致，请先检出发布标签并更新子模块': 'Check out the release tag and update its submodules to match the runtime bundle',
+    '当前硬件版本低于运行包要求': 'The hardware version does not meet the runtime bundle requirements',
+    '当前镜像版本低于运行包要求': 'The system image does not meet the runtime bundle requirements',
+    '源码版本在安装期间发生变化': 'The source revision changed during installation',
+    '安装后文件校验失败': 'File verification failed after installation',
+    '运行包操作失败': 'Runtime bundle operation failed',
+    '等待机器人休息完成超时': 'Timed out waiting for the robot to finish resting',
+    '无法确认机器人休息状态': 'Could not confirm the robot rest state',
+    '机器人休息状态不一致': 'The robot reported an inconsistent rest state',
+    '机器人休息失败': 'The robot failed to finish resting',
+    '机器人休息被中断': 'The robot rest sequence was interrupted',
+    '无法停止当前控制': 'Could not stop the active controls',
+    '机器人拒绝休息': 'The robot rejected the rest request',
+    '结果未确认': 'The result could not be confirmed',
+    'robotd 维护会话通信失败': 'Communication with the robotd maintenance session failed',
+    'robotd 维护会话已断开': 'The robotd maintenance session disconnected',
+    'robotd 维护请求失败': 'The robotd maintenance request failed',
+    'robotd 维护请求被拒绝': 'robotd rejected the maintenance request',
+    'robotd 维护交接未完成': 'The robotd maintenance handover did not finish',
+    'robotd 状态查询连接异常': 'The robotd status query connection failed',
+    '模型更新控制连接中断': 'The update control connection was interrupted',
+    '等待当前休息完成超时': 'Timed out waiting for the current rest sequence',
+    '舵机维护或标定正在进行，暂不能更新模型': 'Finish servo maintenance or calibration before updating',
+    '无法读取控制权': 'Could not read control ownership',
+    '无法登记更新控制会话': 'Could not register the update control session',
+    '无法取得模型更新控制权': 'Could not acquire control for the update',
+    '模型更新期间控制权已被其他操作接管': 'Another operation took control during the update',
+    '模型更新控制会话失效': 'The update control session expired',
+    '未知': 'unknown',
+}
+UPDATE_DIAGNOSTIC_PATTERNS = (
+    (r'(WonderDuck|Studio) 源码存在未提交的修改，请先检查，更新未执行',
+     r'\1 has uncommitted source changes. Resolve them before updating.'),
+    (r'无法获取官方 (main|develop) 分支', r'Could not fetch the official \1 branch'),
+    (r'该发布版本不属于官方 (main|develop) 分支(?:，更新未执行)?',
+     r'The release does not belong to the official \1 branch'),
+    (r'上次安装未完成，请先重新安装版本 (.+)', r'Reinstall version \1 to complete the previous installation'),
+    (r'(.+?) 正在运行，请先按现有方式停止程序', r'Stop \1 before installing the update'),
+    (r'正在下载运行包（(\d+) 字节）', r'Downloading the runtime bundle (\1 bytes)'),
+    (r'运行包 (.+?) 安装完成；请按现有方式启动机器人。',
+     r'Runtime bundle \1 installed. Start the robot service when ready.'),
+    (r'安装未完成，请重新安装版本 (.+)', r'Installation did not finish. Reinstall version \1'),
+    (r'无法创建运行目录 (.+)', r'Could not create runtime directory \1'),
+    (r'无法清理旧版运行目录 (.+)', r'Could not remove old runtime directory \1'),
+    (r'无法安装运行文件 (.+)', r'Could not install runtime file \1'),
+    (r'无法清理旧版运行文件 (.+)', r'Could not remove old runtime file \1'),
+    (r'(.+?) 查询失败', r'The \1 query failed'),
+    (r'机器人 (.+?) 请求失败', r'The robot \1 request failed'),
+    (r'机器人 (.+?) 返回的数据格式无效', r'The robot \1 reply has an invalid format'),
+)
+
+
+def localized_update_line(line, text):
+    if text is not TEXT['en']:
+        return line
+    message, separator, detail = line.partition('：')
+    translated = UPDATE_DIAGNOSTICS.get(message)
+    if translated is None:
+        for pattern, replacement in UPDATE_DIAGNOSTIC_PATTERNS:
+            match = re.fullmatch(pattern, message)
+            if match:
+                translated = match.expand(replacement)
+                break
+    if translated is None:
+        return line
+    if separator:
+        return translated + ': ' + localized_update_line(detail.lstrip(), text)
+    return translated
+
+
+class DownloadProgressOutput:
+    def __init__(self, stream, text):
+        self.stream = stream
+        self.text = text
+
+    def write(self, value):
+        return self.stream.write(value.replace('下载进度：', self.text['download_progress']))
+
+    def flush(self):
+        self.stream.flush()
+
+    def isatty(self):
+        return self.stream.isatty()
 
 
 def parse_version(value, channel):
@@ -112,7 +333,7 @@ def read_url(url, limit, timeout=15):
     with urllib.request.urlopen(request, timeout=timeout) as response:
         data = response.read(limit + 1)
     if not data or len(data) > limit:
-        raise ValueError('invalid release response')
+        raise ValueError('发布响应无效')
     return data
 
 
@@ -122,7 +343,7 @@ def check_release(source, version):
     if (not isinstance(manifest, dict) or manifest.get('tag') != 'v' + version
             or manifest.get('version') != version or manifest.get('architecture') != 'aarch64'
             or manifest.get('archive') != 'aarch64.tar.gz'):
-        raise ValueError('invalid release manifest')
+        raise ValueError('发布清单无效')
     read_url(base + 'manifest.json.sig', 4096)
 
 
@@ -157,7 +378,7 @@ def latest_release(source, channel):
             return version
         except (OSError, ValueError, TypeError, urllib.error.URLError):
             continue
-    raise ValueError('no complete release for ' + channel)
+    raise ValueError('找不到完整的软件发布包：' + channel)
 
 
 def latest_stable_for_browser(source):
@@ -193,7 +414,7 @@ def load_installer(source=None):
     return runtime
 
 
-def prepare_release(runtime, source, version, directory, report):
+def prepare_release(runtime, source, version, directory, report, text):
     tag = 'v' + version
     base = source[3] + '/' + tag + '/'
     release = directory / tag
@@ -210,10 +431,14 @@ def prepare_release(runtime, source, version, directory, report):
             raise ValueError('设备版本低于运行包要求')
     archive = release / data['archive']
     report('download', progress=0)
-    options = {}
-    if 'progress_callback' in inspect.signature(runtime.download).parameters:
+    parameters = inspect.signature(runtime.download).parameters
+    options = {'progress': True} if 'progress' in parameters else {}
+    if 'progress_callback' in parameters:
         options['progress_callback'] = lambda received, size: report('download', progress=received * 100 // size)
-    runtime.download(base + archive.name, archive, data['size'], data['size'], progress=True, **options)
+    with redirect_stdout(DownloadProgressOutput(sys.stdout, text)):
+        runtime.download(base + archive.name, archive, data['size'], data['size'], **options)
+    if 'progress_callback' not in parameters:
+        report('download', progress=100)
     report('verify')
     if runtime.digest_file(archive) != data['sha256']:
         raise ValueError('运行包 SHA-256 不匹配')
@@ -248,10 +473,18 @@ def report_status(version, phase, **details):
     write_update_json(ROOT / STATUS_FILE, dict(version=version, phase=phase, **details))
 
 
-def error_text(error):
+def error_text(error, text):
     if isinstance(error, subprocess.CalledProcessError) and error.stderr:
-        return error.stderr.decode('utf-8', errors='replace').strip()[-1500:]
-    return str(error)
+        message = error.stderr.decode('utf-8', errors='replace').strip()
+    else:
+        message = str(error)
+    return '\n'.join(localized_update_line(line, text) for line in message.splitlines())[-1500:]
+
+
+def install_command(args, text, **kwargs):
+    result = command(args, stdout=subprocess.PIPE, **kwargs)
+    for line in result.stdout.decode('utf-8', errors='replace').splitlines():
+        print(localized_update_line(line, text), flush=True)
 
 
 def git_setting(repo, *args):
@@ -343,9 +576,9 @@ def restore_checkpoint(runtime, archive, checkpoint, restore_runtime, *, boot=Fa
         command(['sudo', '-n', 'systemctl', 'stop', runtime.PROMPT_SERVICE_TARGET.name], timeout=30)
 
 
-def record_recovery(stage, version, checkpoint, job_id, *, phase='stopping'):
+def record_recovery(stage, version, checkpoint, job_id, *, phase='stopping', language='zh'):
     worktrees, submodule_url, paths = checkpoint
-    record = dict(stage=stage.name, version=version, job_id=job_id, phase=phase,
+    record = dict(stage=stage.name, version=version, job_id=job_id, phase=phase, language=language,
                   worktrees=[(str(repo), revision, branch, origin) for repo, revision, branch, origin in worktrees],
                   submodule_url=submodule_url, paths=list(map(str, paths)))
     write_update_json(ROOT / RECOVERY_FILE, record, durable=True)
@@ -385,7 +618,7 @@ def ensure_recovery_hook(runtime):
     runtime.reload_systemd()
 
 
-def clear_recovery():
+def clear_recovery(text):
     (ROOT / RECOVERY_FILE).unlink(missing_ok=True)
     sync_directory(ROOT)
     helper = ROOT / RECOVERY_HELPER
@@ -395,7 +628,7 @@ def clear_recovery():
                 (helper / name).unlink(missing_ok=True)
             helper.rmdir()
     except OSError as error:
-        print(error_text(error), file=sys.stderr)
+        print(error_text(error, text), file=sys.stderr)
 
 
 def recovery_checkpoint(runtime, record):
@@ -437,9 +670,10 @@ def recover_at_start():
             return
         runtime = load_installer(ROOT / RECOVERY_HELPER / 'runtime_release.py')
         record = json.loads(journal.read_text(encoding='utf-8'))
+        text = TEXT['en' if record.get('language') == 'en' else 'zh']
         stage, archive, checkpoint = recovery_checkpoint(runtime, record)
         details = dict(job_id=record['job_id'], failed_phase=record['phase'],
-                       error='软件更新在完成前中断')
+                       error=text['interrupted'])
         report_status(record['version'], 'rollback', **details)
         try:
             runtime.ensure_robot_lock()
@@ -450,10 +684,10 @@ def recover_at_start():
                     if transaction.get('version') == record['version']:
                         runtime.discard_pending(directory, ROOT, transaction, record['version'])
         except Exception as error:
-            report_status(record['version'], 'failed', rollback='failed', rollback_error=error_text(error), **details)
+            report_status(record['version'], 'failed', rollback='failed', rollback_error=error_text(error, text), **details)
             raise
         report_status(record['version'], 'failed', rollback='done', **details)
-        clear_recovery()
+        clear_recovery(text)
         shutil.rmtree(stage)
     finally:
         os.close(descriptor)
@@ -581,13 +815,14 @@ def install(source, version, text, channel, unattended=False, job_id=None, studi
                 raise ValueError('上次软件更新尚未恢复，请启动机器人服务以完成恢复')
             return install_release(runtime, source, version, text, channel, unattended, job_id, studio_port, socket_path)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
-        print(error_text(error), file=sys.stderr)
+        print(error_text(error, text), file=sys.stderr)
         return 1
 
 
 def install_release(runtime, source, version, text, channel, unattended, job_id=None, studio_port=8090,
                     socket_path=ROBOT_SOCKET):
     channel_args = ['--channel', channel] if channel == 'develop' else []
+    language = 'en' if text is TEXT['en'] else 'zh'
     phase = 'prepare'
 
     def report(next_phase, **details):
@@ -608,7 +843,7 @@ def install_release(runtime, source, version, text, channel, unattended, job_id=
         command(['sudo', '-n', 'true'] if unattended else ['sudo', '-v'], timeout=30)
         stage = Path(tempfile.mkdtemp(prefix='.software-update-', dir=str(ROOT)))
         phase = 'download'
-        release = prepare_release(runtime, source, version, stage, report)
+        release = prepare_release(runtime, source, version, stage, report, text)
         phase = 'checkpoint'
         report(phase)
         archive = stage / 'previous.tar'
@@ -629,7 +864,7 @@ def install_release(runtime, source, version, text, channel, unattended, job_id=
         source_script = command(['git', 'show', 'FETCH_HEAD:scripts/update-source.py'],
                                 stdout=subprocess.PIPE, timeout=10).stdout
         if not source_script:
-            raise ValueError('empty source updater')
+            raise ValueError('发布版本缺少源码更新程序')
         check_worktrees(text)
         reload_needed = command(['systemctl', 'show', 'robotd', '-p', 'NeedDaemonReload', '--value'],
                                 stdout=subprocess.PIPE, timeout=10).stdout.strip()
@@ -641,32 +876,32 @@ def install_release(runtime, source, version, text, channel, unattended, job_id=
         report('rest')
         with installation_lease(runtime, socket_path):
             report('install')
-            record_recovery(stage, version, checkpoint, job_id)
+            record_recovery(stage, version, checkpoint, job_id, language=language)
             print(text['stop'], flush=True)
             service_touched = True
             command(['sudo', '-n', 'systemctl', 'stop', 'robotd'], timeout=35)
-        command([sys.executable, '-', version, *channel_args], input=source_script, timeout=180)
+        install_command([sys.executable, '-', version, *channel_args], text, input=source_script, timeout=180)
         print(text['install'], flush=True)
         existing_transactions = {directory for directory, _ in runtime.pending(ROOT)}
-        record_recovery(stage, version, checkpoint, job_id, phase='applying')
+        record_recovery(stage, version, checkpoint, job_id, phase='applying', language=language)
         runtime_touched = True
-        command([sys.executable, 'scripts/runtime_release.py', 'install', '--version', version,
-                 '--base-url', stage.as_uri(), *channel_args], timeout=480)
+        install_command([sys.executable, 'scripts/runtime_release.py', 'install', '--version', version,
+                         '--base-url', stage.as_uri(), *channel_args], text, timeout=480)
         phase = 'restart'
         report(phase)
-        record_recovery(stage, version, checkpoint, job_id, phase='starting')
+        record_recovery(stage, version, checkpoint, job_id, phase='starting', language=language)
         print(text['start'], flush=True)
         command(['sudo', '-n', 'systemctl', 'start', 'robotd'], timeout=35)
         wait_robot_ready(revision, studio_port, socket_path)
-        clear_recovery()
+        clear_recovery(text)
         try:
             report('done')
         except OSError as error:
-            print(error_text(error), file=sys.stderr)
+            print(error_text(error, text), file=sys.stderr)
         print(text['done'], flush=True)
         return 0
     except (OSError, ValueError, RuntimeError, KeyError, subprocess.SubprocessError, KeyboardInterrupt) as error:
-        cause = error_text(error) or text['cancelled']
+        cause = error_text(error, text) or text['cancelled']
         result = {'failed_phase': phase, 'error': cause, 'rollback': 'unneeded'}
         if checkpoint and changed_origin:
             try:
@@ -674,7 +909,7 @@ def install_release(runtime, source, version, text, channel, unattended, job_id=
                 if service_touched:
                     with installation_lease(runtime, socket_path):
                         record_recovery(stage, version, checkpoint, job_id,
-                                        phase='applying' if runtime_touched else 'stopping')
+                                        phase='applying' if runtime_touched else 'stopping', language=language)
                         command(['sudo', '-n', 'systemctl', 'stop', 'robotd'], timeout=35)
                 if service_touched:
                     with runtime.exclusive_lock(runtime.ROBOT_LOCK):
@@ -687,18 +922,18 @@ def install_release(runtime, source, version, text, channel, unattended, job_id=
                 else:
                     restore_checkpoint(runtime, archive, checkpoint, False)
                 if service_touched:
-                    record_recovery(stage, version, checkpoint, job_id, phase='starting')
+                    record_recovery(stage, version, checkpoint, job_id, phase='starting', language=language)
                     command(['sudo', '-n', 'systemctl', 'start', 'robotd'], timeout=35)
                     wait_robot_ready(studio_port=studio_port, socket_path=socket_path)
-                    clear_recovery()
+                    clear_recovery(text)
                 result['rollback'] = 'done'
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as rollback_error:
                 keep_checkpoint = True
-                result.update(rollback='failed', rollback_error=error_text(rollback_error), checkpoint=str(stage))
+                result.update(rollback='failed', rollback_error=error_text(rollback_error, text), checkpoint=str(stage))
         report('failed', **result)
         print(cause, file=sys.stderr)
         if result['rollback'] == 'done':
-            print('已恢复更新前的软件。' if text is TEXT['zh'] else 'The previous software has been restored.', file=sys.stderr)
+            print(text['restored'], file=sys.stderr)
         elif keep_checkpoint:
             print(result['rollback_error'], file=sys.stderr)
             print(str(stage), file=sys.stderr)
@@ -724,11 +959,18 @@ def main():
     parser.add_argument('--robot-socket', default=ROBOT_SOCKET, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.recover_at_start:
+        text = TEXT[args.lang]
+        try:
+            record = json.loads((ROOT / RECOVERY_FILE).read_text(encoding='utf-8'))
+            if isinstance(record, dict):
+                text = TEXT.get(record.get('language'), text)
+        except (OSError, ValueError, TypeError):
+            pass
         try:
             recover_at_start()
             return 0
         except (OSError, KeyError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-            print(error_text(error), file=sys.stderr)
+            print(error_text(error, text), file=sys.stderr)
             return 1
     text = TEXT[args.lang]
     prefix = 'dev_' if args.channel == 'develop' else ''
@@ -757,7 +999,7 @@ def main():
             return install(source, version, text, args.channel, unattended=True,
                            job_id=args.job_id, studio_port=args.studio_port, socket_path=args.robot_socket)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
-            print(str(error), file=sys.stderr)
+            print(error_text(error, text), file=sys.stderr)
             return 1
     try:
         while True:
