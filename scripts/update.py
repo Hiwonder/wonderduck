@@ -181,6 +181,8 @@ UPDATE_DIAGNOSTICS = {
     '下载文件超过允许大小': 'The download exceeded the allowed file size',
     '运行包大小与发布清单不一致': 'The runtime bundle size does not match the manifest',
     '运行包 SHA-256 不匹配': 'The runtime bundle SHA-256 checksum does not match',
+    '发布构建已变化，请重新检查更新': 'The published build has changed. Check for updates again.',
+    '发布包摘要无效': 'Invalid release bundle checksum',
     '运行包包含无效路径': 'The runtime bundle contains an invalid path',
     '运行包包含越界链接': 'The runtime bundle contains a link outside the installation tree',
     '运行包链接超出资源目录': 'A link in the runtime bundle points outside its resource directory',
@@ -414,17 +416,26 @@ def load_installer(source=None):
     return runtime
 
 
-def prepare_release(runtime, source, version, directory, report, text):
+def fetch_signed_manifest(runtime, source, version, directory):
     tag = 'v' + version
     base = source[3] + '/' + tag + '/'
-    release = directory / tag
-    release.mkdir()
-    manifest, signature = (release / name for name in ('manifest.json', 'manifest.json.sig'))
+    manifest, signature = (directory / name for name in ('manifest.json', 'manifest.json.sig'))
     manifest.write_bytes(read_url(base + manifest.name, 64 * 1024))
     signature.write_bytes(read_url(base + signature.name, 4096))
     runtime.verify_signature(ROOT / runtime.PUBLIC_KEY, manifest, signature)
     data = json.loads(manifest.read_text(encoding='utf-8'))
     runtime.validate_manifest(data, tag)
+    return data
+
+
+def prepare_release(runtime, source, version, directory, report, text, expected_sha256=None):
+    tag = 'v' + version
+    base = source[3] + '/' + tag + '/'
+    release = directory / tag
+    release.mkdir()
+    data = fetch_signed_manifest(runtime, source, version, release)
+    if expected_sha256 is not None and data['sha256'] != expected_sha256:
+        raise ValueError('发布构建已变化，请重新检查更新')
     device = json.loads(runtime.DEVICE_VERSION.read_text(encoding='utf-8'))
     for key in ('hardware_version', 'image_version'):
         if runtime.version(device[key]) < runtime.version(data['min_' + key]):
@@ -807,20 +818,21 @@ def check_worktrees(text):
 
 
 def install(source, version, text, channel, unattended=False, job_id=None, studio_port=8090,
-            socket_path=ROBOT_SOCKET):
+            socket_path=ROBOT_SOCKET, expected_sha256=None):
     try:
         runtime = load_installer()
         with runtime.exclusive_lock(ROOT / UPDATE_LOCK, create=True):
             if (ROOT / RECOVERY_FILE).exists():
                 raise ValueError('上次软件更新尚未恢复，请启动机器人服务以完成恢复')
-            return install_release(runtime, source, version, text, channel, unattended, job_id, studio_port, socket_path)
+            return install_release(runtime, source, version, text, channel, unattended, job_id,
+                                   studio_port, socket_path, expected_sha256)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(error_text(error, text), file=sys.stderr)
         return 1
 
 
 def install_release(runtime, source, version, text, channel, unattended, job_id=None, studio_port=8090,
-                    socket_path=ROBOT_SOCKET):
+                    socket_path=ROBOT_SOCKET, expected_sha256=None):
     channel_args = ['--channel', channel] if channel == 'develop' else []
     language = 'en' if text is TEXT['en'] else 'zh'
     phase = 'prepare'
@@ -843,7 +855,7 @@ def install_release(runtime, source, version, text, channel, unattended, job_id=
         command(['sudo', '-n', 'true'] if unattended else ['sudo', '-v'], timeout=30)
         stage = Path(tempfile.mkdtemp(prefix='.software-update-', dir=str(ROOT)))
         phase = 'download'
-        release = prepare_release(runtime, source, version, stage, report, text)
+        release = prepare_release(runtime, source, version, stage, report, text, expected_sha256)
         phase = 'checkpoint'
         report(phase)
         archive = stage / 'previous.tar'
@@ -955,6 +967,7 @@ def main():
     mode.add_argument('--preflight', action='store_true')
     mode.add_argument('--recover-at-start', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--job-id', help=argparse.SUPPRESS)
+    parser.add_argument('--expected-sha256', help=argparse.SUPPRESS)
     parser.add_argument('--studio-port', type=int, default=8090, help=argparse.SUPPRESS)
     parser.add_argument('--robot-socket', default=ROBOT_SOCKET, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -984,7 +997,9 @@ def main():
         try:
             if args.check:
                 version = latest_stable_for_browser(source) if args.channel == 'main' else latest_release(source, args.channel)
-                print(json.dumps({'version': version}))
+                with tempfile.TemporaryDirectory(prefix='wonderduck-release-check-') as directory:
+                    manifest = fetch_signed_manifest(load_installer(), source, version, Path(directory))
+                print(json.dumps({'version': version, 'sha256': manifest['sha256']}))
                 return 0
             if args.preflight:
                 check_worktrees(text)
@@ -994,10 +1009,13 @@ def main():
                 raise ValueError(text[prefix + 'version_invalid'])
             if args.job_id and not re.fullmatch(r'[0-9a-f]{16}', args.job_id):
                 raise ValueError('更新任务编号无效')
+            if args.expected_sha256 is not None and not re.fullmatch(r'[0-9a-f]{64}', args.expected_sha256):
+                raise ValueError('发布包摘要无效')
             if args.studio_port is not None and not 1 <= args.studio_port <= 65535:
                 raise ValueError('Studio 端口无效')
             return install(source, version, text, args.channel, unattended=True,
-                           job_id=args.job_id, studio_port=args.studio_port, socket_path=args.robot_socket)
+                           job_id=args.job_id, studio_port=args.studio_port, socket_path=args.robot_socket,
+                           expected_sha256=args.expected_sha256)
         except (OSError, ValueError, subprocess.SubprocessError) as error:
             print(error_text(error, text), file=sys.stderr)
             return 1

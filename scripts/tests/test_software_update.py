@@ -176,6 +176,30 @@ class SoftwareUpdateTests(unittest.TestCase):
         self.assertEqual(actual, manifest)
         self.assertEqual(report.call_args_list[1].kwargs, {'progress': 100})
 
+    def test_web_check_only_returns_the_digest_of_a_verified_manifest(self):
+        (self.root / '.git').mkdir()
+        digest = 'a' * 64
+        self.runtime.PUBLIC_KEY = 'release.pub'
+        self.runtime.verify_signature = Mock()
+        self.runtime.validate_manifest = Mock()
+        with patch.object(sys, 'argv', ['update.py', '--source', 'gitee', '--check']), \
+                patch.object(UPDATE, 'latest_stable_for_browser', return_value='0.1.5'), \
+                patch.object(UPDATE, 'load_installer', return_value=self.runtime), \
+                patch.object(UPDATE, 'read_url', side_effect=[json.dumps({'sha256': digest}).encode(), b'signature']), \
+                redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(UPDATE.main(), 0)
+        self.runtime.verify_signature.assert_called_once()
+        self.runtime.validate_manifest.assert_called_once()
+        self.assertEqual(json.loads(output.getvalue()), {'version': '0.1.5', 'sha256': digest})
+
+    def test_changed_confirmed_build_is_rejected_before_downloading(self):
+        report = Mock()
+        with patch.object(UPDATE, 'fetch_signed_manifest', return_value={'sha256': 'b' * 64}):
+            with self.assertRaisesRegex(ValueError, '发布构建已变化'):
+                UPDATE.prepare_release(self.runtime, UPDATE.SOURCES['2'], '0.1.5', self.stage,
+                                       report, UPDATE.TEXT['zh'], expected_sha256='a' * 64)
+        report.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()
