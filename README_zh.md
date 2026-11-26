@@ -30,10 +30,10 @@ python3 <(curl -fsSL --connect-timeout 10 https://gitee.com/hiwonder_official/wo
 
 ## 在电脑上交叉编译
 
-以下步骤适用于 x86-64 Ubuntu 电脑，以及已配置 WonderDuck 镜像的设备。在电脑上安装 Git、curl、rsync、pkg-config、带 `venv` 的 Python 3、C 编译器和 Node.js 20，再克隆仓库。
+x86-64 Ubuntu 20.04 与 x86-64 WSL 2 Ubuntu 使用同一套交叉编译命令。构建需要一台已配置 WonderDuck 镜像的设备。在电脑上安装 Git、curl、rsync、pkg-config、带 `venv` 的 Python 3、C 编译器和 Node.js 20。在 WSL 2 中，请在 Ubuntu 的 Bash 终端执行命令，并将仓库克隆到 Linux 家目录。
 
 ```bash
-git clone --branch main --recurse-submodules https://gitee.com/hiwonder_official/wonderduck.git
+git clone --branch develop --recurse-submodules https://gitee.com/hiwonder_official/wonderduck.git
 cd wonderduck
 ```
 

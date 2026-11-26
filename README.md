@@ -30,6 +30,8 @@ Installation updates the startup configuration and preserves device calibration,
 
 ## Cross-compile on a computer
 
+The Gitee `develop` branch uses the same cross-compilation steps on x86-64 Ubuntu and WSL 2. [Gitee build instructions](README_zh.md#在电脑上交叉编译).
+
 These steps are for an x86-64 Ubuntu computer and a robot with a configured WonderDuck image. On the computer, install Git, curl, rsync, pkg-config, Python 3 with `venv`, a C compiler and Node.js 20, then clone the repository.
 
 ```bash
