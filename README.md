@@ -4,10 +4,6 @@ English | [简体中文](README_zh.md)
 
 WonderDuck provides robot control software and [WonderDuck Studio](https://github.com/Hiwonder/wonderduck_studio). It is based on [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck).
 
-## Model licenses
-
-The WonderDuck robot GLB model included with Studio is licensed under CC BY-NC-SA 4.0. [License text](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode)
-
 ## Update and deployment
 
 Both update methods require a device with the system image installed and configured. Before updating, open **Network → Wi-Fi network** in Studio and connect the robot to a trusted Wi-Fi network with internet access.
