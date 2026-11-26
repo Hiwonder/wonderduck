@@ -63,6 +63,8 @@ pub const POLICY_LIBRARY: &str = "/var/lib/robot/policies";
 /// Where a provisioned robot keeps it, alongside the updater's own config.
 pub const DEFAULT_PATH: &str = "/etc/robot/robotd.toml";
 
+pub mod gamepad_idle;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Params {

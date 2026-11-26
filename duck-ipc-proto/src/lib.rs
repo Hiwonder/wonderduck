@@ -2154,9 +2154,10 @@ pub enum HumanControlAction {
     BlockMaintenanceTransition,
     /// Release this connection's maintenance transition guard.
     UnblockMaintenanceTransition,
-    /// Stop either coordinated tracking mode and return ID 31 to physical Home while retaining
-    /// the web lease. The wire name predates target tracking's use of this action.
+    /// Stop autonomous motion and return the head to physical Home while retaining the web lease.
     PersonFollowHome,
+    /// Return the two head joints to physical Home under the current manual control lease.
+    CenterHead,
     Status,
 }
 

@@ -84,7 +84,7 @@ pub struct HeadTracker {
 // Half the measured 10%-to-80% return speeds in the recorded near-final head pose.
 // These shape the commanded positions; the servo's actual response still depends on load.
 const RETURN_SPEED_RAD_S: [f64; 2] = [95.6_f64.to_radians(), 28.95_f64.to_radians()];
-const GENTLE_HOME_SPEED_RAD_S: [f64; 2] = [25.0_f64.to_radians(), 28.95_f64.to_radians()];
+const GENTLE_HOME_SPEED_RAD_S: [f64; 2] = [90.0_f64.to_radians(); 2];
 const RETURN_FEEDBACK_GAIN: f64 = 3.0;
 const RETURN_TOLERANCE_COUNTS: u16 = 20;
 
@@ -108,7 +108,7 @@ impl HeadReturn {
             speed: RETURN_SPEED_RAD_S }
     }
 
-    /// Slow pitch return for a tracking workspace handoff.
+    /// Rate-limited return to the physical head Home.
     pub fn gentle_home(measured: [f64; 2], home: [f64; 2]) -> Self {
         Self { speed: GENTLE_HOME_SPEED_RAD_S, ..Self::new(measured, home) }
     }
@@ -206,6 +206,7 @@ impl HeadHandoff {
         home: [f64; 2],
         generation: u64,
         takeover: bool,
+        return_home: bool,
         dt: f64,
     ) -> Option<[f64; 2]> {
         if takeover {
@@ -233,7 +234,10 @@ impl HeadHandoff {
                 .command
                 .or(self.measured);
         }
-        if self.tracking || body_ended {
+        if return_home && self.hold.is_none_or(|hold| hold.owner != generation || hold.fixed) {
+            self.tracking = false;
+            self.hold = Some(HomeHold { home, owner: generation, motion: None, fixed: false });
+        } else if self.tracking || body_ended {
             self.tracking = false;
             self.hold = if generation == self.generation {
                 Some(HomeHold { home, owner: generation, motion: None, fixed: false })
@@ -254,7 +258,7 @@ impl HeadHandoff {
                 if hold.fixed { return Some(hold.home); }
                 // A missing bus read keeps the last known target until feedback resumes.
                 let Some(measured) = measured else { return self.command.or(self.measured); };
-                let motion = hold.motion.get_or_insert_with(|| HeadReturn::new(measured, hold.home));
+                let motion = hold.motion.get_or_insert_with(|| HeadReturn::gentle_home(measured, hold.home));
                 Some(motion.next(dt))
             }
             Some(_) => {
@@ -274,6 +278,40 @@ impl HeadHandoff {
                 motion.confirm(position);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_home_and_tracking_stop_use_the_same_two_axis_steps() {
+        let home = [0.35, 0.0];
+        let measured = [-0.2, 1.0];
+        let dt = 0.02;
+        let mut explicit = HeadHandoff::default();
+        let mut tracking = HeadHandoff::default();
+        tracking.update(true, false, Some(measured), Some(measured), home, 1, false, false, dt);
+        tracking.confirm(measured);
+
+        let mut last = measured;
+        for _ in 0..150 {
+            let next = explicit.update(false, false, None, Some(measured), home, 1, false, true, dt)
+                .expect("explicit home should keep a target");
+            let stopped = tracking.update(false, false, None, Some(measured), home, 1, false, false, dt)
+                .expect("tracking stop should keep a target");
+            assert_eq!(next, stopped);
+            for axis in 0..2 {
+                assert!((next[axis] - last[axis]).abs() <= GENTLE_HOME_SPEED_RAD_S[axis] * dt + 1e-9);
+                assert!((next[axis] - home[axis]).abs() <= (last[axis] - home[axis]).abs());
+            }
+            tracking.confirm(stopped);
+            explicit.confirm(next);
+            last = next;
+        }
+        assert_eq!(last, home);
+        assert!(explicit.update(false, false, None, Some(home), home, 2, false, false, dt).is_none());
     }
 }
 

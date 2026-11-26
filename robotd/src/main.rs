@@ -8392,7 +8392,7 @@ async fn control_loop<T: RobotIo>(
             .or_else(|| {
                 if snapshot.head_tracking.is_none() && snapshot.coordinated_tracking.is_none() {
                     snapshot.motion_tracking.and_then(|tracking| tracking.initial_pitch)
-                        .or(snapshot.head_position_handoff)
+                        .or(snapshot.head_position_handoff.filter(|_| !snapshot.head_return_home))
                 } else {
                     None
                 }
@@ -8400,7 +8400,8 @@ async fn control_loop<T: RobotIo>(
         let mut head_override = head_handoff.update(
             snapshot.head_tracking.is_some() || snapshot.coordinated_tracking.is_some() || preview_position.is_some(),
             snapshot.motion_tracking.is_some(), tracked_head, measured_head, [home[6], home[7]],
-            snapshot.head_generation, head_takeover, dt).filter(|_| head_available);
+            snapshot.head_generation, head_takeover, snapshot.head_return_home, dt)
+            .filter(|_| head_available);
         if preview_position.is_some() {
             head_override = None;
         }
@@ -9877,7 +9878,8 @@ async fn handle_session(
                 | proto::Call::RobotShutdown | proto::Call::RobotSound(_) | proto::Call::RobotSoundClip(_)))
                 || matches!(call, proto::Call::RobotLowVoltageRearm | proto::Call::RobotApplyModel(_))
                 || matches!(call, proto::Call::RobotHumanControl(params)
-                    if params.action == proto::HumanControlAction::PersonFollowHome)
+                    if matches!(params.action, proto::HumanControlAction::PersonFollowHome
+                        | proto::HumanControlAction::CenterHead))
         }) {
             if let Some(id) = request.id.clone() {
                 let response = proto::Response::err(Some(id), proto::Error::new(
@@ -9895,7 +9897,8 @@ async fn handle_session(
                     || matches!(call, proto::Call::RobotMaintenance(params)
                         if !matches!(params.action, proto::MaintenanceAction::Status | proto::MaintenanceAction::Release))
                     || matches!(call, proto::Call::RobotHumanControl(params)
-                        if params.action == proto::HumanControlAction::PersonFollowHome)
+                        if matches!(params.action, proto::HumanControlAction::PersonFollowHome
+                            | proto::HumanControlAction::CenterHead))
             });
             if blocked {
                 if let Some(id) = request.id.clone() {
@@ -10064,6 +10067,7 @@ async fn handle_session(
                             if params.pitch_position.is_some() {
                                 guard.refresh(session, proto::HumanControlSource::Web);
                             } else if !intents.motion_tracking_active() {
+                                intents.request_head_home();
                                 guard.abandon(session, proto::HumanControlSource::Web);
                             }
                             Ok(())
@@ -10117,6 +10121,7 @@ async fn handle_session(
                         {
                             intents.stop();
                             if !intents.head_tracking_active() {
+                                intents.request_head_home();
                                 guard.abandon(session, proto::HumanControlSource::Web);
                             }
                             Ok(())
@@ -10192,6 +10197,7 @@ async fn handle_session(
                             && intents.update_coordinated_tracking(session.id(), params.clone())
                         {
                             intents.stop();
+                            intents.request_head_home();
                             guard.abandon(session, proto::HumanControlSource::Web);
                             Ok(())
                         } else { Err("联合追踪已停止或网页已失去控制权".to_owned()) }
@@ -10251,6 +10257,7 @@ async fn handle_session(
                             && intents.update_maze(session.id(), *params)
                         {
                             intents.stop();
+                            intents.request_head_home();
                             guard.abandon(session, proto::HumanControlSource::Web);
                             Ok(())
                         } else { Err("迷宫模式已停止或网页已失去控制权".to_owned()) }
@@ -10407,36 +10414,44 @@ async fn handle_session(
                             }
                             result
                         }
-                        Action::PersonFollowHome => {
+                        Action::PersonFollowHome | Action::CenterHead => {
+                            let leaving = params.action == Action::PersonFollowHome;
                             if !state.startup_voltage_ready.load(Ordering::Acquire) || state.low_voltage_lock.requires_rearm() {
                                 proto::HumanControlResult { accepted: false, owner: None, reason: Some("低电压保护中，请充电后手动启动".into()) }
                             } else if guard.status_blocked() || guard.maintenance_transition_blocked() {
                                 proto::HumanControlResult { accepted: false, owner: None, reason: Some("设备状态页面禁止运动".into()) }
-                            } else if session.source() != Some(proto::HumanControlSource::Web)
-                                || (guard.has_owner() && guard.access(session) != human_control::Access::Owner)
+                            } else if session.source() != Some(params.source)
+                                || (leaving && params.source != proto::HumanControlSource::Web)
+                                || (guard.access(session) != human_control::Access::Owner
+                                    && (!leaving || guard.has_owner()))
                             {
                                 proto::HumanControlResult { accepted: false, owner: None, reason: Some("not_owner".into()) }
-                            } else if !intents.snapshot().enabled || state.fallen.load(Ordering::Acquire)
-                                || state.sitting.load(Ordering::Acquire) || state.human_action_busy.load(Ordering::Acquire)
+                            } else if !intents.enabled()
+                                || intents.rest_phase() == proto::RestPhase::Resting
+                                || (leaving && (state.fallen.load(Ordering::Acquire)
+                                    || (state.sitting.load(Ordering::Acquire)
+                                        && !intents.coordinated_tracking_active())))
+                                || (!leaving && (intents.head_tracking_active() || intents.motion_tracking_active()
+                                    || intents.coordinated_tracking_active() || intents.maze_active()))
                             {
-                                proto::HumanControlResult { accepted: false, owner: Some(proto::HumanControlSource::Web),
+                                proto::HumanControlResult { accepted: false, owner: Some(params.source),
                                     reason: Some("机器人尚未准备好，无法让头部回位".into()) }
                             } else {
                                 if !guard.has_owner() {
                                     guard.acquire(session, proto::HumanControlSource::Web);
                                 }
-                                let params = proto::HeadTrackingParams { action: proto::MotionTrackingAction::Start,
-                                    target: None, pitch_position: Some(duck_control::hx::PHYSICAL_HOME_ENCODER_TARGETS[6]),
-                                    deadzone: [0.0; 2], gains: [[0.0; 3]; 2] };
-                                if intents.update_head_tracking(session.id(), params) {
+                                let result = guard.refresh(session, params.source);
+                                if result.accepted && leaving {
+                                    intents.cancel_head_tracking();
                                     intents.cancel_coordinated_tracking();
                                     intents.cancel_motion_tracking();
+                                    intents.cancel_maze();
                                     intents.stop();
-                                    guard.refresh(session, proto::HumanControlSource::Web)
-                                } else {
-                                    proto::HumanControlResult { accepted: false, owner: Some(proto::HumanControlSource::Web),
-                                        reason: Some("头部回位请求被拒绝".into()) }
                                 }
+                                if result.accepted {
+                                    intents.request_head_home();
+                                }
+                                result
                             }
                         }
                         Action::Status => guard.status(session, params.source),

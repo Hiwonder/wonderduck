@@ -25,7 +25,8 @@
 //! D-pad           forward / back / strafe at 0.15 m/s while held
 //! Left stick      forward / back / strafe
 //! Right stick     turn left / right
-//! Start           short press initializes and enables the policy
+//! In head drive   left stick walks and turns, right stick adjusts HX pitch and yaw
+//! Start           short press initializes and enables the policy, and centers the head on HX
 //! Start, 3 s      request rest
 //! Select + Start  toggle between drive and drive + head control
 //! ```
@@ -72,11 +73,13 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use duck_ipc_proto as proto;
+use duck_control::manual_head::HeadStick;
 use gilrs::{Axis, Button, Gilrs, MappingSource};
 use robotd_params::BusProtocol;
 
 mod connection;
 mod control;
+mod head_feedback;
 mod precision_drive;
 mod precision_input;
 #[cfg(target_os = "linux")]
@@ -361,56 +364,31 @@ fn head_from_pad(relative: [f32; 4], gain: f64, max_head: f64) -> proto::HeadPar
     }
 }
 
-fn head_drive_target(protocol: BusProtocol, head: proto::HeadParams) -> proto::HeadParams {
-    if protocol != BusProtocol::Hx {
-        return head;
+fn head_stick_axes(x: f64, y: f64, deadzone: f64) -> [f64; 2] {
+    let axis = usize::from(y.abs() > x.abs());
+    let deflection = [x, y][axis] / x.hypot(y).max(1.0);
+    let mut axes = [0.0; 2];
+    if deflection.abs() > deadzone {
+        axes[axis] = deflection.signum() * (deflection.abs() - deadzone) / (1.0 - deadzone);
     }
-
-    use duck_control::hx::{
-        MANUAL_HEAD_POSITION_LIMITS, PHYSICAL_HOME_ENCODER_TARGETS, decode_position, encode_position,
-    };
-    let offsets = [head.head_pitch, head.head_yaw];
-    let raw_position = std::array::from_fn(|axis| {
-        let joint = axis + 6;
-        let decode = |raw: u16| {
-            decode_position(joint, &raw.to_le_bytes()).expect("valid HX head calibration")
-        };
-        let home = decode(PHYSICAL_HOME_ENCODER_TARGETS[joint]);
-        let (min_raw, max_raw) = MANUAL_HEAD_POSITION_LIMITS[axis];
-        let offset = if offsets[axis].is_finite() { offsets[axis] } else { 0.0 };
-        let target = (home + offset).clamp(decode(max_raw), decode(min_raw));
-        encode_position(joint, target).expect("target within HX head travel")
-    });
-    proto::HeadParams { raw_position: Some(raw_position), ..proto::HeadParams::default() }
+    axes
 }
 
 #[cfg(test)]
 mod head_drive_tests {
-    use super::{BusProtocol, head_drive_target, proto};
+    use super::head_stick_axes;
 
     #[test]
-    fn hx_head_is_absolute_and_only_sends_pitch_and_yaw() {
-        let target = |pitch, yaw| {
-            head_drive_target(BusProtocol::Hx, proto::HeadParams {
-                head_pitch: pitch,
-                head_yaw: yaw,
-                head_roll: 0.4,
-                neck_pitch: 0.3,
-                ..proto::HeadParams::default()
-            })
-        };
-        for (pitch, yaw, expected) in [
-            (0.0, 0.0, [1820, 2048]),
-            (-2.5, 2.5, [2300, 1024]),
-            (2.5, -2.5, [1100, 3072]),
-            (0.1, -0.1, [1755, 2113]),
-            (0.0, 0.0, [1820, 2048]),
-        ] {
-            assert_eq!(target(pitch, yaw), proto::HeadParams {
-                raw_position: Some(expected),
-                ..proto::HeadParams::default()
-            });
-        }
+    fn hx_head_stick_uses_the_dominant_direction_and_rescales_the_deadzone() {
+        assert_eq!(head_stick_axes(0.1, -0.1, 0.1), [0.0, 0.0]);
+        assert_eq!(head_stick_axes(-1.0, 0.0, 0.1), [-1.0, 0.0]);
+        assert_eq!(head_stick_axes(0.0, 1.0, 0.1), [0.0, 1.0]);
+        let [yaw, pitch] = head_stick_axes(0.3, -0.55, 0.1);
+        assert_eq!(yaw, 0.0);
+        assert!((pitch + 0.5).abs() < 1e-9);
+        let [yaw, pitch] = head_stick_axes(1.0, 1.0, 0.1);
+        assert!((0.0..1.0).contains(&yaw));
+        assert_eq!(pitch, 0.0);
     }
 }
 
@@ -673,6 +651,8 @@ fn run_session(
     let mut active_pad_id = None;
     let mut start = control::StartControls::default();
     let mut head_drive = false;
+    let mut head_stick = HeadStick::default();
+    let mut head_feedback = None;
     let mut imu_reference = None;
     let mut center_sticks = false;
     let mut rest_rearm_required = false;
@@ -689,6 +669,15 @@ fn run_session(
     let mut ps3_r2 = None;
     #[cfg(target_os = "linux")]
     let mut ps3_idle = ps3_idle::Ps3Idle::default();
+    #[cfg(target_os = "linux")]
+    let idle_settings_path = robotd_params::gamepad_idle::Settings::path(&args.config);
+    #[cfg(target_os = "linux")]
+    let mut idle_settings_at = config_mtime(&idle_settings_path);
+    #[cfg(target_os = "linux")]
+    let mut idle_timeout = ps3_idle::load_timeout(&idle_settings_path).unwrap_or_else(|error| {
+        tracing::warn!(%error, "using default gamepad idle timeout");
+        Duration::from_secs(u64::from(robotd_params::gamepad_idle::Settings::default().minutes) * 60)
+    });
     let mut precision = args
         .gamepad_precision
         .then(|| PrecisionDrive::new(period.min(control::REFRESH_INTERVAL)));
@@ -701,6 +690,20 @@ fn run_session(
         // next command.
         if tick.duration_since(bindings_checked) >= BINDINGS_POLL {
             bindings_checked = tick;
+            #[cfg(target_os = "linux")]
+            {
+                let modified = config_mtime(&idle_settings_path);
+                if modified != idle_settings_at {
+                    idle_settings_at = modified;
+                    match ps3_idle::load_timeout(&idle_settings_path) {
+                        Ok(timeout) => {
+                            idle_timeout = timeout;
+                            tracing::info!(idle_minutes = timeout.as_secs() / 60, "gamepad idle timeout reloaded");
+                        }
+                        Err(error) => tracing::warn!(%error, "could not reload gamepad idle timeout"),
+                    }
+                }
+            }
             let now = config_mtime(&args.config);
             if now != bindings_at {
                 bindings_at = now;
@@ -822,6 +825,8 @@ fn run_session(
                 active_pad_id = None;
             }
             start = control::StartControls::default();
+            head_feedback = None;
+            head_stick = HeadStick::default();
             imu_reference = None;
             buttons_were_driving = false;
             rest_rearm_required = false;
@@ -832,7 +837,7 @@ fn run_session(
             idle_since = None;
             previous_imu_pose = None;
             #[cfg(target_os = "linux")]
-            ps3_idle.poll(gilrs, tick, args.deadzone, None);
+            ps3_idle.poll(gilrs, tick, args.deadzone, None, idle_timeout);
             std::thread::sleep(IDLE_POLL);
             continue;
         };
@@ -897,8 +902,9 @@ fn run_session(
             }
         }
         if suppress_motion || (rest_rearm_required && !pad_neutral(&pad, args.deadzone, head_drive, r2)) {
+            head_stick = HeadStick::default();
             #[cfg(target_os = "linux")]
-            ps3_idle.poll(gilrs, tick, args.deadzone, (r2 > 0).then_some(pad.id()));
+            ps3_idle.poll(gilrs, tick, args.deadzone, (r2 > 0).then_some(pad.id()), idle_timeout);
             if let Some(precision) = precision.as_mut() {
                 precision.reset();
                 precision.awaiting_completion = false;
@@ -928,8 +934,9 @@ fn run_session(
         // request control. Compare to the last significant pose to filter drift.
         let attitude = tap.and_then(|tap| {
             tap.watch(&pad);
-            tap.imu_control(head_drive && imu_head.enabled);
-            if head_drive && imu_head.enabled { tap.attitude() } else { None }
+            let imu_enabled = head_drive && bus_protocol != BusProtocol::Hx && imu_head.enabled;
+            tap.imu_control(imu_enabled);
+            if imu_enabled { tap.attitude() } else { None }
         });
         if attitude.is_none() {
             imu_reference = None;
@@ -948,7 +955,7 @@ fn run_session(
         let neutral = pad_neutral(&pad, args.deadzone, head_drive, r2);
         let activity = button_activity || imu_moving || !neutral;
         #[cfg(target_os = "linux")]
-        ps3_idle.poll(gilrs, tick, args.deadzone, activity.then_some(pad.id()));
+        ps3_idle.poll(gilrs, tick, args.deadzone, activity.then_some(pad.id()), idle_timeout);
         if activity {
             idle_since = None;
         }
@@ -964,6 +971,7 @@ fn run_session(
                     gate.acquired(&result, requested_at);
                     if gate.driving() {
                         continuous = Continuous::default();
+                        head_stick = HeadStick::default();
                     } else {
                         tracing::info!(reason = ?result.reason, "gamepad control unavailable");
                     }
@@ -979,6 +987,7 @@ fn run_session(
             return std::process::ExitCode::FAILURE;
         }
         if !gate.driving() {
+            head_stick = HeadStick::default();
             pick_mouth.cancel();
             mouth_gesture.cancel();
             if let Some(precision) = precision.as_mut() {
@@ -1017,6 +1026,8 @@ fn run_session(
                 return std::process::ExitCode::FAILURE;
             }
             head_drive = !head_drive;
+            head_feedback = None;
+            head_stick = HeadStick::default();
             imu_reference = None;
             center_sticks = true;
             tracing::info!(head_drive, "Select and Start — gamepad mode switched");
@@ -1025,6 +1036,7 @@ fn run_session(
         // A mode change discards the IMU pose calculated in the previous mode.
         let imu_head_pose = imu_head_pose.filter(|_| !mode_changed);
 
+        let mut center_head = mode_changed && !head_drive;
         if start_action == Some(StartAction::Initialize) {
             match explicit_low_voltage_rearm(&mut stream, &mut next_id, &mut gate) {
                 Ok(true) => {}, Ok(false) => continue,
@@ -1035,12 +1047,31 @@ fn run_session(
                 return std::process::ExitCode::FAILURE;
             }
             match start_robot(&mut stream, &mut next_id) {
-                Ok(StartResult::AlreadyEnabled) => tracing::info!("Start — policy already enabled"),
-                Ok(StartResult::Requested) => tracing::info!("Start — initialization and policy requested"),
+                Ok(StartResult::AlreadyEnabled) => {
+                    tracing::info!("Start — policy already enabled");
+                    center_head = true;
+                }
+                Ok(StartResult::Requested) => {
+                    tracing::info!("Start — initialization and policy requested");
+                    center_head = true;
+                }
                 Ok(StartResult::InitializationRefused) => tracing::warn!("Start — initialization refused"),
                 Ok(StartResult::EnableRefused) => tracing::warn!("Start — policy enable refused"),
                 Err(error) => {
                     tracing::error!(%error, "start request failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
+        if center_head && bus_protocol == BusProtocol::Hx {
+            match control::call(&mut stream, &mut next_id, proto::HumanControlAction::CenterHead) {
+                Ok(result) if result.accepted => {
+                    head_stick = HeadStick::default();
+                    center_sticks = true;
+                }
+                Ok(result) => tracing::debug!(reason = ?result.reason, "head centering refused"),
+                Err(error) => {
+                    tracing::error!(%error, "head centering request failed");
                     return std::process::ExitCode::FAILURE;
                 }
             }
@@ -1089,8 +1120,9 @@ fn run_session(
             let v = v as f64;
             if v.abs() < args.deadzone { 0.0 } else { v }
         };
-        let axes = [Axis::LeftStickY, Axis::LeftStickX, Axis::RightStickX, Axis::RightStickY]
-            .map(|axis| deadzone(pad.value(axis)));
+        let raw_axes = [Axis::LeftStickY, Axis::LeftStickX, Axis::RightStickX, Axis::RightStickY]
+            .map(|axis| pad.value(axis));
+        let axes = raw_axes.map(deadzone);
         if axes == [0.0; 4] {
             center_sticks = false;
         }
@@ -1142,14 +1174,35 @@ fn run_session(
         }));
         frame.extend(press_sound.map(proto::Call::RobotSound));
 
-        if head_drive {
+        if head_drive && bus_protocol == BusProtocol::Hx {
+            let feedback = head_feedback.get_or_insert_with(|| {
+                head_feedback::HeadFeedback::start(args.socket.clone())
+            });
+            if let Some(position) = feedback.position(now) {
+                let axes = if center_sticks {
+                    [0.0; 2]
+                } else {
+                    let [_, _, x, y] = raw_axes;
+                    head_stick_axes(f64::from(x), f64::from(y), args.deadzone)
+                };
+                head_stick.update(axes, Some(position), now);
+                if let Some(raw_position) = head_stick.raw_position() {
+                    frame.push(proto::Call::RobotHead(proto::HeadParams {
+                        raw_position: Some(raw_position),
+                        ..Default::default()
+                    }));
+                }
+            } else {
+                head_stick = HeadStick::default();
+            }
+        } else if head_drive {
             let head = imu_head_pose.unwrap_or(proto::HeadParams {
                 head_pitch: -right_y * args.max_head,
                 head_yaw: -right_x * args.max_head,
                 ..proto::HeadParams::default()
             });
-            frame.push(proto::Call::RobotHead(head_drive_target(bus_protocol, head)));
-        } else if mode_changed {
+            frame.push(proto::Call::RobotHead(head));
+        } else if mode_changed && bus_protocol != BusProtocol::Hx {
             frame.push(proto::Call::RobotHead(proto::HeadParams::default()));
         }
         if accessory_trigger {

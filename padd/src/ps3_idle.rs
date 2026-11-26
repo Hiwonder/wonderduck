@@ -1,13 +1,18 @@
 //! Disconnect idle Bluetooth PS3 controllers without blocking the control loop.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use evdev::{BusType, raw_stream::RawDevice};
 use gilrs::{Axis, Button, Event, EventType, Gamepad, GamepadId, Gilrs, LinuxGamepadExt};
 
-const IDLE_TIMEOUT: Duration = Duration::from_secs(180);
+pub(crate) fn load_timeout(path: &Path) -> std::io::Result<Duration> {
+    let settings = robotd_params::gamepad_idle::Settings::load(path)?;
+    Ok(Duration::from_secs(u64::from(settings.minutes) * 60))
+}
+
 const DISCONNECT_RETRY: Duration = Duration::from_secs(10);
 const TRIGGER_DEADZONE: f32 = 0.02;
 const STICKS: [Axis; 4] = [
@@ -43,7 +48,8 @@ pub(crate) struct Ps3Idle {
 
 struct Connection {
     address: String,
-    disconnect_at: Instant,
+    last_activity: Instant,
+    last_attempt: Option<Instant>,
 }
 
 impl Connection {
@@ -58,22 +64,29 @@ impl Connection {
         let address = evdev.unique_name()?.trim();
         valid_bluetooth_address(address).then(|| Self {
             address: address.to_ascii_uppercase(),
-            disconnect_at: now + IDLE_TIMEOUT,
+            last_activity: now,
+            last_attempt: None,
         })
     }
 
-    fn disconnect_due(&mut self, now: Instant, active: bool) -> bool {
-        if active {
-            self.disconnect_at = now + IDLE_TIMEOUT;
-        }
-        if now < self.disconnect_at {
+    fn record_activity(&mut self, now: Instant) {
+        self.last_activity = now;
+        self.last_attempt = None;
+    }
+
+    fn disconnect_due(&mut self, now: Instant, timeout: Duration) -> bool {
+        if now.saturating_duration_since(self.last_activity) < timeout
+            || self
+                .last_attempt
+                .is_some_and(|at| now.saturating_duration_since(at) < DISCONNECT_RETRY)
+        {
             return false;
         }
-        self.disconnect_at = now + DISCONNECT_RETRY;
+        self.last_attempt = Some(now);
         true
     }
 
-    fn disconnect(&self) {
+    fn disconnect(&self, timeout: Duration) {
         let address = self.address.clone();
         if let Err(error) = std::thread::Builder::new().name("ps3-disconnect".into()).spawn(move || {
             match Command::new("bluetoothctl")
@@ -82,7 +95,7 @@ impl Connection {
                 .stdout(Stdio::null())
                 .status()
             {
-                Ok(status) if status.success() => tracing::warn!(%address, "PS3 controller disconnected after three minutes idle"),
+                Ok(status) if status.success() => tracing::warn!(%address, idle_minutes = timeout.as_secs() / 60, "PS3 controller disconnected after idle timeout"),
                 Ok(status) => tracing::warn!(%address, %status, "could not disconnect idle PS3 controller"),
                 Err(error) => tracing::warn!(%address, %error, "could not run bluetoothctl"),
             }
@@ -120,7 +133,7 @@ impl Ps3Idle {
             _ => false,
         };
         if active && let Some(Some(device)) = self.devices.get_mut(&event.id) {
-            device.disconnect_due(now, true);
+            device.record_activity(now);
         }
     }
 
@@ -130,6 +143,7 @@ impl Ps3Idle {
         now: Instant,
         deadzone: f64,
         active: Option<GamepadId>,
+        timeout: Duration,
     ) {
         for (id, pad) in gilrs.gamepads() {
             let Some(device) = self
@@ -150,8 +164,10 @@ impl Ps3Idle {
                         pad.button_data(*button)
                             .is_some_and(|data| data.value() > TRIGGER_DEADZONE)
                     });
-            if device.disconnect_due(now, held) {
-                device.disconnect();
+            if held {
+                device.record_activity(now);
+            } else if device.disconnect_due(now, timeout) {
+                device.disconnect(timeout);
             }
         }
     }
@@ -163,17 +179,33 @@ mod tests {
 
     #[test]
     fn activity_starts_a_full_new_idle_period() {
+        let timeout = Duration::from_secs(180);
         let start = Instant::now();
         let mut device = Connection {
             address: String::new(),
-            disconnect_at: start + IDLE_TIMEOUT,
+            last_activity: start,
+            last_attempt: None,
         };
-        let near_timeout = start + IDLE_TIMEOUT - Duration::from_secs(1);
-        assert!(!device.disconnect_due(near_timeout, false));
-        assert!(!device.disconnect_due(near_timeout, true));
-        assert!(!device.disconnect_due(start + IDLE_TIMEOUT, false));
-        assert!(device.disconnect_due(near_timeout + IDLE_TIMEOUT, false));
-        assert!(!device.disconnect_due(near_timeout + IDLE_TIMEOUT, false));
+        let near_timeout = start + timeout - Duration::from_secs(1);
+        assert!(!device.disconnect_due(near_timeout, timeout));
+        device.record_activity(near_timeout);
+        assert!(!device.disconnect_due(start + timeout, timeout));
+        assert!(device.disconnect_due(near_timeout + timeout, timeout));
+        assert!(!device.disconnect_due(near_timeout + timeout, timeout));
+    }
+
+    #[test]
+    fn changing_the_timeout_uses_the_original_activity_time() {
+        let start = Instant::now();
+        let mut device = Connection {
+            address: String::new(),
+            last_activity: start,
+            last_attempt: None,
+        };
+        let now = start + Duration::from_secs(120);
+        assert!(!device.disconnect_due(now, Duration::from_secs(180)));
+        assert!(!device.disconnect_due(now, Duration::from_secs(3600)));
+        assert!(device.disconnect_due(now, Duration::from_secs(60)));
     }
 
     #[test]

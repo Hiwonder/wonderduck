@@ -133,9 +133,8 @@ def speaker_available(path):
     return True
 
 
-def read_voltage(path):
-    """Use robotd's fresh protection observation, never a cached battery average."""
-    request = b'{"jsonrpc":"2.0","id":1,"method":"robot.lowVoltageStatus"}\n'
+def robot_result(path, method):
+    request = (json.dumps(dict(jsonrpc="2.0", id=1, method=method)) + "\n").encode()
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(0.35)
@@ -153,8 +152,26 @@ def read_voltage(path):
         if not isinstance(message, dict) or message.get("id") != 1 or message.get("error") is not None:
             return None
         result = message.get("result")
-        if not isinstance(result, dict):
-            return None
+        return result if isinstance(result, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def robot_instance(path):
+    """robotd creates a new socket when it starts."""
+    try:
+        status = path.stat()
+    except OSError:
+        return None
+    return f"{status.st_ino}:{status.st_ctime_ns}"
+
+
+def read_voltage(path):
+    """Use robotd's fresh protection observation, never a cached battery average."""
+    result = robot_result(path, "robot.lowVoltageStatus")
+    if result is None:
+        return None
+    try:
         settings = result.get("settings")
         if (not isinstance(settings, dict)
                 or type(settings.get("threshold_v")) not in (int, float)
@@ -425,13 +442,16 @@ class PromptService:
                     self.last_warning_attempt = float(last)
             except (OSError, ValueError, TypeError, AttributeError):
                 pass
-        startup_error = None
         try:
-            self.startup_pending = claim_startup(startup_marker) and self.audio_enabled
+            self.startup_played = startup_marker.read_text(encoding="ascii").strip()
         except OSError as error:
-            self.startup_pending = False
-            startup_error = error
-        self.startup_deadline = time.monotonic() + 30.0
+            self.startup_played = None
+            if not isinstance(error, FileNotFoundError):
+                print(f"Cannot read startup sound state: {error}", file=sys.stderr, flush=True)
+        self.startup_instance = None
+        self.startup_pending = False
+        self.startup_deadline = 0.0
+        self.child_startup_instance = None
         self.child = None
         self.child_kind = None
         self.child_started = 0.0
@@ -445,8 +465,6 @@ class PromptService:
                              else self.last_warning_attempt + PROMPT_INTERVAL)
         self.last_error = -LOG_INTERVAL
         self.stopping = False
-        if startup_error is not None:
-            self.warn("Cannot save startup sound state: {}".format(startup_error), time.monotonic())
         if volume_error is not None:
             self.warn("Cannot prepare prompt volume: {}".format(volume_error), time.monotonic())
         if self.warning.threshold != THRESHOLD_V:
@@ -457,6 +475,33 @@ class PromptService:
         if now - self.last_error >= LOG_INTERVAL:
             print(message, file=sys.stderr, flush=True)
             self.last_error = now
+
+    def check_startup(self, now):
+        if not self.audio_enabled:
+            return
+        instance = robot_instance(self.socket_path)
+        if instance == self.startup_instance:
+            return
+        self.startup_instance = None
+        self.startup_pending = False
+        if instance is None or instance == self.startup_played:
+            return
+        status = robot_result(self.socket_path, "robot.health")
+        if status and status.get("healthy") is True and robot_instance(self.socket_path) == instance:
+            self.startup_instance = instance
+            self.startup_pending = True
+            self.startup_deadline = now + 30.0
+            self.next_startup = now
+
+    def mark_startup_played(self, instance, now):
+        self.startup_played = instance
+        try:
+            temporary = self.startup_marker.with_name("." + self.startup_marker.name + ".tmp")
+            temporary.write_text(instance + "\n", encoding="ascii")
+            os.replace(str(temporary), str(self.startup_marker))
+        except OSError as error:
+            self.warn(f"Cannot save startup sound state: {error}", now)
+        print(f"Startup sound played for robotd instance {instance}", flush=True)
 
     def sync_warning_marker(self, now):
         try:
@@ -577,6 +622,7 @@ class PromptService:
                 source.close()
         self.child_kind, self.child_started = kind, now
         self.child_timeout = timeout
+        self.child_startup_instance = self.startup_instance if kind == "startup" else None
 
     def finish_child(self, now):
         if self.child is None:
@@ -604,7 +650,10 @@ class PromptService:
                 self.next_warning = now + BUSY_RETRY
         elif result == 0:
             if kind == "startup":
-                self.startup_pending = False
+                instance = self.child_startup_instance
+                self.mark_startup_played(instance, now)
+                if instance == self.startup_instance:
+                    self.startup_pending = False
             elif kind == "network":
                 if self.pending_network is not None and self.pending_network[1]:
                     try:
@@ -627,6 +676,7 @@ class PromptService:
     def tick(self, now):
         self.finish_child(now)
         if now >= self.next_poll:
+            self.check_startup(now)
             sample = read_voltage(self.socket_path)
             if sample is None or sample[0] is None:
                 fallback = self.maintenance_voltage.observe(self.maintenance_reader(), time.monotonic())

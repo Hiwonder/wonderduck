@@ -58,6 +58,7 @@ struct HeadIntent {
     target: duck_ipc_proto::HeadParams,
     at_us: u64,
     hold: bool,
+    return_home: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -429,6 +430,7 @@ pub struct Snapshot {
     pub head_age: Duration,
     pub head_position_raw: Option<[u16; 2]>,
     pub head_position_held: bool,
+    pub head_return_home: bool,
     pub head_generation: u64,
     pub head_tracking: Option<HeadTrackingSnapshot>,
     pub head_position_handoff: Option<u16>,
@@ -504,6 +506,7 @@ impl Intents {
                 target: duck_ipc_proto::HeadParams::default(),
                 at_us: 0,
                 hold: false,
+                return_home: false,
             }),
             head_generation: std::sync::atomic::AtomicU64::new(0),
             head_tracking: ArcSwap::from_pointee(HeadTrackingIntent::default()),
@@ -625,26 +628,52 @@ impl Intents {
     }
 
     pub fn set_head(&self, head: duck_ipc_proto::HeadParams) {
-        if self.head.load().target != head {
+        let previous = self.head.load();
+        // Some manual modes send an empty head target as part of each heartbeat.
+        if previous.return_home && head == duck_ipc_proto::HeadParams::default() {
+            return;
+        }
+        if previous.return_home || previous.target != head {
             self.head_generation.fetch_add(1, Ordering::AcqRel);
         }
         self.head.store(Arc::new(HeadIntent {
             target: head,
             at_us: self.now_us(),
             hold: false,
+            return_home: false,
         }));
     }
 
-    pub fn clear_head(&self) {
+    pub fn request_head_home(&self) {
+        if self.head.load().return_home {
+            return;
+        }
+        self.head_generation.fetch_add(1, Ordering::AcqRel);
         self.head.store(Arc::new(HeadIntent {
             target: duck_ipc_proto::HeadParams::default(),
             at_us: self.now_us(),
             hold: false,
+            return_home: true,
+        }));
+    }
+
+    pub fn clear_head(&self) {
+        if self.head.load().return_home {
+            self.head_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.head.store(Arc::new(HeadIntent {
+            target: duck_ipc_proto::HeadParams::default(),
+            at_us: self.now_us(),
+            hold: false,
+            return_home: false,
         }));
     }
 
     pub fn hold_manual_head_on_release(&self) {
         let head = **self.head.load();
+        if head.return_home {
+            return;
+        }
         if head.target.raw_position.is_some() && self.now_us().saturating_sub(head.at_us) <= 250_000 {
             self.head.store(Arc::new(HeadIntent { hold: true, ..head }));
         } else {
@@ -1251,6 +1280,9 @@ impl Intents {
 
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::Relaxed);
+        if !on && self.head.load().return_home {
+            self.clear_head();
+        }
     }
 
     /// The current enable state — what `robot.enable`'s `toggle` flips. The loop reads its
@@ -1395,6 +1427,7 @@ impl Intents {
             head_age: Duration::from_micros(now.saturating_sub(head.at_us)),
             head_position_raw: head.target.raw_position,
             head_position_held: head.hold,
+            head_return_home: head.return_home,
             head_generation: self.head_generation.load(Ordering::Acquire),
             head_tracking: (head_tracking.active && now.saturating_sub(head_tracking.at_us) <= MOTION_TRACKING_TIMEOUT_US
                 && head_tracking.epoch == self.head_tracking_epoch.load(Ordering::Acquire))

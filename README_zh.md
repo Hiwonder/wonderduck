@@ -4,6 +4,10 @@
 
 WonderDuck 提供机器人控制程序和 [WonderDuck Studio](https://gitee.com/hiwonder_official/wonderduck_studio)。本项目基于 [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck)。
 
+## 模型许可
+
+Studio 中的 WonderDuck 机器人 GLB 模型采用 CC BY-NC-SA 4.0。[许可证全文](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode)
+
 ## 更新与部署
 
 以下两种更新方式均适用于已烧录并完成配置的设备。更新前，先在 Studio 的「网络管理 → 局域网模式」中将机器人连接到可访问互联网的可信 Wi-Fi 网络。

@@ -18,6 +18,7 @@ pub mod i2c_imu;
 pub mod imu;
 pub mod imu_host;
 pub mod imu_timing;
+pub mod manual_head;
 pub mod io;
 pub mod servo_diagnostics;
 pub mod model;
