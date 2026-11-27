@@ -37,6 +37,12 @@ def main():
         bridge.write_text(source)
         replace_once(bridge, "        serial_ptr->begin(baud);",
                      "        // The sketch configured the router UART and its FIFO before Bridge.begin().")
+        replace_once(bridge, "        if (!server->get_rpc(req)) {\n"
+                     "            k_mutex_unlock(&read_mutex);\n"
+                     "            k_msleep(1);",
+                     "        if (!server->get_rpc(req)) {\n"
+                     "            k_mutex_unlock(&read_mutex);\n"
+                     "            k_usleep(250);")
 
         rpclite = libs / "Arduino_RPClite/src"
         header = rpclite / "Arduino_RPClite.h"

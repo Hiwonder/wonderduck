@@ -49,6 +49,9 @@ fi
 
 install -m 0440 "$board/wonderduck-unoq.sudoers" /etc/sudoers.d/wonderduck-unoq
 install -m 0644 "$board/wonderduck-unoq-bridge.service" "$board/robotd.service" /etc/systemd/system/
+install -d -m 0755 /usr/local/libexec
+install -m 0644 "$board/recover-audio.sh" /usr/local/libexec/wonderduck-unoq-audio-recover
+install -m 0644 "$board/wonderduck-unoq-audio-recover.service" /etc/systemd/system/
 install -d -m 0755 /etc/systemd/system/arduino-router.service.d
 install -m 0644 "$board/arduino-router-affinity.conf" /etc/systemd/system/arduino-router.service.d/70-wonderduck-affinity.conf
 
@@ -74,3 +77,4 @@ if [ -f /etc/bluetooth/input.conf ] && command -v bluetoothctl >/dev/null 2>&1; 
     systemctl enable --now bluetooth-auto-trust.service
 fi
 systemctl daemon-reload
+systemctl enable --now wonderduck-unoq-audio-recover.service

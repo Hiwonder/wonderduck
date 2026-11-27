@@ -234,7 +234,9 @@ def main():
     parser.add_argument("--policy-sha256",
                         help="可选的策略预期SHA256；总会记录实际文件SHA256")
     parser.add_argument("--params", type=Path, required=True,
-                        help="原始robotd配置；保存本次副本，单独stand写stand槽，其余写walk槽")
+                        help="原始robotd配置；将录制模型写入本次配置副本的对应策略槽")
+    parser.add_argument("--port",
+                        help="robotd和寄存器诊断共用的串口；诊断默认使用/dev/ttyS3")
     parser.add_argument("--imu-source", action="append", required=True,
                         choices=("i2c", "id200", "id200-timing", "id201", "id200-host"),
                         help="主IMU来源，只能指定一次。ID200的MCU时序需显式选择id200-timing及配套固件。")
@@ -291,17 +293,24 @@ def main():
     gamepad = binary.with_name("padd")
     if args.with_gamepad and (not gamepad.is_file() or not os.access(gamepad, os.X_OK)):
         raise FileNotFoundError("--with-gamepad要求所选robotd同目录有可执行padd，未启动、未覆盖记录")
-    owner = subprocess.run(["fuser", "-s", "/dev/ttyS3"], check=False)
-    if owner.returncode != 1:
-        raise RuntimeError("串口被占用或无法确认占用状态，未启动")
     source = config_source.read_text()
     section = re.search(r"(?ms)^\[policy\]\s*\n(.*?)(?=^\[|\Z)", source)
     if section is None:
         raise ValueError("缺少policy配置节")
-    policy_slot = "stand" if selected_policy_slots(runtime_args) == {"stand"} else "walk"
+    slots = selected_policy_slots(runtime_args)
+    if slots in ({"sitstand"}, {"sitstand", "stand"}):
+        policy_slot = "sitstand"
+    else:
+        policy_slot = "stand" if slots == {"stand"} else "walk"
     policy_pattern = rf"(?m)^{policy_slot}\s*=.*$"
     if len(re.findall(policy_pattern, section.group(1))) != 1:
         raise ValueError(f"要求且只允许一个{policy_slot}策略入口")
+    port = args.port or "/dev/ttyS3"
+    if not Path(port).is_char_device():
+        raise FileNotFoundError(f"无法访问串口 {port}，请用 --port 指定实机串口")
+    owner = subprocess.run(["fuser", "-s", port], check=False)
+    if owner.returncode != 1:
+        raise RuntimeError(f"串口 {port} 被占用或无法确认占用状态，未启动")
     records_root = base.parent.parent / "records"
     if records_root.is_symlink():
         raise ValueError("records目录不能是符号链接")
@@ -320,11 +329,17 @@ def main():
     preflight = None
     if not args.deployment_like:
         preflight = [sys.executable, str(base / "read_registers.py"), "--helper", str(helper),
-                     "--port", "/dev/ttyS3", "--output", str(run / "registers-before.jsonl")]
+                     "--port", port, "--output", str(run / "registers-before.jsonl")]
         if args.servo_diagnostics_ids:
             preflight += ["--diagnostics-ids", *map(str, args.servo_diagnostics_ids)]
         subprocess.run(preflight, check=True)
     command = [str(binary), *effective_runtime_args, "--params", str(params)]
+    if args.port:
+        command += ["--port", args.port]
+    environment = os.environ.copy()
+    if args.port == "/run/wonderduck-unoq/bus":
+        environment.setdefault("WONDERDUCK_UNOQ_FEEDBACK", "1")
+        environment.setdefault("WONDERDUCK_MOTION_CPU_DMA_LATENCY_US", "100")
     if not args.deployment_like:
         command += ["--log-file", str(run / "robotd.log"), "--record", str(record_path)]
     if args.imu_last:
@@ -358,8 +373,9 @@ def main():
                    control_source=("robotd-owned padd" if args.with_gamepad else "external IPC client"),
                    requested_robotd_arguments=runtime_args,
                    imu_recording=imu_recording,
-                   environment_inputs={key: os.environ.get(key) for key in
-                       ("ORT_DYLIB_PATH", "ROBOT_FREEZE_POLICY_IMU", "RUST_LOG")},
+                   environment_inputs={key: environment.get(key) for key in
+                       ("ORT_DYLIB_PATH", "ROBOT_FREEZE_POLICY_IMU", "RUST_LOG", "WONDERDUCK_UNOQ_FEEDBACK",
+                        "WONDERDUCK_MOTION_CPU_DMA_LATENCY_US")},
                    recording_filename=None if args.deployment_like else record_path.name,
                    overwrite_named_record=args.name is not None)
     (run / "request.json").write_text(json.dumps(receipt, indent=2) + "\n")
@@ -386,7 +402,6 @@ def main():
         print("舵机诊断ID：" + ','.join(map(str, args.servo_diagnostics_ids))
               + "；模式=" + args.servo_diagnostics_mode + "；退出后自动读取并比较累计值。", flush=True)
     print("启用后先零指令保持10秒；正常时短前进约0.5秒、归零5秒，最多三次。出现失稳按原方法停策略。", flush=True)
-    environment = os.environ.copy()
     result = run_control_process(command, environment)
     result['after_registers_returncode'] = None
     result['endpoint_comparison_error'] = None

@@ -17,7 +17,7 @@ fn response(sequence: u32, age_us: u32) -> Vec<u8> {
     result
 }
 
-fn exercise(responses: Vec<Vec<u8>>) -> Vec<Result<Vec<StatusFrame>>> {
+fn exercise_read(responses: Vec<Vec<u8>>, address: u8, length: u8) -> Vec<Result<Vec<StatusFrame>>> {
     let (mut master, mut slave) = (-1, -1);
     assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(),
                                       std::ptr::null(), std::ptr::null()) }, 0);
@@ -35,6 +35,7 @@ fn exercise(responses: Vec<Vec<u8>>) -> Vec<Result<Vec<StatusFrame>>> {
             let mut request = [0; 24];
             master.read_exact(&mut request).unwrap();
             assert_eq!(request[4], UNOQ_FEEDBACK_READ);
+            assert_eq!(request[5..7], [address, length]);
             assert_eq!(request[2..].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)), 0xff);
             master.write_all(&reply).unwrap();
         }
@@ -43,13 +44,31 @@ fn exercise(responses: Vec<Vec<u8>>) -> Vec<Result<Vec<StatusFrame>>> {
     let mut results = Vec::new();
     for _ in 0..count {
         results.push(io.exchange_with_cycle_deadline(
-            sync_read_request(&IDS, PRESENT_POSITION, PRESENT_POSITION_LEN).unwrap(),
-            &IDS, PRESENT_POSITION_LEN, Instant::now() + Duration::from_millis(20),
+            sync_read_request(&IDS, address, length).unwrap(),
+            &IDS, length, Instant::now() + Duration::from_millis(20),
         ));
     }
     done.send(()).unwrap();
     worker.join().unwrap();
     results
+}
+
+fn exercise(responses: Vec<Vec<u8>>) -> Vec<Result<Vec<StatusFrame>>> {
+    exercise_read(responses, PRESENT_POSITION, PRESENT_POSITION_LEN)
+}
+
+#[test]
+fn recording_feedback_uses_cache_with_full_blocks() {
+    let mut metadata = 1u32.to_le_bytes().to_vec();
+    metadata.extend_from_slice(&8_000u32.to_le_bytes());
+    let mut reply = packet(UNOQ_FEEDBACK_METADATA_ID, 0, &metadata).unwrap();
+    for id in IDS {
+        reply.extend(packet(id, 0, &[id; RECORD_FEEDBACK_LENGTH as usize]).unwrap());
+    }
+    let result = exercise_read(vec![reply], RECORD_FEEDBACK_ADDRESS, RECORD_FEEDBACK_LENGTH);
+    for (frame, id) in result[0].as_ref().unwrap().iter().zip(IDS) {
+        assert_eq!(frame.data, [id; RECORD_FEEDBACK_LENGTH as usize]);
+    }
 }
 
 #[test]

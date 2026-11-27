@@ -114,10 +114,9 @@ impl LowVoltage {
         true
     }
 
-    /// Publish read-only recovery samples without triggering a new sit request.
-    pub fn observe_recovery(&self, voltage: Option<f64>, now: Instant, triggered: bool) {
+    /// Publish read-only recovery samples without inferring a trip from the startup interlock.
+    pub fn observe_recovery(&self, voltage: Option<f64>, now: Instant) {
         let mut monitor = self.monitor.lock().expect("low voltage lock poisoned");
-        monitor.triggered = triggered;
         monitor.observe_voltage(voltage, now);
     }
 }
@@ -125,6 +124,19 @@ impl LowVoltage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_for_voltage_recovery_does_not_report_a_new_trip() {
+        let monitor = LowVoltage::default();
+        let now = Instant::now();
+        monitor.observe_recovery(Some(7.9), now);
+        let later = now + Duration::from_secs(1);
+        monitor.observe_recovery(None, later);
+        let status = monitor.status_at(later);
+        assert!(status.voltage_v.is_none());
+        assert!(!status.triggered);
+        assert!(!status.warning_active);
+    }
 
     #[test]
     fn warning_starts_before_protection_and_survives_a_missing_sample() {

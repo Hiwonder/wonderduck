@@ -4,6 +4,7 @@ use super::sensing::{PERSISTENT_ACCEL, PERSISTENT_GYRO, persistent_calibration_f
 use super::*;
 use crate::accel_calibration::FixedAccelCalibration;
 use crate::gyro_calibration::FixedGyroCalibration;
+use crate::gyro_gains::GyroGains;
 use crate::gyro_gains::{ADDRESS as GAIN_ADDRESS, GainState, STATUS_LENGTH as GAIN_LENGTH};
 use std::path::Path;
 
@@ -16,7 +17,12 @@ const FLASH_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 pub struct CalibrationRestoreAttempts {
     accel: bool,
     gyro: bool,
-    blocked: bool,
+    pending_verification: Option<CalibrationReadback>,
+}
+
+enum CalibrationReadback {
+    Accel { flags: u32, data: [u8; 32] },
+    Gyro { flags: u32, bias: [f32; 3], gains: Option<GyroGains> },
 }
 
 impl HxIo {
@@ -74,10 +80,13 @@ impl HxIo {
         if !matches!(self.imu.source(), ImuSource::Id200 | ImuSource::Id200Timing) {
             return Ok(());
         }
-        if attempts.blocked {
-            return Err(IoError::Bus("MCU calibration restore was not verified; inspect the MCU and backup before restarting robotd".into()));
-        }
         let id = IMU_DXL_ID;
+        if let Some(expected) = &attempts.pending_verification {
+            drain_status_port(self.port_mut()?)?;
+            self.verify_calibration_restore(id, expected, Duration::ZERO)?;
+            attempts.pending_verification = None;
+            tracing::info!("MCU persistent calibration restore confirmed by readback");
+        }
         if !self.gyro_bias_state_for_load_at(id)?.supported {
             return Ok(()); // Hardware fusion does not use these calibrations.
         }
@@ -151,21 +160,17 @@ impl HxIo {
             let mut params = vec![16];
             params.extend_from_slice(&accel.wire_configuration(generation));
             attempts.accel = true;
-            attempts.blocked = true;
+            let expected = attempts.pending_verification.insert(CalibrationReadback::Accel {
+                flags: flags | PERSISTENT_ACCEL,
+                data: desired,
+            });
             let reply = self.flash_write(id, &params, 32);
             check_flash_ack(reply, &desired, "accelerometer")?;
-            let after_flags = self.persistent_flags_for_recovery(id)?;
-            if after_flags & (flags | PERSISTENT_ACCEL) != flags | PERSISTENT_ACCEL
-                || self.read_register_block(id, 16, 32)? != desired
-            {
-                return Err(IoError::Bus(
-                    "MCU persistent accelerometer calibration readback mismatch".into(),
-                ));
-            }
-            attempts.blocked = false;
+            self.verify_calibration_restore(id, expected, Duration::ZERO)?;
+            attempts.pending_verification = None;
             tracing::info!(path = %accel_path.display(), "missing MCU accelerometer calibration restored from backup");
         }
-        if let Some(gyro) = &gyro {
+        if let Some(gyro) = gyro {
             let flags_before = self.persistent_flags_for_recovery(id)?;
             if flags_before & PERSISTENT_GYRO != 0 {
                 return Err(IoError::Bus(
@@ -173,45 +178,19 @@ impl HxIo {
                 ));
             }
             attempts.gyro = true;
-            attempts.blocked = true;
-            self.restore_missing_gyro_gains(id, gyro.gyro_gains.as_ref())?;
             let desired = gyro.wire_configuration();
+            let expected = attempts.pending_verification.insert(CalibrationReadback::Gyro {
+                flags: flags_before | PERSISTENT_GYRO,
+                bias: gyro.gyro_bias_rad_s,
+                gains: gyro.gyro_gains.clone(),
+            });
+            self.restore_missing_gyro_gains(id, gyro.gyro_gains.as_ref())?;
             let mut params = vec![122];
             params.extend_from_slice(&desired);
             let reply = self.flash_write(id, &params, 16);
             check_flash_ack(reply, &desired, "gyro")?;
-            let after_flags = self.persistent_flags_for_recovery(id)?;
-            let expected_gains = if gyro.gyro_gains.is_some() {
-                PERSISTENT_GAINS
-            } else {
-                0
-            };
-            if after_flags & (flags_before | PERSISTENT_GYRO) != flags_before | PERSISTENT_GYRO
-                || after_flags & PERSISTENT_GAINS != expected_gains
-            {
-                return Err(IoError::Bus(
-                    "MCU persistent gyro calibration flags mismatch".into(),
-                ));
-            }
-            let state =
-                GainState::decode(&self.read_register_block(id, GAIN_ADDRESS, GAIN_LENGTH)?)?;
-            if !state.matches(gyro.gyro_gains.as_ref()) {
-                return Err(IoError::Bus("MCU gyro gains readback mismatch".into()));
-            }
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                let state = self.gyro_bias_state_for_load_at(id)?;
-                if state.loaded && state.ready && state.bias_rad_s == gyro.gyro_bias_rad_s {
-                    break;
-                }
-                if Instant::now() >= deadline {
-                    return Err(IoError::Bus(
-                        "MCU restored gyro calibration readback or readiness timeout".into(),
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            attempts.blocked = false;
+            self.verify_calibration_restore(id, expected, Duration::from_secs(5))?;
+            attempts.pending_verification = None;
             tracing::info!(path = %gyro_path.display(), "missing MCU gyro calibration restored from backup");
         }
         if let Some(error) = backup_error {
@@ -219,6 +198,42 @@ impl HxIo {
         } else {
             Ok(())
         }
+    }
+
+    fn verify_calibration_restore(&mut self, id: u8, expected: &CalibrationReadback, wait_ready: Duration) -> Result<()> {
+        match expected {
+            CalibrationReadback::Accel { flags, data } => {
+                let after_flags = self.persistent_flags_for_recovery(id)?;
+                if after_flags & flags != *flags || self.read_register_block(id, 16, 32)? != *data {
+                    return Err(IoError::Bus("MCU persistent accelerometer calibration readback mismatch".into()));
+                }
+            }
+            CalibrationReadback::Gyro { flags, bias, gains } => {
+                let after_flags = self.persistent_flags_for_recovery(id)?;
+                let expected_gains = if gains.is_some() { PERSISTENT_GAINS } else { 0 };
+                if after_flags & flags != *flags || after_flags & PERSISTENT_GAINS != expected_gains {
+                    return Err(IoError::Bus("MCU persistent gyro calibration flags mismatch".into()));
+                }
+                let state = GainState::decode(&self.read_register_block(id, GAIN_ADDRESS, GAIN_LENGTH)?)?;
+                if !state.matches(gains.as_ref()) {
+                    return Err(IoError::Bus("MCU gyro gains readback mismatch".into()));
+                }
+                let deadline = Instant::now() + wait_ready;
+                loop {
+                    let state = self.gyro_bias_state_for_load_at(id)?;
+                    if state.loaded && state.ready && state.bias_rad_s == *bias {
+                        break;
+                    }
+                    if Instant::now() >= deadline {
+                        return Err(IoError::Bus(
+                            "MCU restored gyro calibration readback or readiness timeout".into(),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn persistent_flags_for_recovery(&mut self, id: u8) -> Result<u32> {

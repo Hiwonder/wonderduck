@@ -1,0 +1,12 @@
+[Unit]
+Description=Recover the Arduino UNO Q audio card after boot
+After=remoteproc_audio_fixup.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /usr/local/libexec/wonderduck-unoq-audio-recover
+TimeoutStartSec=120s
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

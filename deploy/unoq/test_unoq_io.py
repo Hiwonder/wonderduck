@@ -4,15 +4,15 @@ import unittest
 import unoq_io
 
 
-def request():
-    body = bytes((0xfe, 20, unoq_io.UNOQ_FEEDBACK_READ, 56, 12)) + unoq_io.UNOQ_FEEDBACK_IDS
+def request(address=56, length=12):
+    body = bytes((0xfe, 20, unoq_io.UNOQ_FEEDBACK_READ, address, length)) + unoq_io.UNOQ_FEEDBACK_IDS
     return b"\xff\xff" + body + bytes((~sum(body) & 0xff,))
 
 
-def frames():
+def frames(length=12):
     result = bytearray()
     for identifier in unoq_io.UNOQ_FEEDBACK_IDS:
-        body = bytes((identifier, 14, 0)) + bytes(12)
+        body = bytes((identifier, length + 2, 0)) + bytes(length)
         result.extend(b"\xff\xff" + body + bytes((~sum(body) & 0xff,)))
     return bytes(result)
 
@@ -29,10 +29,10 @@ class FakeRouter:
             if self.version is None:
                 raise OSError("method wonderduck/feedback_version not available")
             return self.version
-        if method == "feedback":
+        if method in ("feedback", "feedback_extended"):
             return self.feedback
         if method == "servo":
-            return b"sample"
+            return frames(args[0][6])
         if method == "feedback_stop":
             return 0
         raise AssertionError(method)
@@ -79,6 +79,28 @@ class FeedbackSessionTests(unittest.TestCase):
         session = unoq_io.FeedbackSession(FakeRouter())
         with self.assertRaises(OSError):
             session.read(request()[:-1])
+
+    def test_extended_feedback_keeps_full_recording_frames(self):
+        router = FakeRouter(3)
+        router.feedback = struct.pack("<II", 19, 8000) + frames(28)
+        session = unoq_io.FeedbackSession(router)
+        result = session.read(request(40, 28))
+        self.assertEqual(result[14:], frames(28))
+        self.assertEqual(struct.unpack_from("<I", result, 5)[0], 19)
+        self.assertIn(("feedback_extended", (0,)), router.calls)
+        router.feedback = struct.pack("<II", 20, 8000) + frames()
+        self.assertEqual(session.read(request(40, 28)), unoq_io.feedback_error_reply())
+        router.feedback = struct.pack("<II", 21, 8000) + frames(28)
+        self.assertEqual(struct.unpack_from("<I", session.read(request(40, 28)), 5)[0], 21)
+
+    def test_version_two_uses_sync_for_extended_and_cache_for_compact(self):
+        router = FakeRouter()
+        session = unoq_io.FeedbackSession(router)
+        self.assertEqual(session.read(request(40, 28))[14:], frames(28))
+        compact = session.read(request())
+        self.assertEqual(compact[14:], frames())
+        self.assertEqual(struct.unpack_from("<I", compact, 5)[0], 2)
+        self.assertEqual([method for method, _ in router.calls], ["feedback_version", "servo", "feedback"])
 
 
 if __name__ == "__main__":

@@ -1045,6 +1045,7 @@ struct RobotState {
     /// reading the startup pose. Non-zero means the loop is still waiting for a robot to
     /// answer and has never commanded anything.
     startup_bus_failures: AtomicU32,
+    startup_servo_configuration_failures: ArcSwapOption<Vec<StartupServoFailure>>,
     /// Motor-bus voltage, EMA-smoothed, as `f64::to_bits`. Zero means *not read yet* — a
     /// distinction that has to survive to the wire, since zero volts and unknown volts look
     /// nothing alike to whoever is deciding whether to charge the robot.
@@ -1256,6 +1257,7 @@ impl RobotState {
             bus_read_timeouts: AtomicU64::new(0),
             bus_timeout_supported: params.bus.protocol == BusProtocol::Hx,
             startup_bus_failures: AtomicU32::new(0),
+            startup_servo_configuration_failures: ArcSwapOption::empty(),
             battery_v: AtomicU64::new(0),
             motor_max_c: AtomicU64::new(0),
             motor_mean_c: AtomicU64::new(0),
@@ -1374,6 +1376,9 @@ impl RobotState {
 
         // "Starting" is not "started". The gate polls, so it will see the transition.
         if self.ticks.load(Ordering::Relaxed) == 0 {
+            if let Some(failures) = self.startup_servo_configuration_failures.load_full() {
+                return degraded(format!("舵机启动参数未确认：{}", startup_servo_failure_detail(&failures)));
+            }
             // Distinguish "starting" from "cannot see a robot". Both mean no ticks, but only
             // one of them is going to resolve on its own, and the update system quotes this
             // string as the reason it rolled a release back — so it has to name the cause.
@@ -2242,88 +2247,12 @@ fn spawn_control_thread(
     std::thread::Builder::new()
         .name("control".into())
         .spawn(move || {
-            if state.status_bus_fault.load(Ordering::Acquire) {
-                // An interrupted status read might have left torque enabled.
-                // Drain late replies, then individually release and verify the
-                // servos before clearing the durable marker or starting control.
-                intents.set_enabled(false);
-                #[cfg(target_os = "linux")]
-                let mut status_io: Option<BusIo> = None;
-                #[cfg(target_os = "linux")]
-                let mut status_only = ReadOnlyStatusSession::default();
-                let mut retry_at = Instant::now();
-                while !state.shutdown.load(Ordering::Acquire) && !state.stopping.load(Ordering::Acquire) {
-                    #[cfg(target_os = "linux")]
-                    if service_startup_emergency(&state, &intents, || {
-                        if let Some(io) = status_io.as_mut() { status_only.close(io, &state)?; }
-                        let mut io = match status_io.take() {
-                            Some(io) => io,
-                            None => open_backend(&bus, imu_source, imu_last).map_err(|error| error.to_string())?,
-                        };
-                        io.recover_device_bus().map_err(|error| error.to_string())?;
-                        status_bus::complete_recovery(&state.status_journal).map_err(|error| error.to_string())?;
-                        state.status_bus_fault.store(false, Ordering::Release);
-                        state.homed.store(false, Ordering::Release);
-                        Ok(())
-                    }) {
-                        if !state.status_bus_fault.load(Ordering::Acquire) { break; }
-                        std::thread::sleep(period);
-                        continue;
-                    }
-                    #[cfg(target_os = "linux")]
-                    if status_only_requested(&state) {
-                        if state.devices_tx.receiver_count() > 0 && Instant::now() >= retry_at {
-                            if status_io.is_none() {
-                                match open_backend(&bus, imu_source, imu_last) {
-                                    Ok(io) => status_io = Some(io),
-                                    Err(error) => {
-                                        tracing::warn!(%error, "cannot open startup status bus");
-                                        retry_at = Instant::now() + Duration::from_secs(2);
-                                    }
-                                }
-                            }
-                            if let Some(io) = status_io.as_mut() {
-                                if io.supports_individual_device_observation() {
-                                    status_only.sample(io, &state, period, false);
-                                } else {
-                                    publish_status_fault(&state, None);
-                                }
-                            }
-                        }
-                        std::thread::sleep(period);
-                        continue;
-                    }
-                    #[cfg(target_os = "linux")]
-                    if let Some(mut io) = status_io.take() {
-                        let _ = status_only.close(&mut io, &state);
-                    }
-                    publish_status_fault(&state, None);
-                    if Instant::now() < retry_at {
-                        std::thread::sleep(period);
-                        continue;
-                    }
-                    #[cfg(target_os = "linux")]
-                    let recovered = open_backend(&bus, imu_source, imu_last)
-                        .and_then(|mut io| io.recover_device_bus())
-                        .map_err(|error| error.to_string())
-                        .and_then(|()| status_bus::complete_recovery(&state.status_journal)
-                            .map_err(|error| error.to_string()));
-                    #[cfg(not(target_os = "linux"))]
-                    let recovered: Result<(), String> = Err("status bus recovery is unavailable".into());
-                    match recovered {
-                        Ok(()) => {
-                            state.startup_release_verified.store(true, Ordering::Release);
-                            state.status_bus_fault.store(false, Ordering::Release);
-                            state.homed.store(false, Ordering::Release);
-                            tracing::warn!("status bus recovered before startup; policy disabled and joints released");
-                            break;
-                        }
-                        Err(error) => tracing::warn!(%error, "startup status bus recovery failed; retrying"),
-                    }
-                    retry_at = Instant::now() + Duration::from_secs(2);
-                    std::thread::sleep(period);
-                }
-                if state.status_bus_fault.load(Ordering::Acquire) { return; }
+            #[cfg(target_os = "linux")]
+            if !fake && sim.is_none() && bus.protocol == BusProtocol::Hx {
+                configure_startup_servos(&bus, &state, imu_source, imu_last);
+            }
+            if !wait_for_startup_status_bus_recovery(&bus, &state, &intents, imu_source, imu_last, period) {
+                return;
             }
             #[cfg(target_os = "linux")]
             if !fake && sim.is_none() {
@@ -2390,18 +2319,15 @@ fn spawn_control_thread(
             // afterwards. Retrying the read alone was not enough: execution never got there.
             runtime.block_on(async move {
                 #[cfg(target_os = "linux")]
-                if bus.protocol == BusProtocol::Hx && state.low_voltage_lock.requires_rearm()
-                    && !wait_for_low_voltage_recovery(&bus, &state, &intents, imu_source, imu_last).await
-                {
-                    // Keep publishing an unconfirmed-bus fault for viewers that
-                    // subscribe after preflight has already failed.
-                    while state.status_bus_fault.load(Ordering::Acquire)
-                        && !state.shutdown.load(Ordering::Acquire)
-                    {
-                        publish_status_fault(&state, None);
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                while bus.protocol == BusProtocol::Hx && state.low_voltage_lock.requires_rearm() {
+                    if wait_for_low_voltage_recovery(&bus, &state, &intents, imu_source, imu_last).await {
+                        break;
                     }
-                    return;
+                    if !state.status_bus_fault.load(Ordering::Acquire)
+                        || !wait_for_startup_status_bus_recovery(&bus, &state, &intents, imu_source, imu_last, period)
+                    {
+                        return;
+                    }
                 }
                 if let Some(mut io) = open_bus_waiting(&bus, &state, &intents, imu_source, imu_last, use_accel_calibration).await {
                     #[cfg(target_os = "linux")]
@@ -2445,6 +2371,215 @@ fn spawn_control_thread(
         })
 }
 
+#[derive(Clone)]
+struct StartupServoFailure {
+    id: u8,
+    remaining: u8,
+    reason: String,
+}
+
+#[cfg(target_os = "linux")]
+fn configure_startup_servos(bus: &params::Bus, state: &RobotState, imu_source: ImuSource, imu_last: bool) {
+    const ATTEMPTS: u8 = 3;
+    let mut pending: Vec<_> = duck_control::model::JOINT_IDS.into_iter().map(|id| StartupServoFailure {
+        id, remaining: ATTEMPTS, reason: String::new(),
+    }).collect();
+    let mut corrected = 0;
+    for attempt in 1..=ATTEMPTS {
+        if state.stopping.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) { return; }
+        let opened = open_backend(bus, imu_source, imu_last).and_then(|mut io| {
+            if attempt > 1 || state.status_bus_fault.load(Ordering::Acquire) {
+                io.prepare_individual_device_observation()?;
+            }
+            Ok(io)
+        });
+        match opened {
+            Ok(BusIo::Hx(mut io)) => {
+                pending.retain_mut(|servo| {
+                    match io.check_released_servo_at_startup(servo.id, low_voltage_lock::RECOVER_VOLTAGE, &mut servo.remaining) {
+                        Ok(count) => { corrected += count; false }
+                        Err(error) => {
+                            servo.reason = error.to_string();
+                            tracing::warn!(id = servo.id, attempt, %error, "startup servo parameter check failed");
+                            true
+                        }
+                    }
+                });
+                // Publish firmware information while the bus is still owned,
+                // even if motion startup will wait for a low-voltage rearm.
+                if pending.is_empty() || attempt == ATTEMPTS {
+                    refresh_imu_firmware_version(&mut io, state, true);
+                }
+            }
+            Ok(BusIo::Dynamixel(_)) => unreachable!("startup configuration requires HX"),
+            Err(error) => {
+                tracing::warn!(attempt, %error, "cannot open HX bus for startup parameters");
+                for servo in &mut pending { servo.reason = error.to_string(); }
+            }
+        }
+        if pending.is_empty() {
+            tracing::info!(corrected, "HX startup configuration verified before motion startup");
+            return;
+        }
+        if attempt < ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let detail = startup_servo_failure_detail(&pending);
+    tracing::warn!(corrected, %detail, "HX startup servo parameters unverified after three checks");
+    state.startup_servo_configuration_failures.store(Some(Arc::new(pending)));
+}
+
+fn startup_servo_failure_detail(failures: &[StartupServoFailure]) -> String {
+    failures.iter().map(|servo| format!("ID {}: {}", servo.id, servo.reason)).collect::<Vec<_>>().join(" | ")
+}
+
+#[cfg(target_os = "linux")]
+fn check_startup_servo_recovery(hx: &mut duck_control::hx::HxIo, state: &RobotState) -> duck_control::io::Result<usize> {
+    // The normal control read must see every required joint before doing
+    // addressed readbacks of the joints that failed configuration.
+    hx.check_control_stream()?;
+    let Some(failures) = state.startup_servo_configuration_failures.load_full() else { return Ok(0); };
+    let mut pending = (*failures).clone();
+    let mut corrected = 0;
+    pending.retain_mut(|servo| {
+        match hx.check_released_servo_at_startup(servo.id, low_voltage_lock::RECOVER_VOLTAGE, &mut servo.remaining) {
+            Ok(count) => { corrected += count; false }
+            Err(error) => { servo.reason = error.to_string(); true }
+        }
+    });
+    if !pending.is_empty() {
+        let reason = startup_servo_failure_detail(&pending);
+        state.startup_servo_configuration_failures.store(Some(Arc::new(pending)));
+        return Err(duck_control::io::IoError::Bus(reason));
+    }
+    tracing::info!(corrected, "HX startup servo parameters verified after recovery");
+    state.startup_servo_configuration_failures.store(None);
+    Ok(corrected)
+}
+
+#[cfg(target_os = "linux")]
+fn refresh_imu_firmware_version(io: &mut duck_control::hx::HxIo, state: &RobotState, log_unavailable: bool) {
+    if state.imu_firmware_version.load().is_none() {
+        match io.imu_firmware_version() {
+            Ok(version) => state.imu_firmware_version.store(Some(Arc::new(version))),
+            Err(error) if log_unavailable => tracing::info!(%error, "ID200 firmware version unavailable"),
+            Err(_) => {}
+        }
+    }
+}
+
+fn wait_for_startup_status_bus_recovery(
+    bus: &params::Bus, state: &RobotState, intents: &Intents,
+    imu_source: ImuSource, imu_last: bool, period: Duration,
+) -> bool {
+    if !state.status_bus_fault.load(Ordering::Acquire) { return true; }
+    // An interrupted status read might have left torque enabled.
+    // Drain late replies, then individually release and verify the
+    // servos before clearing the durable marker or starting control.
+    intents.set_enabled(false);
+    #[cfg(target_os = "linux")]
+    let mut status_io: Option<BusIo> = None;
+    #[cfg(target_os = "linux")]
+    let mut status_only = ReadOnlyStatusSession::default();
+    #[cfg(target_os = "linux")]
+    let (mut maintenance_parked, mut maintenance_error) = (false, None);
+    let mut retry_at = Instant::now();
+    while !state.shutdown.load(Ordering::Acquire) && !state.stopping.load(Ordering::Acquire) {
+        #[cfg(target_os = "linux")]
+        if service_startup_maintenance(state, &mut maintenance_parked, &mut maintenance_error, |release| {
+            if release {
+                let io = status_io.as_mut().ok_or_else(|| {
+                    duck_control::io::IoError::Bus("individual status bus is unavailable".into())
+                })?;
+                status_only.close(io, state).map_err(duck_control::io::IoError::Bus)?;
+                verify_faulted_partial_maintenance(state).map_err(duck_control::io::IoError::Bus)?;
+                io.maintenance_handoff(true)?;
+            } else {
+                status_io = None;
+            }
+            Ok(())
+        }) {
+            std::thread::sleep(period);
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        if service_startup_emergency(state, intents, || {
+            if let Some(io) = status_io.as_mut() { status_only.close(io, state)?; }
+            let mut io = match status_io.take() {
+                Some(io) => io,
+                None => open_backend(bus, imu_source, imu_last).map_err(|error| error.to_string())?,
+            };
+            io.recover_device_bus().map_err(|error| error.to_string())?;
+            status_bus::complete_recovery(&state.status_journal).map_err(|error| error.to_string())?;
+            state.status_bus_fault.store(false, Ordering::Release);
+            state.homed.store(false, Ordering::Release);
+            Ok(())
+        }) {
+            if !state.status_bus_fault.load(Ordering::Acquire) { break; }
+            std::thread::sleep(period);
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        if status_only_requested(state) {
+            if state.devices_tx.receiver_count() > 0 && Instant::now() >= retry_at {
+                if status_io.is_none() {
+                    match open_backend(bus, imu_source, imu_last) {
+                        Ok(io) => status_io = Some(io),
+                        Err(error) => {
+                            tracing::warn!(%error, "cannot open startup status bus");
+                            retry_at = Instant::now() + Duration::from_secs(2);
+                        }
+                    }
+                }
+                if let Some(io) = status_io.as_mut() {
+                    if io.supports_individual_device_observation() {
+                        status_only.sample(io, state, period, false);
+                    } else {
+                        publish_status_fault(state, None);
+                    }
+                }
+            }
+            std::thread::sleep(period);
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(mut io) = status_io.take() {
+            let _ = status_only.close(&mut io, state);
+        }
+        publish_status_fault(state, None);
+        if Instant::now() < retry_at {
+            std::thread::sleep(period);
+            continue;
+        }
+        #[cfg(target_os = "linux")]
+        let recovered = open_backend(bus, imu_source, imu_last)
+            .and_then(|mut io| io.recover_device_bus())
+            .map_err(|error| error.to_string())
+            .and_then(|()| status_bus::complete_recovery(&state.status_journal)
+                .map_err(|error| error.to_string()));
+        #[cfg(not(target_os = "linux"))]
+        let recovered: Result<(), String> = Err("status bus recovery is unavailable".into());
+        match recovered {
+            Ok(()) => {
+                state.startup_release_verified.store(true, Ordering::Release);
+                let mut guard = state.human_control.lock();
+                if guard.emergency_release_completed() {
+                    guard.finish_emergency_release();
+                }
+                state.status_bus_fault.store(false, Ordering::Release);
+                state.homed.store(false, Ordering::Release);
+                tracing::warn!("status bus recovered before startup; policy disabled and joints released");
+                break;
+            }
+            Err(error) => tracing::warn!(%error, "startup status bus recovery failed; retrying"),
+        }
+        retry_at = Instant::now() + Duration::from_secs(2);
+        std::thread::sleep(period);
+    }
+    !state.status_bus_fault.load(Ordering::Acquire)
+}
+
 #[cfg(target_os = "linux")]
 fn minimum_recovery_voltage(blocks: &[Vec<u8>]) -> Option<f64> {
     if blocks.len() != duck_control::model::JOINT_IDS.len() { return None; }
@@ -2484,7 +2619,45 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
     }
     let mut admitted = false;
     let mut status_only = ReadOnlyStatusSession::default();
+    let (mut maintenance_parked, mut maintenance_error) = (false, None);
     loop {
+        if service_startup_maintenance(state, &mut maintenance_parked, &mut maintenance_error, |release| {
+            if release {
+                status_only.close(&mut io, state).map_err(duck_control::io::IoError::Bus)?;
+                match io.read_maintenance_readiness(low_voltage_lock::RECOVER_VOLTAGE) {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => return Err(duck_control::io::IoError::Bus(reason)),
+                    Err(error) => {
+                        state.status_bus_fault.store(true, Ordering::Release);
+                        return Err(error);
+                    }
+                }
+                io.maintenance_handoff(true)?;
+                state.startup_release_verified.store(true, Ordering::Release);
+                state.startup_voltage_ready.store(false, Ordering::Release);
+                state.low_voltage_lock.observe_recovery(None, Instant::now());
+                admitted = false;
+            } else {
+                // Maintenance can leave torque enabled. Restore a verified release
+                // before the read-only preflight takes ownership again.
+                let result = release_voltage_preflight_bus(bus, imu_source, imu_last)
+                    .and_then(|()| io.maintenance_reclaim_for_shutdown());
+                if let Err(error) = result {
+                    tracing::warn!(%error, "cannot verify torque release after voltage-preflight maintenance");
+                    state.status_bus_fault.store(true, Ordering::Release);
+                }
+            }
+            Ok(())
+        }) {
+            if state.status_bus_fault.load(Ordering::Acquire) { return false; }
+            if maintenance_parked && (state.stopping.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire)) {
+                // Studio still owns the serial port. Keep the recovery journal for restart.
+                state.release_torque_on_exit.store(false, Ordering::Release);
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            continue;
+        }
         if state.stopping.load(Ordering::Acquire) || state.shutdown.load(Ordering::Acquire) {
             if let Err(error) = status_only.close(&mut io, state) {
                 tracing::error!(%error, "cannot close voltage preflight status session");
@@ -2501,6 +2674,22 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
                 state.exit_sit.store(EXIT_SIT_DONE, Ordering::Release);
             }
             return false;
+        }
+        if service_startup_emergency(state, intents, || {
+            status_only.close(&mut io, state)?;
+            state.startup_voltage_ready.store(false, Ordering::Release);
+            state.low_voltage_lock.observe_recovery(None, Instant::now());
+            admitted = false;
+            let result = io.maintenance_handoff(true)
+                .and_then(|()| release_voltage_preflight_bus(bus, imu_source, imu_last))
+                .and_then(|()| io.maintenance_reclaim_for_shutdown());
+            if result.is_err() {
+                state.status_bus_fault.store(true, Ordering::Release);
+            }
+            result.map_err(|error| error.to_string())
+        }) {
+            if state.status_bus_fault.load(Ordering::Acquire) { return false; }
+            continue;
         }
         if status_only_requested(state) {
             // Preflight is read-only and has its own durable marker. Suspend
@@ -2521,7 +2710,7 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
                 // Do not clear the journal or send another instruction: the
                 // unanswered reply can still arrive after an arbitrary delay.
                 state.startup_voltage_ready.store(false, Ordering::Release);
-                state.low_voltage.observe_recovery(None, Instant::now(), true);
+                state.low_voltage.observe_recovery(None, Instant::now());
                 state.status_bus_fault.store(true, Ordering::Release);
                 publish_status_fault(state, None);
                 tracing::error!(%error, "voltage preflight reply unconfirmed; motor bus remains locked");
@@ -2529,33 +2718,34 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
             }
         };
         let now = Instant::now();
+        let voltage_recovered = sample.is_some_and(|v| v >= low_voltage_lock::RECOVER_VOLTAGE);
         if let Some(voltage) = sample { state.battery_v.store(voltage.to_bits(), Ordering::Relaxed); }
         state.low_voltage_lock.observe_recovery(sample, now);
         if state.low_voltage_lock.locked() && admitted {
-            // A new low or missing sample invalidates a previously offered
-            // rearm before the bus is handed back to normal startup.
+            // Restart the continuous voltage check after a sampling gap.
+            // A normal reading after a status-page pause keeps the recovered marker.
             let mut guard = state.human_control.lock();
             state.startup_voltage_ready.store(false, Ordering::Release);
             guard.emergency_stop();
             clear_human_intents(intents);
             intents.set_enabled(false);
             let _ = intents.take_power_request();
-            if let Err(error) = state.low_voltage_lock.trip() {
+            if !voltage_recovered &&
+                let Err(error) = state.low_voltage_lock.trip()
+            {
                 tracing::error!(%error, "cannot restore the persistent low-voltage lock");
                 state.status_bus_fault.store(true, Ordering::Release);
                 return false;
             }
             admitted = false;
         }
-        if !admitted && !state.low_voltage_lock.locked() && state.low_voltage_lock.requires_rearm()
-            && let Err(error) = state.low_voltage_lock.mark_recovered()
-        {
-            state.low_voltage.observe_recovery(sample, now, true);
-            tracing::error!(%error, "cannot persist recovered voltage; startup remains blocked");
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            continue;
-        }
         if !admitted && !state.low_voltage_lock.locked() && state.low_voltage_lock.requires_rearm() {
+            if let Err(error) = state.low_voltage_lock.mark_recovered() {
+                state.low_voltage.observe_recovery(sample, now);
+                tracing::error!(%error, "cannot persist recovered voltage; startup remains blocked");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
             // No request received before this point may run afterwards.
             let mut guard = state.human_control.lock();
             guard.emergency_stop();
@@ -2571,7 +2761,7 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
             tracing::warn!("voltage recovered; awaiting an explicit start");
         }
         if admitted && !state.low_voltage_lock.requires_rearm()
-            && !sample.is_some_and(|v| v >= low_voltage_lock::RECOVER_VOLTAGE)
+            && !voltage_recovered
         {
             let mut guard = state.human_control.lock();
             state.startup_voltage_ready.store(false, Ordering::Release);
@@ -2587,9 +2777,9 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
             }
             admitted = false;
         }
-        state.low_voltage.observe_recovery(sample, now, !admitted);
+        state.low_voltage.observe_recovery(sample, now);
         if admitted && !state.low_voltage_lock.requires_rearm()
-            && sample.is_some_and(|v| v >= low_voltage_lock::RECOVER_VOLTAGE)
+            && voltage_recovered
         {
             if let Err(error) = status_bus::complete(&state.status_journal) {
                 state.startup_voltage_ready.store(false, Ordering::Release);
@@ -2604,6 +2794,14 @@ async fn wait_for_low_voltage_recovery(bus: &params::Bus, state: &RobotState, in
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+#[cfg(target_os = "linux")]
+fn release_voltage_preflight_bus(
+    bus: &params::Bus, imu_source: ImuSource, imu_last: bool,
+) -> duck_control::io::Result<()> {
+    let mut io = open_backend(bus, imu_source, imu_last)?;
+    io.recover_device_bus()
 }
 
 /// The real bus on the board; a fake elsewhere, so `open_bus_waiting` has one signature.
@@ -2947,6 +3145,12 @@ async fn open_bus_waiting(
             continue;
         }
         if service_startup_maintenance(state, &mut maintenance_parked, &mut maintenance_error, |release| {
+            if release && state.status_bus_fault.load(Ordering::Acquire) {
+                verify_faulted_partial_maintenance(state).map_err(duck_control::io::IoError::Bus)?;
+                if io.is_none() {
+                    return Err(duck_control::io::IoError::Bus("individual status bus is unavailable".into()));
+                }
+            }
             match io.as_mut() {
                 Some(io) if !release && state.stopping.load(Ordering::Acquire) => {
                     io.maintenance_reclaim_for_shutdown()
@@ -3208,14 +3412,8 @@ fn open_bus(bus: &params::Bus, attempt: u32, imu_source: ImuSource, imu_last: bo
 fn check_open_bus(io: &mut BusIo, bus: &params::Bus, attempt: u32, imu_source: ImuSource, use_accel_calibration: bool, state: Option<&RobotState>, calibration_restore: &mut duck_control::hx::CalibrationRestoreAttempts) -> bool {
     let loud = attempt == 0 || attempt.is_multiple_of(STARTUP_READ_LOG_EVERY);
     let port = bus.port.as_str();
-    if let (Some(state), BusIo::Hx(hx)) = (state, &mut *io)
-        && state.imu_firmware_version.load().is_none()
-    {
-        match hx.imu_firmware_version() {
-            Ok(version) => state.imu_firmware_version.store(Some(Arc::new(version))),
-            Err(error) if loud => tracing::info!(%error, "ID200 firmware version unavailable"),
-            Err(_) => {}
-        }
+    if let (Some(state), BusIo::Hx(hx)) = (state, &mut *io) {
+        refresh_imu_firmware_version(hx, state, loud);
     }
     // Under the same `loud` rule as everything else here — a board waiting on servo power
     // retries this forever. Worth saying at all because the whole tick budget hangs off it,
@@ -3226,7 +3424,10 @@ fn check_open_bus(io: &mut BusIo, bus: &params::Bus, attempt: u32, imu_source: I
     // A missing or faulty servo must not stop the settings of the other joints
     // from being checked. The result still gates motion until every check and
     // any replacement-device adoption succeed.
-    let registers = io.check_registers();
+    let registers = match (&mut *io, state) {
+        (BusIo::Hx(hx), Some(state)) => check_startup_servo_recovery(hx, state),
+        _ => io.check_registers(),
+    };
     let adoption_ok = adopt_missing_servo(io, loud);
     match registers {
         Ok(0) if loud => tracing::info!("motor registers already correct"),
@@ -3640,9 +3841,45 @@ fn partial_maintenance_ready(observation: &proto::DeviceObservation, now_ns: u64
     available > 0 && missing > 0
 }
 
+fn verify_faulted_partial_maintenance(state: &RobotState) -> Result<(), String> {
+    if state.low_voltage_lock.requires_rearm() && !state.low_voltage_lock.awaiting_start() {
+        return Err("low_voltage_rearm_required".into());
+    }
+    let observation = state.partial_maintenance_observation.lock().expect("partial observation mutex");
+    let ready = observation.as_ref().is_some_and(|observation| {
+        partial_maintenance_ready(observation, proto::clock::monotonic_ns())
+            && observation.servos.iter().filter(|servo| servo.valid).all(|servo| {
+                servo.voltage.is_some_and(|voltage| (low_voltage_lock::RECOVER_VOLTAGE..=25.5).contains(&voltage))
+            })
+            && observation.optional_servos.iter().all(|servo| servo.valid && servo.torque == Some(0))
+    });
+    if ready { Ok(()) } else { Err("partial_servo_release_or_voltage_not_verified".into()) }
+}
+
 #[cfg(test)]
 mod partial_maintenance_tests {
     use super::*;
+
+    #[test]
+    fn recovered_voltage_allows_maintenance_to_verify_bus_before_manual_start() {
+        let intents = Arc::new(Intents::new());
+        let state = RobotState::new(&Params::default(), Path::new("/test/robotd.toml"), intents);
+        state.startup_read_only.store(true, Ordering::Relaxed);
+        state.startup_voltage_ready.store(false, Ordering::Relaxed);
+        state.low_voltage_lock.trip().unwrap();
+        assert!(!maintenance_voltage_admitted(&state));
+
+        let started = Instant::now();
+        for step in 0..=20 {
+            state.low_voltage_lock.observe_recovery(Some(7.8), started + Duration::from_millis(100 * step));
+        }
+        state.low_voltage_lock.mark_recovered().unwrap();
+        assert!(maintenance_voltage_admitted(&state));
+        assert!(state.low_voltage_lock.requires_rearm());
+
+        state.low_voltage_lock.trip().unwrap();
+        assert!(!maintenance_voltage_admitted(&state));
+    }
 
     fn observations(now: u64) -> proto::DeviceObservation {
         let servos = duck_control::model::JOINT_IDS.into_iter().map(|id| {
@@ -3690,6 +3927,21 @@ mod partial_maintenance_tests {
         guard.begin_partial_maintenance(&session).unwrap();
         assert!(guard.partial_maintenance());
         assert!(guard.emergency_release_active());
+    }
+
+    #[test]
+    fn faulted_partial_maintenance_checks_voltage_on_each_reachable_servo() {
+        let intents = Arc::new(Intents::new());
+        let state = RobotState::new(&Params::default(), Path::new("/test/robotd.toml"), intents);
+        let mut scan = observations(proto::clock::monotonic_ns());
+        for servo in scan.servos.iter_mut().filter(|servo| servo.valid) {
+            servo.voltage = Some(7.9);
+        }
+        *state.partial_maintenance_observation.lock().unwrap() = Some(scan.clone());
+        assert!(verify_faulted_partial_maintenance(&state).is_ok());
+        scan.servos[0].voltage = Some(7.1);
+        *state.partial_maintenance_observation.lock().unwrap() = Some(scan);
+        assert!(verify_faulted_partial_maintenance(&state).is_err());
     }
 
     #[test]
@@ -3914,6 +4166,7 @@ impl ReadOnlyStatusSession {
         let result = self.sample_inner(io, state, period, existing_marker_owned);
         if let Err(error) = result {
             tracing::error!(%error, "individual status read unconfirmed; motor bus remains locked");
+            *state.partial_maintenance_observation.lock().expect("partial observation mutex") = None;
             io.set_status_individual(false);
             io.quarantine_status();
             self.active = false;
@@ -3953,11 +4206,11 @@ impl ReadOnlyStatusSession {
                 .map_err(|error| error.to_string())?
         {
             self.schedule.observe(&observation);
-            if state.status_bus_fault.load(Ordering::Acquire) {
-                publish_status_fault(state, Some(observation));
-            } else {
-                *state.partial_maintenance_observation.lock().expect("partial observation mutex") = Some(observation.clone());
+            *state.partial_maintenance_observation.lock().expect("partial observation mutex") = Some(observation.clone());
+            if !state.status_bus_fault.load(Ordering::Acquire) || verify_faulted_partial_maintenance(state).is_ok() {
                 publish_device_observation(state, Some(observation));
+            } else {
+                publish_status_fault(state, Some(observation));
             }
         }
         Ok(())
@@ -5147,6 +5400,18 @@ async fn control_loop<T: RobotIo>(
         read_timing.begin_tick(tick_start);
 
         if state.status_bus_fault.load(Ordering::Acquire) {
+            let partial_maintenance = state.human_control.lock().partial_maintenance();
+            if partial_maintenance
+                && service_startup_maintenance(&state, &mut maintenance_parked, &mut maintenance_reopen_error, |release| {
+                    if release {
+                        status_only.close(&mut safety, &state).map_err(duck_control::io::IoError::Bus)?;
+                        verify_faulted_partial_maintenance(&state).map_err(duck_control::io::IoError::Bus)?;
+                    }
+                    safety.maintenance_handoff(release)
+                })
+            {
+                continue;
+            }
             let mut requested_recovery = None;
             service_startup_emergency(&state, &intents, || {
                 let result = status_only.close(&mut safety, &state)
@@ -5187,6 +5452,9 @@ async fn control_loop<T: RobotIo>(
                             guard.finish_status_recovery();
                             guard.finish_maintenance_return();
                             maintenance_parked = false;
+                        }
+                        if guard.emergency_release_completed() {
+                            guard.finish_emergency_release();
                         }
                         drop(guard);
                         state.status_bus_fault.store(false, Ordering::Release);
@@ -9895,7 +10163,9 @@ async fn handle_session(
                     | proto::Call::RobotSound(_) | proto::Call::RobotSoundClip(_)))
                     || matches!(call, proto::Call::RobotLowVoltageRearm | proto::Call::RobotApplyModel(_))
                     || matches!(call, proto::Call::RobotMaintenance(params)
-                        if !matches!(params.action, proto::MaintenanceAction::Status | proto::MaintenanceAction::Release))
+                        if !matches!(params.action, proto::MaintenanceAction::Status
+                            | proto::MaintenanceAction::AcquirePartial | proto::MaintenanceAction::Release
+                            | proto::MaintenanceAction::InvalidateRest))
                     || matches!(call, proto::Call::RobotHumanControl(params)
                         if matches!(params.action, proto::HumanControlAction::PersonFollowHome
                             | proto::HumanControlAction::CenterHead))
@@ -9952,7 +10222,10 @@ async fn handle_session(
 
         // An operator must explicitly rearm after recovery. Reject requests
         // before they can be queued and accidentally run when voltage returns.
+        // After confirmed voltage recovery an explicit release may turn torque off
+        // during startup. Motion still requires a separate, freshly verified Start.
         if state.startup_read_only.load(Ordering::Acquire)
+            && !state.low_voltage_lock.awaiting_start()
             && matches!(&call, Ok(proto::Call::RobotEmergencyRelax))
         {
             if let Some(id) = request.id {
@@ -9969,6 +10242,16 @@ async fn handle_session(
             if let Some(id) = request.id {
                 let result = proto::IntentResult::refused("电压检测或保护恢复中，请等待后手动启动");
                 write_line(&mut write_half, &proto::Response::ok(Some(id), &result)).await?;
+            }
+            continue;
+        }
+
+        if matches!(&call, Ok(proto::Call::RobotInit | proto::Call::RobotEnable(proto::EnableParams { on: true, .. })))
+            && let Some(failures) = state.startup_servo_configuration_failures.load_full()
+        {
+            if let Some(id) = request.id {
+                let reason = format!("舵机启动参数未确认：{}", startup_servo_failure_detail(&failures));
+                write_line(&mut write_half, &proto::Response::ok(Some(id), &proto::IntentResult::refused(reason))).await?;
             }
             continue;
         }
@@ -10610,6 +10893,15 @@ async fn handle_session(
     }
 }
 
+fn maintenance_voltage_admitted(state: &RobotState) -> bool {
+    if state.startup_read_only.load(Ordering::Acquire) && state.low_voltage_lock.awaiting_start() {
+        // The voltage preflight verifies fresh voltage and torque before yielding
+        // the port. The recovery marker is consumed only by a separate Start.
+        return true;
+    }
+    state.startup_voltage_ready.load(Ordering::Acquire) && !state.low_voltage_lock.requires_rearm()
+}
+
 async fn maintenance_request(
     state: &RobotState,
     intents: &Intents,
@@ -10652,20 +10944,40 @@ async fn maintenance_request(
             }
             MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial | MaintenanceAction::AcquireStatus if state.managed_models.busy.load(Ordering::Acquire) => Err("model_update_in_progress"),
             MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial if guard.status_blocked() => Err("status_page_active"),
-            MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial | MaintenanceAction::AcquireStatus if !state.startup_voltage_ready.load(Ordering::Acquire) || state.low_voltage_lock.requires_rearm() => Err("low_voltage_rearm_required"),
+            MaintenanceAction::Acquire if !maintenance_voltage_admitted(state) => Err("low_voltage_rearm_required"),
+            MaintenanceAction::AcquireStatus if !state.startup_voltage_ready.load(Ordering::Acquire) || state.low_voltage_lock.requires_rearm() => Err("low_voltage_rearm_required"),
             MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial | MaintenanceAction::AcquireStatus if state.stopping.load(Ordering::Acquire) => Err("robot_exiting"),
             MaintenanceAction::Acquire | MaintenanceAction::AcquirePartial | MaintenanceAction::AcquireStatus if state.exit_sit.load(Ordering::Acquire) != 0 => Err("robot_exiting"),
             MaintenanceAction::AcquirePartial if !guard.maintenance_transition_blocked() => Err("partial_transition_guard_required"),
-            MaintenanceAction::AcquirePartial if state.status_bus_fault.load(Ordering::Acquire) => Err("status_bus_unconfirmed"),
-            MaintenanceAction::AcquirePartial if !state.partial_maintenance_observation.lock().expect("partial observation mutex")
-                .as_ref().is_some_and(|observation| partial_maintenance_ready(observation, proto::clock::monotonic_ns()))
-                => Err("partial_servo_release_not_verified"),
-            MaintenanceAction::AcquirePartial => guard.begin_partial_maintenance(session).map(|()| {
-                clear_human_intents_with_stop(intents, true);
-                intents.cancel_motion_tracking();
-                intents.cancel_maze();
-                let _ = intents.take_power_request();
-            }),
+            MaintenanceAction::AcquirePartial => {
+                let faulted = state.status_bus_fault.load(Ordering::Acquire);
+                let ready = if faulted {
+                    verify_faulted_partial_maintenance(state)
+                        .map_err(|_| "partial_servo_release_or_voltage_not_verified")
+                } else if !state.startup_voltage_ready.load(Ordering::Acquire) || state.low_voltage_lock.requires_rearm() {
+                    Err("low_voltage_rearm_required")
+                } else if !state.partial_maintenance_observation.lock().expect("partial observation mutex")
+                    .as_ref().is_some_and(|observation| partial_maintenance_ready(observation, proto::clock::monotonic_ns()))
+                {
+                    Err("partial_servo_release_not_verified")
+                } else {
+                    Ok(())
+                };
+                ready.and_then(|()| {
+                    if faulted && !guard.emergency_release_active() {
+                        // The guarded scan verified release for reachable servos.
+                        // Keep the full release gate latched across maintenance.
+                        guard.begin_emergency_release()?;
+                        guard.mark_emergency_release_unverified();
+                    }
+                    guard.begin_partial_maintenance(session)
+                }).map(|()| {
+                    clear_human_intents_with_stop(intents, true);
+                    intents.cancel_motion_tracking();
+                    intents.cancel_maze();
+                    let _ = intents.take_power_request();
+                })
+            }
             MaintenanceAction::Acquire | MaintenanceAction::AcquireStatus => guard.begin_maintenance(session, action == MaintenanceAction::AcquireStatus).map(|()| {
                 clear_human_intents_with_stop(intents, true);
                 intents.cancel_motion_tracking();
