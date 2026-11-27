@@ -24,6 +24,7 @@ HX_SYNC_WRITE = 0x83
 UNOQ_FEEDBACK_READ = 0x93
 UNOQ_FEEDBACK_METADATA_ID = 0xfd
 UNOQ_FEEDBACK_IDS = bytes((20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14, 200))
+UNOQ_FEEDBACK_LAYOUTS = {(56, 12): ("feedback", 2), (40, 28): ("feedback_extended", 3)}
 STATUS_READ = 0x92
 TCGETS2 = 0x802C542A
 TIOCGPTPEER = 0x5441
@@ -55,7 +56,7 @@ class Router:
 
         with (RPC_LOCK_DIRECTORY / "admission").open("rb") as admission, \
              (RPC_LOCK_DIRECTORY / "wire").open("rb") as wire:
-            if method in ("servo", "feedback"):
+            if method in ("servo", "feedback", "feedback_extended"):
                 # Keep the admission lock while HX waits for an in-flight
                 # transaction. No new sensor exchange can overtake HX.
                 fcntl.flock(admission, fcntl.LOCK_EX)
@@ -230,13 +231,14 @@ def feedback_error_reply():
     return b"\xff\xff" + body + bytes((~sum(body) & 0xff,))
 
 
-def valid_feedback_frames(data):
-    if len(data) != len(UNOQ_FEEDBACK_IDS) * 18:
+def valid_feedback_frames(data, payload_length):
+    frame_length = payload_length + 6
+    if len(data) != len(UNOQ_FEEDBACK_IDS) * frame_length:
         return False
     seen = set()
-    for offset in range(0, len(data), 18):
-        frame = data[offset:offset + 18]
-        if (frame[:2] != b"\xff\xff" or frame[3] != 14 or frame[2] not in UNOQ_FEEDBACK_IDS
+    for offset in range(0, len(data), frame_length):
+        frame = data[offset:offset + frame_length]
+        if (frame[:2] != b"\xff\xff" or frame[3] != payload_length + 2 or frame[2] not in UNOQ_FEEDBACK_IDS
                 or frame[2] in seen or sum(frame[2:]) & 0xff != 0xff):
             return False
         seen.add(frame[2])
@@ -253,8 +255,9 @@ def ordinary_sync_read(frame):
 class FeedbackSession:
     def __init__(self, router):
         self.router = router
-        self.supported = None
+        self.version = None
         self.active = False
+        self.sample_sequence = 0
         self.sequence = 0
         self.last_failure_log = 0
 
@@ -271,48 +274,49 @@ class FeedbackSession:
             self.active = False
 
     def read(self, frame):
-        if (len(frame) != 24 or frame[2] != 0xfe or frame[5:7] != b"\x38\x0c"
-                or frame[7:-1] != UNOQ_FEEDBACK_IDS):
+        if (len(frame) != 24 or frame[2] != 0xfe or frame[7:-1] != UNOQ_FEEDBACK_IDS
+                or tuple(frame[5:7]) not in UNOQ_FEEDBACK_LAYOUTS):
             raise OSError("invalid UNO Q cached feedback request")
-        if self.supported is None:
+        method, required_version = UNOQ_FEEDBACK_LAYOUTS[tuple(frame[5:7])]
+        payload_length = frame[6]
+        if self.version is None:
             try:
-                self.supported = self.router.call("feedback_version") == 2
+                self.version = self.router.call("feedback_version")
             except OSError as error:
                 if "not available" not in str(error):
                     raise
-                self.supported = False
-            if not self.supported:
-                print("STM32 cached feedback unavailable; using synchronous reads", flush=True)
-        if not self.supported:
+                self.version = 0
+        if self.version < required_version:
+            self.stop()
             result = self.router.call("servo", ordinary_sync_read(frame))
-            self.sequence = (self.sequence + 1) & 0xffffffff or 1
-            return feedback_reply(self.sequence, 0, result) or feedback_error_reply()
+            if not isinstance(result, bytes) or not valid_feedback_frames(result, payload_length):
+                return self.failure("invalid synchronous feedback frames")
+            return self.reply(0, result)
 
         self.active = True
         started = time.monotonic_ns()
-        result = self.router.call("feedback", self.sequence)
+        result = self.router.call(method, self.sample_sequence)
         elapsed_us = (time.monotonic_ns() - started + 999) // 1000
         if not isinstance(result, bytes) or len(result) < 8:
             return self.failure("no new sample before deadline")
         sequence, mcu_age_us = struct.unpack_from("<II", result)
-        if sequence == self.sequence:
-            return self.failure(f"repeated sample sequence={sequence}")
+        advance = (sequence - self.sample_sequence) & 0xffffffff
+        if sequence == 0 or advance == 0 or (self.sample_sequence != 0 and advance >= 0x80000000):
+            return self.failure(f"invalid sample sequence={sequence}")
         # Add the full RPC time to bound the age at the local serial reply.
         age_us = mcu_age_us + elapsed_us
         data = result[8:]
-        if not valid_feedback_frames(data):
-            invalid = []
-            for offset in range(0, len(data), 18):
-                frame = data[offset:offset + 18]
-                if (len(frame) != 18 or frame[:2] != b"\xff\xff" or frame[3] != 14
-                        or sum(frame[2:]) & 0xff != 0xff):
-                    invalid.append(f"{offset}:{frame[:5].hex()}")
-            return self.failure(f"invalid sample sequence={sequence} bytes={len(data)} frames={invalid[:3]}")
-        reply = feedback_reply(sequence, age_us, data)
-        if not reply:
+        if not valid_feedback_frames(data, payload_length):
+            return self.failure(f"invalid sample sequence={sequence} bytes={len(data)}")
+        if age_us > 40_000:
             return self.failure(f"stale sample sequence={sequence} age_us={age_us}")
-        self.sequence = sequence
-        return reply
+        self.sample_sequence = sequence
+        return self.reply(age_us, data, advance)
+
+    def reply(self, age_us, data, advance=1):
+        # Preserve gaps in MCU sample numbers across synchronous fallback reads.
+        self.sequence = (self.sequence + advance) & 0xffffffff or 1
+        return feedback_reply(self.sequence, age_us, data)
 
 
 def serve_bus(router, port, owner=None):

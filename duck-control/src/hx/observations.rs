@@ -98,7 +98,7 @@ impl HxIo {
 
     /// A status reply is accepted only as the exact matching complete frame.
     /// Unlike the regular stream parser, this never skips damaged or extra bytes.
-    fn read_status_one(&mut self, id: u8, address: u8, length: u8) -> Result<Option<StatusFrame>> {
+    pub(super) fn read_status_one(&mut self, id: u8, address: u8, length: u8) -> Result<Option<StatusFrame>> {
         if self.status_unconfirmed {
             return Err(IoError::Bus("status reply unconfirmed; motor bus is quarantined".into()));
         }

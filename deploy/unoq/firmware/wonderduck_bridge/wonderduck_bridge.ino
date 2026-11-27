@@ -31,6 +31,7 @@ constexpr size_t hx_max_frame_size = 255 + 4;
 constexpr uint8_t feedback_ids[] = {20, 21, 22, 23, 24, 30, 31, 32, 33, 34,
                                     10, 11, 12, 13, 14, 200};
 constexpr uint32_t feedback_period_us = 10000;
+constexpr uint32_t extended_feedback_period_us = 16000;
 constexpr uint32_t feedback_lease_us = 1000000;
 constexpr uint32_t feedback_max_age_us = 20000;
 
@@ -38,10 +39,11 @@ k_mutex bus_mutex, feedback_mutex;
 k_sem feedback_start, feedback_ready;
 K_THREAD_STACK_DEFINE(feedback_stack, 4096);
 k_thread feedback_thread;
-Bytes feedback_request, feedback_latest;
+Bytes feedback_request, extended_feedback_request, feedback_latest;
 uint32_t feedback_sequence = 0, feedback_sample_started = 0, feedback_lease_until = 0;
 uint32_t feedback_generation = 0;
 bool feedback_enabled = false;
+bool feedback_extended = false;
 
 // The expansion board uses D18 to select the transmit path. D18 is PC1 on UNO Q.
 constexpr uint32_t direction_pin = LL_GPIO_PIN_1;
@@ -167,7 +169,10 @@ void feedback_acquire(void *, void *, void *) {
         k_sem_take(&feedback_start, K_FOREVER);
         k_mutex_lock(&feedback_mutex, K_FOREVER);
         const uint32_t generation = feedback_generation;
+        const bool extended = feedback_extended;
         k_mutex_unlock(&feedback_mutex);
+        const Bytes &request = extended ? extended_feedback_request : feedback_request;
+        const uint32_t period = extended ? extended_feedback_period_us : feedback_period_us;
         uint32_t deadline = micros();
         for (;;) {
             k_mutex_lock(&feedback_mutex, K_FOREVER);
@@ -181,7 +186,7 @@ void feedback_acquire(void *, void *, void *) {
 
             k_mutex_lock(&bus_mutex, K_FOREVER);
             const uint32_t started = micros();
-            Bytes reply = servo_exchange(feedback_request);
+            Bytes reply = servo_exchange(request);
             k_mutex_lock(&feedback_mutex, K_FOREVER);
             if (feedback_enabled && generation == feedback_generation) {
                 feedback_latest.swap(reply);
@@ -192,7 +197,7 @@ void feedback_acquire(void *, void *, void *) {
             k_mutex_unlock(&feedback_mutex);
             k_mutex_unlock(&bus_mutex);
 
-            deadline += feedback_period_us;
+            deadline += period;
             const int32_t remaining = int32_t(deadline - micros());
             if (remaining > 0) {
                 k_sleep(K_USEC(remaining));
@@ -203,11 +208,12 @@ void feedback_acquire(void *, void *, void *) {
     }
 }
 
-void feedback_begin() {
+void feedback_begin(bool extended) {
     k_mutex_lock(&feedback_mutex, K_FOREVER);
     feedback_lease_until = micros() + feedback_lease_us;
-    if (!feedback_enabled) {
+    if (!feedback_enabled || feedback_extended != extended) {
         feedback_enabled = true;
+        feedback_extended = extended;
         ++feedback_generation;
         feedback_latest.clear();
         k_sem_reset(&feedback_ready);
@@ -216,9 +222,9 @@ void feedback_begin() {
     k_mutex_unlock(&feedback_mutex);
 }
 
-Bytes feedback_read(uint32_t previous_sequence) {
+Bytes feedback_read(uint32_t previous_sequence, bool extended) {
     const uint32_t until = micros() + 18000;
-    feedback_begin();
+    feedback_begin(extended);
 
     for (;;) {
         k_mutex_lock(&feedback_mutex, K_FOREVER);
@@ -277,18 +283,24 @@ Bytes tof_transfer(Bytes request, uint8_t read_length) {
 }
 }
 
+Bytes make_feedback_request(uint8_t address, uint8_t length) {
+    Bytes request = {0xff, 0xff, 0xfe, uint8_t(sizeof(feedback_ids) + 4),
+                     hx_sync_read, address, length};
+    request.insert(request.end(), feedback_ids, feedback_ids + sizeof(feedback_ids));
+    uint8_t sum = 0;
+    for (size_t i = 2; i < request.size(); ++i) sum += request[i];
+    request.push_back(~sum);
+    return request;
+}
+
 void setup() {
     init_servo_bus();
     k_mutex_init(&bus_mutex);
     k_mutex_init(&feedback_mutex);
     k_sem_init(&feedback_start, 0, 1);
     k_sem_init(&feedback_ready, 0, 1);
-    feedback_request = {0xff, 0xff, 0xfe, uint8_t(sizeof(feedback_ids) + 4),
-                        hx_sync_read, 56, 12};
-    feedback_request.insert(feedback_request.end(), feedback_ids, feedback_ids + sizeof(feedback_ids));
-    uint8_t sum = 0;
-    for (size_t i = 2; i < feedback_request.size(); ++i) sum += feedback_request[i];
-    feedback_request.push_back(~sum);
+    feedback_request = make_feedback_request(56, 12);
+    extended_feedback_request = make_feedback_request(40, 28);
     k_thread_create(&feedback_thread, feedback_stack, K_THREAD_STACK_SIZEOF(feedback_stack),
                     feedback_acquire, nullptr, nullptr, nullptr, 6, 0, K_NO_WAIT);
     HeadImuI2c::begin();
@@ -301,9 +313,14 @@ void setup() {
             return count <= max_bus_bytes ? Bytes(count, 0xaa) : Bytes{};
         });
         Bridge.provide("wonderduck/servo", locked_servo_exchange);
-        // Version 2 provides feedback only in replies to Linux requests.
-        Bridge.provide("wonderduck/feedback_version", +[]() -> int { return 2; });
-        Bridge.provide("wonderduck/feedback", feedback_read);
+        // Version 3 adds the extended recording registers to the pull protocol.
+        Bridge.provide("wonderduck/feedback_version", +[]() -> int { return 3; });
+        Bridge.provide("wonderduck/feedback", +[](uint32_t previous) -> Bytes {
+            return feedback_read(previous, false);
+        });
+        Bridge.provide("wonderduck/feedback_extended", +[](uint32_t previous) -> Bytes {
+            return feedback_read(previous, true);
+        });
         Bridge.provide("wonderduck/feedback_stop", feedback_stop);
         Bridge.provide("wonderduck/feedback_sequence", +[]() -> uint32_t {
             k_mutex_lock(&feedback_mutex, K_FOREVER);

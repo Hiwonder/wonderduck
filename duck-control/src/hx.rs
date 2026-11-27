@@ -64,6 +64,12 @@ const TEMPERATURE_OFFSET: usize = 63 - PRESENT_POSITION as usize;
 const RECORD_FEEDBACK_ADDRESS: u8 = TORQUE_ENABLE;
 const RECORD_FEEDBACK_LENGTH: u8 = PRESENT_POSITION + PRESENT_POSITION_LEN - RECORD_FEEDBACK_ADDRESS;
 
+enum ServoRelease {
+    NoReply,
+    Unverified(String),
+    Verified,
+}
+
 /// How long a move takes, as `(address, width, wanted)` — asserted at startup.
 ///
 /// These are the servo's *motion shaping*, and the firmware loads them from its own defaults
@@ -297,12 +303,17 @@ impl HxIo {
 
     /// Probe the selected control devices and verify their startup registers.
     pub fn check_registers(&mut self) -> Result<usize> {
-        self.begin_control_observation();
         // Check each servo before probing the combined control stream. A missing
         // device must not prevent healthy joints from receiving their settings.
         let fixed = self.check_servo_startup_configuration()?;
-        self.read_control_blocks(PRESENT_POSITION, PRESENT_POSITION_LEN)?;
+        self.check_control_stream()?;
         Ok(fixed)
+    }
+
+    /// Verify the combined feedback stream without writing startup parameters.
+    pub fn check_control_stream(&mut self) -> Result<()> {
+        self.begin_control_observation();
+        self.read_control_blocks(PRESENT_POSITION, PRESENT_POSITION_LEN).map(|_| ())
     }
 
     /// Verify servo motion shaping without querying the IMU.
@@ -348,16 +359,20 @@ impl HxIo {
 
     fn verify_servo_motion_registers(&mut self) -> Result<()> {
         let blocks = self.sync_read_ids(&HX_BUS_JOINT_IDS, ACCELERATION, 7)?;
-        for (index, block) in blocks.iter().enumerate() {
-            for &(address, width, want) in MOTION_REGISTERS {
-                let start = usize::from(address - ACCELERATION);
-                let got = decode_register(&block[start..start + usize::from(width)], width)?;
-                if got != want {
-                    return Err(IoError::Bus(format!(
-                        "HX motion register did not restore: ID {}, address {address}, got {got}, want {want}",
-                        HX_BUS_JOINT_IDS[index]
-                    )));
-                }
+        for (&id, block) in HX_BUS_JOINT_IDS.iter().zip(&blocks) {
+            Self::verify_servo_motion_register_block(id, block)?;
+        }
+        Ok(())
+    }
+
+    fn verify_servo_motion_register_block(id: u8, block: &[u8]) -> Result<()> {
+        for &(address, width, want) in MOTION_REGISTERS {
+            let start = usize::from(address - ACCELERATION);
+            let got = decode_register(&block[start..start + usize::from(width)], width)?;
+            if got != want {
+                return Err(IoError::Bus(format!(
+                    "HX motion register did not restore: ID {id}, address {address}, got {got}, want {want}"
+                )));
             }
         }
         Ok(())
@@ -479,6 +494,38 @@ impl HxIo {
     /// production loop, except that the caller chooses a servo-only ID list.
     pub fn diagnostic_read_state_blocks(&mut self, ids: &[u8]) -> Result<Vec<Vec<u8>>> {
         self.sync_read_ids(ids, PRESENT_POSITION, PRESENT_POSITION_LEN)
+    }
+
+    /// Check power and torque under exclusive ownership without changing any register.
+    pub fn read_maintenance_readiness(&mut self, minimum_voltage: f64) -> Result<Option<String>> {
+        for id in JOINT_IDS.into_iter().chain(ACCESSORY_SERVO_IDS) {
+            match self.read_released_servo(id, minimum_voltage)? {
+                ServoRelease::Unverified(reason) => return Ok(Some(reason)),
+                ServoRelease::NoReply if !ACCESSORY_SERVO_IDS.contains(&id) => {
+                    return Err(IoError::Bus(format!("ID {id} 无回复，需逐个确认可维护的舵机")));
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_released_servo(&mut self, id: u8, minimum_voltage: f64) -> Result<ServoRelease> {
+        const VOLTAGE_INDEX: usize = 62 - TORQUE_ENABLE as usize;
+        const LENGTH: u8 = (VOLTAGE_INDEX + 1) as u8;
+        let Some(reply) = self.read_status_one(id, TORQUE_ENABLE, LENGTH)? else {
+            return Ok(ServoRelease::NoReply);
+        };
+        let Some(voltage) = reply.data.get(VOLTAGE_INDEX).map(|value| f64::from(*value) / 10.0) else {
+            return Ok(ServoRelease::Unverified(format!("ID {id} 的电压和扭矩回读未确认")));
+        };
+        if voltage < minimum_voltage {
+            return Ok(ServoRelease::Unverified(format!("ID {id} 电压 {voltage:.1} V，要求至少 {minimum_voltage:.1} V")));
+        }
+        if reply.data[0] != 0 {
+            return Ok(ServoRelease::Unverified(format!("ID {id} 尚未确认卸力")));
+        }
+        Ok(ServoRelease::Verified)
     }
 
     /// Encode the configured home pose for an explicit diagnostic ID list.
@@ -765,7 +812,8 @@ impl HxIo {
     ) -> Result<Vec<StatusFrame>> {
         self.unoq_feedback_started_ns = None;
         if self.unoq_feedback && !self.read_only && tx.len() == 24 &&
-            tx[4..7] == [SYNC_READ, PRESENT_POSITION, PRESENT_POSITION_LEN] &&
+            matches!(&tx[4..7], [SYNC_READ, PRESENT_POSITION, PRESENT_POSITION_LEN]
+                | [SYNC_READ, RECORD_FEEDBACK_ADDRESS, RECORD_FEEDBACK_LENGTH]) &&
             expected.len() == NUM_JOINTS + 1 && expected[..NUM_JOINTS] == HX_BUS_JOINT_IDS &&
             expected[NUM_JOINTS] == IMU_DXL_ID
         {
@@ -1287,7 +1335,22 @@ impl RobotIo for HxIo {
             // accept an individually verified release.
             self.port = Some(open_serial(&self.port_path)?);
             self.torque_enabled = None;
-            self.set_torque(false)?;
+            // A wing can still be holding torque from Studio or the previous
+            // process. The in-memory accessory flag cannot establish its state.
+            self.sync_write_ids(TORQUE_ENABLE, 1, &ACCESSORY_SERVO_IDS, &[vec![0], vec![0]])?;
+            self.accessory_torque = false;
+            self.accessory_motion = AccessoryMotion::default();
+            let joint_release = self.set_torque(false);
+            for id in ACCESSORY_SERVO_IDS {
+                if let Some(reply) = self.read_status_one(id, TORQUE_ENABLE, 1)?
+                    && reply.data.as_slice() != [0]
+                {
+                    return Err(IoError::Bus(format!(
+                        "HX torque state did not verify for accessory ID {id}: {:?}", reply.data,
+                    )));
+                }
+            }
+            joint_release?;
             // Bus recovery is complete once every servo confirms torque off.
             // Calibration is a separate prerequisite for later motion; making
             // it part of this result prevents a blank MCU from being restored.

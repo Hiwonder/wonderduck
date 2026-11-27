@@ -6,7 +6,7 @@ use crate::io::{IoError, Result};
 pub const ADDRESS: u8 = 117;
 pub const STATUS_LENGTH: u8 = 40;
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GyroGains {
     schema_version: u16,

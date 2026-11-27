@@ -69,6 +69,9 @@ impl LowVoltageLock {
     }
     pub(crate) fn locked(&self) -> bool { self.state.lock().expect("low-voltage lock poisoned").locked }
     pub(crate) fn requires_rearm(&self) -> bool { self.state.lock().expect("low-voltage lock poisoned").requires_rearm }
+    pub(crate) fn awaiting_start(&self) -> bool {
+        self.state.lock().expect("low-voltage lock poisoned").awaiting_start_on_disk
+    }
     pub(crate) fn persistence_confirmed(&self) -> bool { self.state.lock().expect("low-voltage lock poisoned").persistence_confirmed }
     /// A recovery requires a continuous stream of complete, fresh minimum
     /// voltages. Unknown, stale, out-of-order or low data resets the timer.

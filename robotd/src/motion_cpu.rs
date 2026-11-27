@@ -1,7 +1,7 @@
-//! CPU frequency floor requested by the UNO Q service during physical motion control.
+//! CPU frequency and wake-up latency requests during physical motion control.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,26 +11,50 @@ pub(crate) struct MotionCpuFloor {
     saved: PathBuf,
     applied: Option<bool>,
     retry_at: Option<Instant>,
+    latency: Option<MotionCpuLatency>,
 }
 
 impl MotionCpuFloor {
     pub(crate) fn configured() -> Option<Self> {
-        let value = std::env::var("WONDERDUCK_MOTION_CPU_MIN_KHZ").ok()?;
-        let Ok(khz) = value.parse::<u32>() else {
-            tracing::warn!(%value, "invalid motion CPU frequency floor");
-            return None;
-        };
-        (khz > 0).then(|| Self {
+        let khz = std::env::var("WONDERDUCK_MOTION_CPU_MIN_KHZ")
+            .ok()
+            .and_then(|value| match value.parse::<u32>() {
+                Ok(khz) => Some(khz),
+                Err(_) => {
+                    tracing::warn!(%value, "invalid motion CPU frequency floor");
+                    None
+                }
+            })
+            .unwrap_or(0);
+        let latency = std::env::var("WONDERDUCK_MOTION_CPU_DMA_LATENCY_US")
+            .ok()
+            .and_then(|value| match value.parse::<i32>() {
+                Ok(micros) if micros >= 0 => Some(MotionCpuLatency {
+                    micros,
+                    device: "/dev/cpu_dma_latency".into(),
+                    request: None,
+                    retry_at: None,
+                }),
+                _ => {
+                    tracing::warn!(%value, "invalid motion CPU wake-up latency");
+                    None
+                }
+            });
+        (khz > 0 || latency.is_some()).then(|| Self {
             khz,
             minimum: "/sys/devices/system/cpu/cpufreq/policy0/scaling_min_freq".into(),
             saved: "/run/robotd/motion-cpu-min-khz".into(),
             applied: None,
             retry_at: None,
+            latency,
         })
     }
 
     pub(crate) fn update(&mut self, active: bool, now: Instant) {
-        if self.applied == Some(active) || self.retry_at.is_some_and(|retry| now < retry) {
+        if let Some(latency) = &mut self.latency {
+            latency.update(active, now);
+        }
+        if self.khz == 0 || self.applied == Some(active) || self.retry_at.is_some_and(|retry| now < retry) {
             return;
         }
         let result = if active { self.raise() } else { self.restore() };
@@ -83,8 +107,44 @@ impl MotionCpuFloor {
 
 impl Drop for MotionCpuFloor {
     fn drop(&mut self) {
-        if let Err(error) = self.restore() {
+        if self.khz != 0 && let Err(error) = self.restore() {
             tracing::warn!(%error, "cannot restore idle CPU frequency floor");
+        }
+    }
+}
+
+struct MotionCpuLatency {
+    micros: i32,
+    device: PathBuf,
+    request: Option<fs::File>,
+    retry_at: Option<Instant>,
+}
+
+impl MotionCpuLatency {
+    fn update(&mut self, active: bool, now: Instant) {
+        if !active {
+            self.request = None;
+            self.retry_at = None;
+            return;
+        }
+        if self.request.is_some() || self.retry_at.is_some_and(|retry| now < retry) {
+            return;
+        }
+        match fs::OpenOptions::new().write(true).open(&self.device).and_then(|mut file| {
+            file.write_all(&self.micros.to_ne_bytes())?;
+            Ok(file)
+        }) {
+            // The kernel releases this PM QoS request when the descriptor closes.
+            Ok(file) => {
+                self.request = Some(file);
+                self.retry_at = None;
+            }
+            Err(error) => {
+                if self.retry_at.is_none() {
+                    tracing::warn!(%error, "cannot request motion CPU wake-up latency");
+                }
+                self.retry_at = Some(now + Duration::from_secs(1));
+            }
         }
     }
 }
@@ -108,6 +168,7 @@ mod tests {
             saved: dir.join("original"),
             applied: None,
             retry_at: None,
+            latency: None,
         };
         let mut params = Params::default();
         params.policy.enabled = false;
@@ -160,6 +221,7 @@ mod tests {
             saved: saved.clone(),
             applied: None,
             retry_at: None,
+            latency: None,
         };
         let now = Instant::now();
         fs::write(&minimum, "614400\n").unwrap();
@@ -188,5 +250,26 @@ mod tests {
         assert_eq!(MotionCpuFloor::read_khz(&minimum).unwrap(), 300_000);
         assert!(!saved.exists());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn holds_cpu_latency_request_only_while_active() {
+        let device = std::env::temp_dir().join(format!("robotd-cpu-qos-{}", std::process::id()));
+        fs::write(&device, []).unwrap();
+        let mut latency = MotionCpuLatency {
+            micros: 100,
+            device: device.clone(),
+            request: None,
+            retry_at: None,
+        };
+        let now = Instant::now();
+        latency.update(false, now);
+        assert!(latency.request.is_none());
+        latency.update(true, now);
+        assert!(latency.request.is_some());
+        assert_eq!(fs::read(&device).unwrap(), 100i32.to_ne_bytes());
+        latency.update(false, now);
+        assert!(latency.request.is_none());
+        fs::remove_file(device).unwrap();
     }
 }

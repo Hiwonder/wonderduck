@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use super::{ACCELERATION, HX_BUS_JOINT_IDS, HxIo, IoError, ReadFailureReason, Result, drain_status_port};
+use super::{ACCELERATION, HX_BUS_JOINT_IDS, HxIo, IoError, ReadFailureReason, Result, ServoRelease, drain_status_port};
 
 const TEMPERATURE_LIMIT: u8 = 13;
 const POSITION_PID: u8 = 21;
@@ -39,6 +39,39 @@ pub(super) fn startup_check_result(fixed: usize, failed: Vec<String>) -> Result<
 }
 
 impl HxIo {
+    /// A missing reply or unsafe voltage does not start a configuration attempt.
+    /// Once the write budget is exhausted the joint can only recover by readback.
+    pub fn check_released_servo_at_startup(&mut self, id: u8, minimum_voltage: f64, remaining: &mut u8) -> Result<usize> {
+        self.confirm_startup_servo_released(id, minimum_voltage)?;
+        let (count, block) = if *remaining > 0 {
+            *remaining -= 1;
+            self.check_one_servo_startup(id)?
+        } else {
+            (0, self.read_verified_startup_configuration(id)?)
+        };
+        self.cache_startup_configuration(id, &block);
+        Ok(count)
+    }
+
+    fn read_verified_startup_configuration(&mut self, id: u8) -> Result<Vec<u8>> {
+        let block = self.read_configuration(id, 0, STARTUP_BLOCK_LENGTH)?;
+        Self::verify_servo_motion_register_block(id, &block[usize::from(ACCELERATION)..])?;
+        if let Some(change) = servo_configuration_changes(id, &block).first() {
+            return Err(IoError::Bus(format!(
+                "ID {id} 寄存器 {} 读回 {:?}，预期 {:?}", change.address, change.actual, change.expected
+            )));
+        }
+        Ok(block)
+    }
+
+    fn confirm_startup_servo_released(&mut self, id: u8, minimum_voltage: f64) -> Result<()> {
+        match self.read_released_servo(id, minimum_voltage)? {
+            ServoRelease::Verified => Ok(()),
+            ServoRelease::Unverified(reason) => Err(IoError::Bus(reason)),
+            ServoRelease::NoReply => Err(IoError::Bus("舵机无回复".into())),
+        }
+    }
+
     pub(super) fn check_servo_startup_configuration(&mut self) -> Result<usize> {
         self.invalidate_observation_configuration();
         let mut fixed = 0;
@@ -76,32 +109,7 @@ impl HxIo {
     }
 
     fn correct_servo_configuration(&mut self, id: u8, block: &mut [u8]) -> Result<usize> {
-        let mut changes = Vec::new();
-        for (offset, expected) in POSITION_PID_EXPECTED.iter().copied().enumerate() {
-            if block[usize::from(POSITION_PID) + offset] != expected {
-                changes.push(Change {
-                    address: POSITION_PID + offset as u8,
-                    actual: vec![block[usize::from(POSITION_PID) + offset]],
-                    expected: vec![expected],
-                });
-            }
-        }
-        if id != 34 {
-            if block[usize::from(TEMPERATURE_LIMIT)] != TEMPERATURE_LIMIT_EXPECTED {
-                changes.push(Change {
-                    address: TEMPERATURE_LIMIT,
-                    actual: vec![block[usize::from(TEMPERATURE_LIMIT)]],
-                    expected: vec![TEMPERATURE_LIMIT_EXPECTED],
-                });
-            }
-            if block[usize::from(MINIMUM_START_TORQUE)..usize::from(MINIMUM_START_TORQUE) + 2] != [0, 0] {
-                changes.push(Change {
-                    address: MINIMUM_START_TORQUE,
-                    actual: block[usize::from(MINIMUM_START_TORQUE)..usize::from(MINIMUM_START_TORQUE) + 2].to_vec(),
-                    expected: vec![0, 0],
-                });
-            }
-        }
+        let changes = servo_configuration_changes(id, block);
         if changes.is_empty() { return Ok(0); }
 
         let lock = self.read_configuration(id, NVS_WRITE_PROTECTION, 1)?;
@@ -180,4 +188,23 @@ impl HxIo {
         }
         unreachable!("configuration read loop always returns")
     }
+}
+
+fn servo_configuration_changes(id: u8, block: &[u8]) -> Vec<Change> {
+    let mut changes = Vec::new();
+    let mut require = |address: u8, expected: &[u8]| {
+        let start = usize::from(address);
+        let actual = &block[start..start + expected.len()];
+        if actual != expected {
+            changes.push(Change { address, actual: actual.to_vec(), expected: expected.to_vec() });
+        }
+    };
+    for (offset, expected) in POSITION_PID_EXPECTED.iter().copied().enumerate() {
+        require(POSITION_PID + offset as u8, &[expected]);
+    }
+    if id != 34 {
+        require(TEMPERATURE_LIMIT, &[TEMPERATURE_LIMIT_EXPECTED]);
+        require(MINIMUM_START_TORQUE, &[0, 0]);
+    }
+    changes
 }

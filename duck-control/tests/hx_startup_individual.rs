@@ -88,6 +88,14 @@ fn run_bus<T>(
     failed_verification: Option<u8>,
     run: impl FnOnce(&mut HxIo) -> T,
 ) -> (T, Bus) {
+    run_bus_with_state(missing, failed_verification, |io, _| run(io))
+}
+
+fn run_bus_with_state<T>(
+    missing: Option<u8>,
+    failed_verification: Option<u8>,
+    run: impl FnOnce(&mut HxIo, &Mutex<Bus>) -> T,
+) -> (T, Bus) {
     let mut master = -1;
     let mut slave = -1;
     assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(),
@@ -110,6 +118,7 @@ fn run_bus<T>(
         block[44] = 23;
         block[46] = 5;
         block[55] = 1;
+        block[62] = 79;
         (id, block)
     }).collect();
     let bus = Arc::new(Mutex::new(Bus { registers, requests: Vec::new(), missing, failed_verification }));
@@ -136,7 +145,7 @@ fn run_bus<T>(
             thread::sleep(Duration::from_millis(1));
         }
     });
-    let result = run(&mut io);
+    let result = run(&mut io, &bus);
     running.store(false, Ordering::Relaxed);
     worker.join().unwrap();
     drop(io);
@@ -177,6 +186,45 @@ fn healthy_servos_are_configured_before_the_control_stream_probe() {
     assert_eq!(sync_reads.len(), 1);
     assert_eq!((sync_reads[0][5], sync_reads[0][6]), (56, 12));
     assert_eq!(bus.requests.last().unwrap()[4], 0x82);
+}
+
+#[test]
+fn early_startup_configuration_checks_each_joint_voltage_and_torque() {
+    let (_, bus) = run_bus(Some(21), None, |io| {
+        let mut remaining = 3;
+        assert!(io.check_released_servo_at_startup(20, 8.0, &mut remaining).is_err());
+        assert!(io.check_released_servo_at_startup(21, 7.2, &mut remaining).is_err());
+        assert_eq!(remaining, 3);
+        assert!(io.check_released_servo_at_startup(22, 7.2, &mut remaining).unwrap() > 0);
+        assert_eq!(remaining, 2);
+    });
+    assert_eq!(&bus.registers[&20][21..24], &[9, 7, 2]);
+    assert_eq!(&bus.registers[&21][21..24], &[9, 7, 2]);
+    assert_corrected(&bus, 22);
+    assert!(!bus.requests.iter().any(|frame| matches!(frame[4], 0x03 | 0x83) && [40, 42].contains(&frame[5])));
+}
+
+#[test]
+fn recovered_startup_servo_is_verified_without_further_writes() {
+    let (first_recheck, bus) = run_bus_with_state(Some(10), None, |io, bus| {
+        let mut remaining = 1;
+        for _ in 0..3 {
+            assert!(io.check_released_servo_at_startup(10, 7.2, &mut remaining).is_err());
+        }
+        assert_eq!(remaining, 1);
+        bus.lock().unwrap().missing = None;
+        assert!(io.check_released_servo_at_startup(10, 7.2, &mut remaining).unwrap() > 0);
+        assert_eq!(remaining, 0);
+        let first_recheck = bus.lock().unwrap().requests.len();
+        assert_eq!(io.check_released_servo_at_startup(10, 7.2, &mut remaining).unwrap(), 0);
+
+        bus.lock().unwrap().registers.get_mut(&10).unwrap()[21] = 9;
+        let error = io.check_released_servo_at_startup(10, 7.2, &mut remaining).unwrap_err();
+        assert!(error.to_string().contains("寄存器 21"), "{error}");
+        first_recheck
+    });
+    assert_eq!(bus.registers[&10][21], 9);
+    assert!(bus.requests[first_recheck..].iter().all(|frame| frame[4] == 0x02));
 }
 
 #[test]
