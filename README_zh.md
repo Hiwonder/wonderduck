@@ -2,7 +2,7 @@
 
 [English](README.md) | 简体中文
 
-WonderDuck 提供机器人控制程序和 [WonderDuck Studio](https://gitee.com/hiwonder_official/wonderduck_studio)。本项目基于 [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck)。
+WonderDuck 提供机器人控制程序和 [WonderDuck Studio](https://gitee.com/hiwonder_official/wonderduck_studio)。
 
 ## 更新与部署
 
@@ -174,3 +174,10 @@ systemctl is-active robotd
 ## 恢复状态读取故障
 
 设备状态读取发生串口故障时，机器人会关闭运动控制，尝试恢复通信并逐个确认舵机卸力。如果故障持续，请检查舵机和 MCU 的连接及供电，再重新打开设备状态页；仍无法恢复时请联系技术支持。
+
+## 致谢
+
+- [MicroDuck](https://github.com/pollen-robotics/microduck)
+- [MjLab](https://github.com/mujocolab/mjlab)
+- [MuJoCo](https://github.com/google-deepmind/mujoco)
+- [BAM](https://github.com/Rhoban/bam)

@@ -2,7 +2,7 @@
 
 English | [简体中文](README_zh.md)
 
-WonderDuck provides robot control software and [WonderDuck Studio](https://github.com/Hiwonder/wonderduck_studio). It is based on [Pollen Robotics Microduck](https://github.com/pollen-robotics/microduck).
+WonderDuck provides robot control software and [WonderDuck Studio](https://github.com/Hiwonder/wonderduck_studio).
 
 ## Update and deployment
 
@@ -178,3 +178,10 @@ Open Studio to verify the deployment, then remove the build output in `target/na
 ## Recover from a device status read failure
 
 If a device status read encounters a serial fault, motion control is disabled while the robot attempts to restore communication and verify each servo is released. If the fault persists, check the servo and MCU connections and power, then reopen the device status page. Contact support if recovery still fails.
+
+## Acknowledgments
+
+- [MicroDuck](https://github.com/pollen-robotics/microduck)
+- [MjLab](https://github.com/mujocolab/mjlab)
+- [MuJoCo](https://github.com/google-deepmind/mujoco)
+- [BAM](https://github.com/Rhoban/bam)
