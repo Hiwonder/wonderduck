@@ -23,6 +23,7 @@ HX_SYNC_READ = 0x82
 HX_SYNC_WRITE = 0x83
 UNOQ_FEEDBACK_READ = 0x93
 UNOQ_FEEDBACK_METADATA_ID = 0xfd
+UNOQ_FEEDBACK_TIMING_ID = 0xfc
 UNOQ_FEEDBACK_IDS = bytes((20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 10, 11, 12, 13, 14, 200))
 UNOQ_FEEDBACK_LAYOUTS = {(56, 12): ("feedback", 2), (40, 28): ("feedback_extended", 3)}
 STATUS_READ = 0x92
@@ -50,9 +51,9 @@ class Router:
         self.responses = msgpack.Unpacker(raw=False, max_buffer_size=65536)
         self.ids = itertools.count(1)
 
-    def call(self, method, *args):
+    def call(self, method, *args, timed=False):
         if not self.prioritize_hx:
-            return self._exchange(method, args)
+            return self._exchange(method, args, timed)
 
         with (RPC_LOCK_DIRECTORY / "admission").open("rb") as admission, \
              (RPC_LOCK_DIRECTORY / "wire").open("rb") as wire:
@@ -72,12 +73,13 @@ class Router:
                     finally:
                         fcntl.flock(admission, fcntl.LOCK_UN)
                     time.sleep(.001)
-            return self._exchange(method, args)
+            return self._exchange(method, args, timed)
 
-    def _exchange(self, method, args):
+    def _exchange(self, method, args, timed):
         request_id = next(self.ids)
-        self.socket.sendall(msgpack.packb([0, request_id, "wonderduck/" + method, args],
-                                          use_bin_type=True))
+        request = msgpack.packb([0, request_id, "wonderduck/" + method, args], use_bin_type=True)
+        exchange_start_ns = time.monotonic_ns() if timed else None
+        self.socket.sendall(request)
         while True:
             for response in self.responses:
                 kind, returned_id, error, value = response
@@ -85,6 +87,8 @@ class Router:
                     raise OSError("unexpected Arduino Router response")
                 if error:
                     raise OSError(f"Arduino Router {method}: {error}")
+                if timed:
+                    return value, (exchange_start_ns, time.monotonic_ns())
                 return value
             chunk = self.socket.recv(4096)
             if not chunk:
@@ -218,12 +222,16 @@ def status_read_reply(router, frame):
     return reply
 
 
-def feedback_reply(sequence, age_us, reply):
+def feedback_reply(sequence, age_us, reply, exchange_times=None):
     if not isinstance(reply, bytes) or not reply or not sequence or age_us > 40_000:
         return b""
     payload = struct.pack("<II", sequence, age_us)
     body = bytes((UNOQ_FEEDBACK_METADATA_ID, len(payload) + 2, 0)) + payload
-    return b"\xff\xff" + body + bytes((~sum(body) & 0xff,)) + reply
+    metadata = b"\xff\xff" + body + bytes((~sum(body) & 0xff,))
+    if exchange_times is not None:
+        timing = bytes((UNOQ_FEEDBACK_TIMING_ID, 18, 0)) + struct.pack("<QQ", *exchange_times)
+        metadata += b"\xff\xff" + timing + bytes((~sum(timing) & 0xff,))
+    return metadata + reply
 
 
 def feedback_error_reply():
@@ -295,7 +303,7 @@ class FeedbackSession:
 
         self.active = True
         started = time.monotonic_ns()
-        result = self.router.call(method, self.sample_sequence)
+        result, exchange_times = self.router.call(method, self.sample_sequence, timed=True)
         elapsed_us = (time.monotonic_ns() - started + 999) // 1000
         if not isinstance(result, bytes) or len(result) < 8:
             return self.failure("no new sample before deadline")
@@ -303,7 +311,8 @@ class FeedbackSession:
         advance = (sequence - self.sample_sequence) & 0xffffffff
         if sequence == 0 or advance == 0 or (self.sample_sequence != 0 and advance >= 0x80000000):
             return self.failure(f"invalid sample sequence={sequence}")
-        # Add the full RPC time to bound the age at the local serial reply.
+        # Bound the age before forwarding to the PTY. The RPC timestamps let
+        # robotd account for when the MCU calculated its age within the exchange.
         age_us = mcu_age_us + elapsed_us
         data = result[8:]
         if not valid_feedback_frames(data, payload_length):
@@ -311,12 +320,12 @@ class FeedbackSession:
         if age_us > 40_000:
             return self.failure(f"stale sample sequence={sequence} age_us={age_us}")
         self.sample_sequence = sequence
-        return self.reply(age_us, data, advance)
+        return self.reply(mcu_age_us, data, advance, exchange_times)
 
-    def reply(self, age_us, data, advance=1):
+    def reply(self, age_us, data, advance=1, exchange_times=None):
         # Preserve gaps in MCU sample numbers across synchronous fallback reads.
         self.sequence = (self.sequence + advance) & 0xffffffff or 1
-        return feedback_reply(self.sequence, age_us, data)
+        return feedback_reply(self.sequence, age_us, data, exchange_times)
 
 
 def serve_bus(router, port, owner=None):

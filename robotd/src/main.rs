@@ -23,6 +23,8 @@ mod control;
 mod emergency_relax;
 mod coordinated_mouth;
 mod coordinated_tracking;
+#[cfg(target_os = "linux")]
+mod device_version;
 mod gamepad_process;
 mod head_tracking;
 mod human_control;
@@ -80,7 +82,7 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use clap::{Parser, Subcommand};
 use duck_control::fall::{FallPredictor, FallPredictorConfig};
 use duck_control::hx::ImuSource;
-use duck_control::io::RobotIo;
+use duck_control::io::{AccessoryMotionInput, RobotIo};
 use duck_control::obs::{BodyPose, Command as PolicyCommand};
 use duck_control::policy::{DEFAULT_STANDING_THRESHOLD, Policy, PolicyError, PolicyPaths, PrecisionPolicy};
 use duck_control::safety::{Safety, SafetyConfig};
@@ -1040,7 +1042,8 @@ struct RobotState {
     /// Control-loop bus reads that exhausted the receive timeout, cumulative.
     bus_read_timeouts: AtomicU64,
     /// The HX transport reports receive timeouts as a distinct error type.
-    bus_timeout_supported: bool,
+    has_hx_bus: bool,
+    wing_flap_enabled: AtomicBool,
     /// Failed attempts to bring the bus up — opening it, verifying its registers, or
     /// reading the startup pose. Non-zero means the loop is still waiting for a robot to
     /// answer and has never commanded anything.
@@ -1255,7 +1258,8 @@ impl RobotState {
             achieved_hz: AtomicU64::new(0),
             consecutive_errors: AtomicU32::new(0),
             bus_read_timeouts: AtomicU64::new(0),
-            bus_timeout_supported: params.bus.protocol == BusProtocol::Hx,
+            has_hx_bus: params.bus.protocol == BusProtocol::Hx,
+            wing_flap_enabled: AtomicBool::new(false),
             startup_bus_failures: AtomicU32::new(0),
             startup_servo_configuration_failures: ArcSwapOption::empty(),
             battery_v: AtomicU64::new(0),
@@ -1340,6 +1344,18 @@ impl RobotState {
         let describe =
             |healthy: bool, degraded: bool, reason: Option<String>| proto::HealthResult {
                 healthy,
+                wing_flap_enabled: self.wing_flap_enabled.load(Ordering::Acquire),
+                action_position_limits: if self.has_hx_bus {
+                    duck_control::model::JOINT_IDS.iter().copied().enumerate()
+                        .filter_map(|(joint, id)| duck_control::hx::joint_position_bounds(joint).ok()
+                            .map(|bounds| (id, bounds)))
+                        .chain(duck_control::model::ACCESSORY_SERVO_IDS.into_iter().zip(
+                            duck_control::model::ACCESSORY_SERVO_LIMITS.map(|(min, max)| [min, max]),
+                        ))
+                        .collect()
+                } else {
+                    Default::default()
+                },
                 imu_firmware_version: self.imu_firmware_version.load_full().map(|version| (*version).clone()),
                 degraded,
                 reason,
@@ -1355,7 +1371,7 @@ impl RobotState {
                 control_loop: Some(self.loop_health()),
                 bus: proto::BusHealth {
                     consecutive_errors: self.consecutive_errors.load(Ordering::Relaxed),
-                    read_timeouts: self.bus_timeout_supported
+                    read_timeouts: self.has_hx_bus
                         .then(|| self.bus_read_timeouts.load(Ordering::Relaxed)),
                     startup_failures: self.startup_bus_failures.load(Ordering::Relaxed),
                 },
@@ -1769,6 +1785,11 @@ async fn main() -> ExitCode {
 
     let requires_voltage_recovery = physical_status_bus && low_voltage_lock.requires_rearm();
     let mut state = RobotState::new(&params, &params_path, Arc::clone(&intents));
+    #[cfg(target_os = "linux")]
+    if physical_status_bus {
+        state.wing_flap_enabled.store(
+            device_version::supports_wing_flap(Path::new(device_version::PATH)), Ordering::Release);
+    }
     state.obstacle = Arc::new(obstacle::Shared::new(tof_enabled));
     state.status_bus_fault.store(status_fault_at_startup, Ordering::Release);
     state.low_voltage_lock = low_voltage_lock;
@@ -2409,6 +2430,17 @@ fn configure_startup_servos(bus: &params::Bus, state: &RobotState, imu_source: I
                 // even if motion startup will wait for a low-voltage rearm.
                 if pending.is_empty() || attempt == ATTEMPTS {
                     refresh_imu_firmware_version(&mut io, state, true);
+                    if let Some(id) = io.detect_startup_accessory_servo() {
+                        match device_version::record_wing_hardware(Path::new(device_version::PATH)) {
+                            Ok(true) => tracing::info!(id, "detected wing servo; recorded hardware version 1.1.0"),
+                            Ok(false) => tracing::info!(id, "detected wing servo; hardware version already current"),
+                            Err(error) => tracing::warn!(id, %error, "cannot record wing hardware version"),
+                        }
+                    } else {
+                        tracing::info!("no wing servo ID confirmed at startup");
+                    }
+                    state.wing_flap_enabled.store(
+                        device_version::supports_wing_flap(Path::new(device_version::PATH)), Ordering::Release);
                 }
             }
             Ok(BusIo::Dynamixel(_)) => unreachable!("startup configuration requires HX"),
@@ -2980,10 +3012,15 @@ impl RobotIo for BusIo {
         }
     }
 
-    fn write_timed_positions(&mut self, positions: &[Option<f64>; NUM_JOINTS], duration_ms: u16) -> duck_control::io::Result<bool> {
+    fn write_timed_positions(
+        &mut self,
+        positions: &[Option<f64>; NUM_JOINTS],
+        accessories: &duck_control::io::AccessoryPositions,
+        duration_ms: u16,
+    ) -> duck_control::io::Result<bool> {
         match self {
-            Self::Dynamixel(io) => io.write_timed_positions(positions, duration_ms),
-            Self::Hx(io) => io.write_timed_positions(positions, duration_ms),
+            Self::Dynamixel(io) => io.write_timed_positions(positions, accessories, duration_ms),
+            Self::Hx(io) => io.write_timed_positions(positions, accessories, duration_ms),
         }
     }
 
@@ -3030,9 +3067,9 @@ impl RobotIo for BusIo {
         }
     }
 
-    fn write_accessory_trigger(&mut self, pressure: u8) -> duck_control::io::Result<()> {
+    fn write_accessory_motion(&mut self, input: AccessoryMotionInput) -> duck_control::io::Result<()> {
         match self {
-            Self::Hx(io) => io.write_accessory_trigger(pressure),
+            Self::Hx(io) => io.write_accessory_motion(input),
             Self::Dynamixel(_) => Ok(()),
         }
     }
@@ -4509,7 +4546,7 @@ async fn finish_startup_exit<T: RobotIo>(safety: &mut Safety<T>, state: &RobotSt
         tracing::error!("shutdown bus write skipped: motor status or torque release is unconfirmed");
     } else if state.release_torque_on_exit.load(Ordering::Acquire) {
         let released = finish_exit(safety, false, state.exit_head_timing).await.is_ok();
-        state.exit_release_verified.store(released && state.bus_timeout_supported, Ordering::Release);
+        state.exit_release_verified.store(released && state.has_hx_bus, Ordering::Release);
     }
     if state.exit_sit.load(Ordering::Acquire) != 0 {
         state.exit_sit.store(EXIT_SIT_DONE, Ordering::Release);
@@ -5384,6 +5421,7 @@ async fn control_loop<T: RobotIo>(
     // the host estimator's continuous stream here; runtime gap checks stay strict.
     safety.restart_imu_stream();
     let mut shutdown_after_maintenance = false;
+    let continuous_recording = recorder.as_ref().is_some_and(record::RecordSender::continuous);
     while !state.shutdown.load(Ordering::Acquire) {
         ticker.tick().await;
         let tick_start = Instant::now();
@@ -5394,8 +5432,10 @@ async fn control_loop<T: RobotIo>(
                 || intents.rest_phase() == proto::RestPhase::Resting
                 || shutdown_sit.is_some() || shutdown_rest.is_some()
                 || matches!(state.exit_sit.load(Ordering::Acquire), EXIT_SIT_REQUESTED | EXIT_SIT_RUNNING);
-            floor.update(active && !powered_off && !maintenance_parked && !status_session_open
-                && !state.status_bus_fault.load(Ordering::Acquire), tick_start);
+            let feedback_expected = !powered_off && !maintenance_parked && !status_session_open
+                && !state.status_bus_fault.load(Ordering::Acquire);
+            floor.update(active && feedback_expected,
+                (active || continuous_recording) && feedback_expected, tick_start);
         }
         read_timing.begin_tick(tick_start);
 
@@ -5969,7 +6009,11 @@ async fn control_loop<T: RobotIo>(
                     .get_or_insert_with(|| ReadRun::new(Instant::now(), Arc::clone(&error)))
                     .failed(Arc::clone(&error));
 
-                tracing::warn!(error = error.as_ref() as &(dyn std::error::Error + 'static), consecutive = n,
+                let missing_ids = match error.as_ref() {
+                    duck_control::IoError::ReadFailure(failure) => Some(tracing::field::debug(&failure.missing_ids)),
+                    _ => None,
+                };
+                tracing::warn!(error = error.as_ref() as &(dyn std::error::Error + 'static), consecutive = n, missing_ids,
                     read_ms = read_elapsed.as_secs_f64() * 1000.0, "bus read failed");
                 None
             }
@@ -6535,30 +6579,47 @@ async fn control_loop<T: RobotIo>(
         // Before the enable-driven bring-up below, so a `relax` that arrives in the same tick as a
         // still-set `enabled` flag wins — `request_relax` clears that flag, and reading the request
         // first means the order cannot invert.
-        let power_request = intents.take_power_request().filter(|_| state.exit_sit.load(Ordering::Acquire) == 0);
+        use intents::PowerRequest;
+        let mut power_guard = intents.has_power_request().then(|| state.human_control.lock());
+        let power_request = power_guard.as_ref().and_then(|_| intents.take_power_request())
+            .filter(|_| state.exit_sit.load(Ordering::Acquire) == 0);
         let mut torque_only_initialized = false;
         match power_request {
             // The power-off has been asked for and torque is off. Standing the robot up now would
             // hand the poweroff a robot mid-ramp, stiff, which is the outcome the sit exists to
             // avoid.
-            Some(intents::PowerRequest::Init) if powered_off => {
+            Some(PowerRequest::Init | PowerRequest::GamepadSelect) if powered_off => {
                 tracing::warn!("robot.init ignored: the robot is powering off")
             }
-            Some(intents::PowerRequest::Init)
+            Some(PowerRequest::Init | PowerRequest::GamepadSelect)
                 if params.bus.protocol == BusProtocol::Hx && controller.is_none() =>
             {
                 tracing::error!("robot.init refused: no validated policy joint HOME");
             }
-            Some(intents::PowerRequest::Init) => {
-                let guard = state.human_control.lock();
+            Some(request @ (PowerRequest::Init | PowerRequest::GamepadSelect)) => {
+                let guard = power_guard.as_ref().expect("power request taken under control lock");
+                let from_select = request == PowerRequest::GamepadSelect;
                 if guard.emergency_release_active() {
                     tracing::warn!("robot.init ignored: torque release is in progress");
+                } else if from_select && (intents.enabled() || intents.rest_phase() == proto::RestPhase::Resting
+                    || shutdown_sit.is_some() || shutdown_rest.is_some()) {
+                    tracing::debug!("Select ignored: policy enabled or rest in progress");
                 } else {
-                    maintenance_holding = false;
+                    if !from_select {
+                        maintenance_holding = false;
+                    }
                     match (bringup, sensors.as_ref()) {
+                        (Bringup::Ready, _) if from_select => {
+                            intents.set_enabled(true);
+                            intents.resume_after_rest();
+                            tracing::info!("Select: policy enabled");
+                        }
+                        (Bringup::Homing { .. }, _) if from_select => {
+                            tracing::debug!("Select ignored: HOME ramp in progress");
+                        }
                         // A bench robot can be initialized without a walking policy.
                         (Bringup::Limp, Some(sensors)) => match (|| {
-                            if state.init_torque_only {
+                            if state.init_torque_only || from_select {
                                 let current = fresh.as_ref().ok_or_else(|| duck_control::io::IoError::Bus(
                                     "current-pose initialization requires fresh joint readings".into()))?;
                                 safety.prepare_torque_only(&current.positions)?;
@@ -6566,7 +6627,11 @@ async fn control_loop<T: RobotIo>(
                             safety.set_torque(true)
                         })() {
                             Ok(()) => {
-                                if state.init_torque_only {
+                                if from_select {
+                                    maintenance_holding = false;
+                                    intents.resume_after_rest();
+                                }
+                                if state.init_torque_only && !from_select {
                                     hold = sensors.positions;
                                     bringup = Bringup::Ready;
                                     torque_only_initialized = true;
@@ -6606,7 +6671,8 @@ async fn control_loop<T: RobotIo>(
                     }
                 }
             }
-            Some(intents::PowerRequest::Relax) => {
+            Some(PowerRequest::Relax) => {
+                drop(power_guard.take());
                 intents.cancel_pending_rest();
                 if !shutdown_power_off {
                     intents.finish_rest(false);
@@ -6633,6 +6699,7 @@ async fn control_loop<T: RobotIo>(
             }
             None => {}
         }
+        drop(power_guard);
 
         // `robot.rebootMotors`: torque off everywhere, then REBOOT the named servos (every servo
         // when none are named). The rebooted servos are off the bus for a few hundred milliseconds
@@ -8852,10 +8919,12 @@ async fn control_loop<T: RobotIo>(
                 .apply_position_p_gain(&mut safety, fall_position_gains)
                 .and_then(|()| {
                     if let Some(RestMotion::Action { playback, .. }) = shutdown_rest.as_mut() {
-                        let Some((positions, duration_ms)) = playback.pending_frame() else {
+                        let Some(frame) = playback.pending_frame() else {
                             return Ok(duck_control::safety::Applied::default());
                         };
-                        let applied = safety.apply_timed_frame(positions, duration_ms, targets, hold, gain)?;
+                        let applied = safety.apply_timed_frame(
+                            &frame.targets, &frame.accessories, frame.duration_ms, targets, hold, gain,
+                        )?;
                         if !applied.limited_by(duck_control::safety::Limit::NotFinite) {
                             playback.confirm_sent(Instant::now());
                         }
@@ -8884,15 +8953,22 @@ async fn control_loop<T: RobotIo>(
         if let Err(error) = safety.write_limp_mouth(limp_jaw) {
             tracing::warn!(%error, "isolated jaw write failed");
         }
-        // A due R2 reversal is a single write behind the main motor command.
+        // A due wing reversal is a single write behind the main motor command.
         // Skipping it when a tick has little spare time leaves a pause at the endpoint.
-        if wrote_targets && write_ok && gamepad_ready && !stop_changed && fresh.is_some()
+        if wrote_targets && write_ok && fresh.is_some() && !safety.fallen() && !in_limp_fall
             && !status_page_active && !write_guard.maintenance_transition_blocked()
-            && shutdown_rest.is_none() && !state.stopping.load(Ordering::Acquire)
+            && shutdown_sit.is_none() && shutdown_rest.is_none() && !powered_off
+            && !state.stopping.load(Ordering::Acquire)
             && state.exit_sit.load(Ordering::Acquire) == 0
-            && let Err(error) = safety.write_accessory_trigger(intents.accessory_trigger())
         {
-            tracing::warn!(%error, "accessory servo write failed");
+            let input = if gamepad_ready && !stop_changed {
+                intents.accessory_motion()
+            } else {
+                AccessoryMotionInput::Trigger(0)
+            };
+            if let Err(error) = safety.write_accessory_motion(input) {
+                tracing::warn!(%error, "accessory servo write failed");
+            }
         }
         drop(write_guard);
         if person_follow && coordinated_eligible && !unsafe_motion && !tracking_stopped
@@ -9288,7 +9364,7 @@ async fn control_loop<T: RobotIo>(
             && !safety.fallen() && safety.imu_ready()
             && state.consecutive_errors.load(Ordering::Relaxed) == 0;
         let released = finish_exit(&mut safety, safe_to_position, state.exit_head_timing).await.is_ok();
-        state.exit_release_verified.store(released && state.bus_timeout_supported, Ordering::Release);
+        state.exit_release_verified.store(released && state.has_hx_bus, Ordering::Release);
     }
     if !shutdown_after_maintenance && !state.low_voltage_lock.requires_rearm() {
         if let Err(error) = LimpFall::Idle.apply_position_p_gain(&mut safety, fall_position_gains) {
@@ -9926,9 +10002,9 @@ fn is_motion_intent(call: &proto::Call) -> bool {
     matches!(call,
         proto::Call::RobotMove(_) | proto::Call::RobotPrecisionMove(_) | proto::Call::RobotSetObstacle(_)
         | proto::Call::RobotHead(_) | proto::Call::RobotHeadTracking(_) | proto::Call::RobotMotionTracking(_) | proto::Call::RobotCoordinatedTracking(_) | proto::Call::RobotMaze(_) | proto::Call::RobotLook(_) | proto::Call::RobotStop
-        | proto::Call::RobotEnable(_) | proto::Call::RobotInit | proto::Call::RobotRelax
+        | proto::Call::RobotEnable(_) | proto::Call::RobotInit | proto::Call::RobotGamepadSelect | proto::Call::RobotRelax
         | proto::Call::RobotRebootMotors(_) | proto::Call::RobotRest | proto::Call::RobotDo(_)
-        | proto::Call::RobotPose(_) | proto::Call::RobotMouth(_) | proto::Call::RobotAccessoryTrigger(_)
+        | proto::Call::RobotPose(_) | proto::Call::RobotMouth(_) | proto::Call::RobotAccessoryTrigger(_) | proto::Call::RobotWingFlap(_)
         | proto::Call::RobotSound(_)
         | proto::Call::RobotSoundClip(_)
         | proto::Call::RobotTheremin(_) | proto::Call::RobotChorale(_)
@@ -9941,7 +10017,7 @@ fn is_motion_intent(call: &proto::Call) -> bool {
 fn is_manual_movement(call: &proto::Call) -> bool {
     matches!(call,
         proto::Call::RobotMove(_) | proto::Call::RobotHead(_) | proto::Call::RobotLook(_)
-        | proto::Call::RobotPose(_) | proto::Call::RobotDo(_) | proto::Call::RobotSetMode(_)
+        | proto::Call::RobotPose(_) | proto::Call::RobotDo(_) | proto::Call::RobotSetMode(_) | proto::Call::RobotWingFlap(_)
         | proto::Call::RobotPrecisionMove(proto::PrecisionMoveParams::Start { .. }))
 }
 
@@ -10786,15 +10862,31 @@ async fn handle_session(
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::refused("manual movement is disabled on the active page")))
                 } else if !allowed {
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::refused("another control source owns the robot")))
+                } else if matches!(call, proto::Call::RobotGamepadSelect)
+                    && (access != human_control::Access::Owner || session.source() != Some(proto::HumanControlSource::Gamepad))
+                {
+                    request.id.clone().map(|id| proto::Response::ok(Some(id), &proto::IntentResult::refused("Select requires gamepad control")))
                 } else if let proto::Call::RobotAccessoryTrigger(params) = call {
                     let result = if access == human_control::Access::Owner
                         && session.source() == Some(proto::HumanControlSource::Gamepad)
                         && params.pressure <= 100
                     {
-                        intents.set_accessory_trigger(params.pressure);
+                        intents.set_accessory_motion(AccessoryMotionInput::Trigger(params.pressure));
                         proto::IntentResult::accepted()
                     } else {
                         proto::IntentResult::refused("accessory trigger requires gamepad control and a pressure of 0–100")
+                    };
+                    request.id.clone().map(|id| proto::Response::ok(Some(id), &result))
+                } else if let proto::Call::RobotWingFlap(params) = call {
+                    let result = if !state.wing_flap_enabled.load(Ordering::Acquire) {
+                        proto::IntentResult::refused("wing flapping requires supported hardware version 1.1.0")
+                    } else if access == human_control::Access::Owner
+                        && session.source() == Some(proto::HumanControlSource::Web)
+                    {
+                        intents.set_accessory_motion(AccessoryMotionInput::WingFlap(*params));
+                        proto::IntentResult::accepted()
+                    } else {
+                        proto::IntentResult::refused("wing flapping requires browser control")
                     };
                     request.id.clone().map(|id| proto::Response::ok(Some(id), &result))
                 } else {
@@ -11839,6 +11931,9 @@ fn dispatch(
         proto::Call::RobotAccessoryTrigger(_) => proto::Response::ok(
             Some(id), &proto::IntentResult::refused("accessory trigger requires gamepad control"),
         ),
+        proto::Call::RobotWingFlap(_) => proto::Response::ok(
+            Some(id), &proto::IntentResult::refused("wing flapping requires browser control"),
+        ),
 
         // Gaze as a point: the IK runs here, against the same MJCF the policies train on,
         // and the answer is the joints the head was sent to — so a client can hold the gaze
@@ -12144,11 +12239,27 @@ fn dispatch(
         // A refusal here is a normal answer with a reason, not an error: the client asked
         // something reasonable and the daemon declined. Gravity is never one of those
         // reasons — see below.
-        proto::Call::RobotEnable(p) => {
-            // `toggle` flips the robot's own state — the pad's Start. Evaluated here, not
-            // in the client, because a client-side belief drifts (relax, shutdown, either
-            // side restarting) and a stale one turns Start into a no-op every other press.
-            let on = if p.toggle { !intents.enabled() } else { p.on };
+        proto::Call::RobotEnable(_) | proto::Call::RobotGamepadSelect => {
+            // `toggle` flips the daemon's current state, including any change from
+            // another client, relax or shutdown.
+            let on = match call {
+                proto::Call::RobotEnable(p) if p.toggle => !intents.enabled(),
+                proto::Call::RobotEnable(p) => p.on,
+                proto::Call::RobotGamepadSelect if intents.enabled() => false,
+                proto::Call::RobotGamepadSelect => {
+                    let result = if intents.rest_phase() == proto::RestPhase::Resting {
+                        proto::IntentResult::refused("rest is still in progress")
+                    } else if let Some(failures) = state.startup_servo_configuration_failures.load_full() {
+                        proto::IntentResult::refused(format!("舵机启动参数未确认：{}", startup_servo_failure_detail(&failures)))
+                    } else if intents.request_gamepad_select() {
+                        proto::IntentResult::accepted()
+                    } else {
+                        proto::IntentResult::refused("a power request is already pending")
+                    };
+                    return proto::Response::ok(Some(id), &result);
+                }
+                _ => unreachable!(),
+            };
             // Never refused for being down. Start on a robot lying on the floor is exactly
             // how someone asks it to stand back up, and it brings the robot up and hands it
             // to the standing policy like any other enable.

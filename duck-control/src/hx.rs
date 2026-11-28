@@ -36,10 +36,14 @@ pub use calibration_recovery::CalibrationRestoreAttempts;
 
 
 use crate::io::{
-    ImuStale, IoError, JointTargets, ReadFeedback, Result, RobotIo, Sensors, SentGoals,
+    AccessoryMotionInput, AccessoryPositions, ImuStale, IoError, JointTargets, ReadFeedback, Result, RobotIo, Sensors, SentGoals,
     ServoFeedback, SlowSensors,
 };
-use crate::model::{BAUD_RATE, DEFAULT_POSITION, IMU_DXL_ID, JOINT_IDS, MOUTH_INDEX, NUM_JOINTS};
+use duck_ipc_proto::WingFlapParams;
+use crate::model::{
+    ACCESSORY_SERVO_IDS, ACCESSORY_SERVO_LIMITS, BAUD_RATE, DEFAULT_POSITION, IMU_DXL_ID, JOINT_IDS,
+    JOINT_LIMITS, MOUTH_INDEX, NUM_JOINTS,
+};
 use crate::read_diagnostic::{ReadFailure, ReadFailureReason};
 
 const BROADCAST_ID: u8 = 0xfe;
@@ -50,6 +54,8 @@ const SYNC_WRITE: u8 = 0x83;
 // Local UNO Q PTY instruction; the bridge translates it to STM32 cached feedback.
 const UNOQ_FEEDBACK_READ: u8 = 0x93;
 const UNOQ_FEEDBACK_METADATA_ID: u8 = 0xfd;
+const UNOQ_FEEDBACK_TIMING_ID: u8 = 0xfc;
+const UNOQ_FEEDBACK_TIMING_LENGTH: usize = 16;
 const UNOQ_FEEDBACK_MAX_AGE_US: u32 = 40_000;
 const UNOQ_FEEDBACK_MAX_AGE_NS: u64 = 50_000_000;
 
@@ -57,12 +63,23 @@ const UNOQ_FEEDBACK_MAX_AGE_NS: u64 = 50_000_000;
 const PRESENT_POSITION: u8 = 56;
 const PRESENT_POSITION_LEN: u8 = 12;
 const GOAL_POSITION: u8 = 42;
-const ACCESSORY_SERVO_IDS: [u8; 2] = [35, 36];
 const TORQUE_ENABLE: u8 = 40;
 const VOLTAGE_OFFSET: usize = 62 - PRESENT_POSITION as usize;
 const TEMPERATURE_OFFSET: usize = 63 - PRESENT_POSITION as usize;
 const RECORD_FEEDBACK_ADDRESS: u8 = TORQUE_ENABLE;
 const RECORD_FEEDBACK_LENGTH: u8 = PRESENT_POSITION + PRESENT_POSITION_LEN - RECORD_FEEDBACK_ADDRESS;
+const UNOQ_FEEDBACK_MAX_REPLY_BYTES: usize =
+    (8 + 6) + (UNOQ_FEEDBACK_TIMING_LENGTH + 6)
+        + (NUM_JOINTS + 1) * (RECORD_FEEDBACK_LENGTH as usize + 6);
+
+fn decode_unoq_feedback_exchange(frame: &StatusFrame) -> Option<[u64; 2]> {
+    if frame.error != 0 || frame.data.len() != UNOQ_FEEDBACK_TIMING_LENGTH {
+        return None;
+    }
+    let start_ns = u64::from_le_bytes(frame.data[..8].try_into().unwrap());
+    let end_ns = u64::from_le_bytes(frame.data[8..].try_into().unwrap());
+    (start_ns <= end_ns).then_some([start_ns, end_ns])
+}
 
 enum ServoRelease {
     NoReply,
@@ -227,6 +244,7 @@ pub struct HxIo {
     unoq_feedback_sequence: Option<u32>,
     unoq_feedback_request_ns: u64,
     unoq_feedback_started_ns: Option<u64>,
+    unoq_feedback_scan_start_ns: Option<[u64; 2]>,
     last_sent_goals: Option<SentGoals>,
     servo_diagnostics_ids: Vec<u8>,
 }
@@ -259,6 +277,7 @@ impl HxIo {
             unoq_feedback_sequence: None,
             unoq_feedback_request_ns: 0,
             unoq_feedback_started_ns: None,
+            unoq_feedback_scan_start_ns: None,
             last_sent_goals: None,
             servo_diagnostics_ids: Vec::new(),
         })
@@ -811,6 +830,7 @@ impl HxIo {
         deadline: Instant,
     ) -> Result<Vec<StatusFrame>> {
         self.unoq_feedback_started_ns = None;
+        self.unoq_feedback_scan_start_ns = None;
         if self.unoq_feedback && !self.read_only && tx.len() == 24 &&
             matches!(&tx[4..7], [SYNC_READ, PRESENT_POSITION, PRESENT_POSITION_LEN]
                 | [SYNC_READ, RECORD_FEEDBACK_ADDRESS, RECORD_FEEDBACK_LENGTH]) &&
@@ -865,7 +885,10 @@ impl HxIo {
             && expected == self.control_ids();
         let mut parser = Frames::default();
         let mut found: Vec<StatusFrame> = Vec::with_capacity(expected.len());
-        let mut buffer = [0u8; 256];
+        let mut cached_age_ns = None;
+        // The UNO Q bridge writes the full snapshot to the PTY at once. Leave
+        // room for the metadata and every joint/IMU frame in one read.
+        let mut buffer = [0u8; UNOQ_FEEDBACK_MAX_REPLY_BYTES];
         let mut cycle_overdue_logged = false;
         while Instant::now() < deadline {
             if let Some(cycle_end) = cycle_deadline
@@ -923,8 +946,21 @@ impl HxIo {
                             "stale UNO Q feedback".into()), tx, &parser, &found, started.elapsed()));
                     }
                     self.unoq_feedback_sequence = Some(sequence);
+                    let age_ns = u64::from(age_us) * 1000;
+                    cached_age_ns = Some(age_ns);
                     self.unoq_feedback_started_ns = Some(
-                        self.unoq_feedback_request_ns.saturating_sub(u64::from(age_us) * 1000));
+                        self.unoq_feedback_request_ns.saturating_sub(age_ns));
+                    continue;
+                }
+                if cached && frame.id == UNOQ_FEEDBACK_TIMING_ID {
+                    if let Some(age_ns) = cached_age_ns
+                        && let Some([start_ns, end_ns]) = decode_unoq_feedback_exchange(&frame)
+                        && self.unoq_feedback_request_ns <= start_ns
+                        && end_ns <= duck_ipc_proto::clock::monotonic_ns()
+                    {
+                        self.unoq_feedback_scan_start_ns =
+                            Some([start_ns, end_ns].map(|timestamp| timestamp.saturating_sub(age_ns)));
+                    }
                     continue;
                 }
                 if self.read_only {
@@ -1203,6 +1239,23 @@ pub fn encode_position(index: usize, radians: f64) -> Result<u16> {
     Ok(raw.clamp(f64::from(POSITION_MIN), f64::from(POSITION_MAX)) as u16)
 }
 
+/// Inclusive HX encoder counts inside this model joint's control limits.
+pub fn joint_position_bounds(index: usize) -> Result<[u16; 2]> {
+    let &(lower, upper) = JOINT_LIMITS
+        .get(index)
+        .ok_or_else(|| IoError::Bus(format!("invalid HX joint index {index}")))?;
+    let mut counts = [encode_position(index, lower)?, encode_position(index, upper)?];
+    counts.sort_unstable();
+    let range = lower..=upper;
+    if !range.contains(&decode_position(index, &counts[0].to_le_bytes())?) {
+        counts[0] += 1;
+    }
+    if !range.contains(&decode_position(index, &counts[1].to_le_bytes())?) {
+        counts[1] -= 1;
+    }
+    Ok(counts)
+}
+
 fn decode_record_feedback(feedback: &mut ServoFeedback, joint: usize, block: &[u8]) -> Result<()> {
     if block.len() != usize::from(RECORD_FEEDBACK_LENGTH) {
         return Err(IoError::ShortRead {
@@ -1410,20 +1463,36 @@ impl RobotIo for HxIo {
         Ok(())
     }
 
-    fn write_timed_positions(&mut self, positions: &[Option<f64>; NUM_JOINTS], duration_ms: u16) -> Result<bool> {
+    fn write_timed_positions(
+        &mut self,
+        positions: &[Option<f64>; NUM_JOINTS],
+        accessories: &AccessoryPositions,
+        duration_ms: u16,
+    ) -> Result<bool> {
         if self.recovery_imu_pending || self.torque_enabled != Some(true) {
             return Err(IoError::Bus("cannot play a timed HX frame without confirmed torque and bus readiness".into()));
+        }
+        if accessories.iter().zip(ACCESSORY_SERVO_LIMITS).any(
+            |(position, (lower, upper))| position.is_some_and(|raw| !(lower..=upper).contains(&raw)),
+        ) {
+            return Err(IoError::Bus("invalid timed wing position".into()));
         }
         let mut ids = Vec::new();
         let mut data = Vec::new();
         let duration = duration_ms.to_le_bytes();
+        let has_accessories = accessories.iter().any(Option::is_some);
+        let (address, width) = if has_accessories { (TORQUE_ENABLE, 8) } else { (ACCELERATION, 7) };
+        let encode_goal = |raw: u16| {
+            let goal = raw.to_le_bytes();
+            let frame = [1, 0, goal[0], goal[1], duration[0], duration[1], 0, 0];
+            frame[usize::from(!has_accessories)..].to_vec()
+        };
         let mut counts = self.last_sent_goals.map(|goals| goals.position_counts);
         for (index, position) in positions.iter().enumerate() {
             let Some(position) = position else { continue };
             let raw = encode_position(index, *position)?;
-            let goal = raw.to_le_bytes();
             ids.push(JOINT_IDS[index]);
-            data.push(vec![0, goal[0], goal[1], duration[0], duration[1], 0, 0]);
+            data.push(encode_goal(raw));
             if let Some(counts) = counts.as_mut() {
                 counts[index] = raw;
             }
@@ -1431,7 +1500,17 @@ impl RobotIo for HxIo {
         if !ids.is_empty() {
             // Restore ordinary untimed motion with the next control-loop target.
             self.motion_restore_pending = true;
-            self.sync_write_ids(ACCELERATION, 7, &ids, &data)?;
+        }
+        for (id, position) in ACCESSORY_SERVO_IDS.into_iter().zip(accessories) {
+            if let Some(raw) = position {
+                ids.push(id);
+                data.push(encode_goal(*raw));
+            }
+        }
+        if !ids.is_empty() {
+            // A broadcast does not wait for replies from optional wings.
+            self.accessory_torque |= has_accessories;
+            self.sync_write_ids(address, width, &ids, &data)?;
             if self.record_feedback {
                 self.last_sent_goals = counts.map(|position_counts| SentGoals {
                     position_counts,
@@ -1494,12 +1573,17 @@ impl RobotIo for HxIo {
         result
     }
 
-    fn write_accessory_trigger(&mut self, pressure: u8) -> Result<()> {
+    fn write_accessory_motion(&mut self, input: AccessoryMotionInput) -> Result<()> {
         if self.torque_enabled != Some(true) || self.recovery_imu_pending {
             return Ok(());
         }
         let mut next_motion = self.accessory_motion;
-        if let Some((positions, duration_ms)) = next_motion.update(pressure, Instant::now()) {
+        let now = Instant::now();
+        let target = match input {
+            AccessoryMotionInput::Trigger(pressure) => next_motion.update(pressure, now),
+            AccessoryMotionInput::WingFlap(params) => next_motion.flap(params, now),
+        };
+        if let Some((positions, duration_ms)) = target {
             let duration = duration_ms.to_le_bytes();
             let data = positions.map(|position| {
                 let goal = position.to_le_bytes();
@@ -1552,17 +1636,48 @@ struct AccessoryMotion {
     opening: bool,
     repeating: bool,
     next_toggle: Option<Instant>,
+    flap_duration_ms: Option<u16>,
 }
 
 impl AccessoryMotion {
+    fn close(&mut self) -> Option<([u16; 2], u16)> {
+        let previous = std::mem::take(self);
+        previous.opening.then(|| {
+            previous.flap_duration_ms
+                .map_or_else(|| accessory_trigger_target(0, previous.pressure),
+                    |duration| ([2048; 2], duration))
+        })
+    }
+
+    fn flap(&mut self, params: WingFlapParams, now: Instant) -> Option<([u16; 2], u16)> {
+        let Some(duration) = params.travel_time_ms() else {
+            return self.close();
+        };
+        if self.flap_duration_ms.is_none() {
+            *self = Self::default();
+            self.opening = true;
+        } else {
+            if self.next_toggle.is_some_and(|deadline| now < deadline) {
+                return None;
+            }
+            self.opening = !self.opening;
+        }
+        self.flap_duration_ms = Some(duration);
+        self.next_toggle = Some(now + Duration::from_millis(u64::from(duration)));
+        let positions = if self.opening { accessory_trigger_target(100, 0).0 } else { [2048; 2] };
+        Some((positions, duration))
+    }
+
     fn update(&mut self, pressure: u8, now: Instant) -> Option<([u16; 2], u16)> {
         const HOLD_TO_REPEAT: Duration = Duration::from_secs(1);
         const PRESSURE_TOLERANCE: u8 = 2;
 
         let pressure = pressure.min(100);
         if pressure == 0 {
-            let previous = std::mem::take(self);
-            return previous.opening.then(|| accessory_trigger_target(0, previous.pressure));
+            return self.close();
+        }
+        if self.flap_duration_ms.is_some() {
+            *self = Self::default();
         }
         if !self.repeating && (self.pressure == 0 || self.pressure.abs_diff(pressure) > PRESSURE_TOLERANCE) {
             self.pressure = pressure;
@@ -1592,6 +1707,27 @@ fn accessory_trigger_target(pressure: u8, previous_pressure: u8) -> ([u16; 2], u
     let travel = ((1365 * pressure + 50) / 100) as u16;
     let duration = 800 - ((650 * timing_pressure + 50) / 100) as u16;
     ([2048 - travel, 2048 + travel], duration)
+}
+
+#[cfg(test)]
+#[test]
+fn wing_flap_switches_speed_at_the_next_endpoint_and_stops_at_center() {
+    use duck_ipc_proto::WingFlapMode::{Fast, Off, Slow};
+
+    let mut motion = AccessoryMotion::default();
+    let start = Instant::now();
+    let at = |ms| start + Duration::from_millis(ms);
+    let preset = |mode| WingFlapParams { mode, duration_ms: None };
+    let custom = WingFlapParams { mode: Fast, duration_ms: Some(240) };
+    assert_eq!(motion.flap(preset(Slow), at(0)), Some(([683, 3413], 300)));
+    assert_eq!(motion.flap(preset(Fast), at(299)), None);
+    assert_eq!(motion.flap(preset(Fast), at(300)), Some(([2048; 2], 100)));
+    assert_eq!(motion.flap(custom, at(399)), None);
+    assert_eq!(motion.flap(custom, at(400)), Some(([683, 3413], 240)));
+    assert_eq!(motion.flap(preset(Fast), at(639)), None);
+    assert_eq!(motion.flap(preset(Off), at(639)), Some(([2048; 2], 240)));
+    assert_eq!(motion.flap(preset(Off), at(1350)), None);
+    assert_eq!(motion.update(50, at(1400)), Some(([1365, 2731], 475)));
 }
 
 #[cfg(test)]

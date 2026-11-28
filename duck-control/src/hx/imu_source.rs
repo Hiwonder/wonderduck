@@ -292,6 +292,7 @@ impl ImuReader {
                     Self::Bus(bus) => bus.stale.run,
                     Self::Id200Host { .. } => 0,
                 },
+                unoq_feedback_scan_start_ns: None,
                 mcu: None,
                 host: None,
                 i2c: i2c_timing,

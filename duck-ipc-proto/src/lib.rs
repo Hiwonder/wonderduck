@@ -707,6 +707,9 @@ pub mod method {
     /// Unlike [`ROBOT_ENABLE`], this does not start the policy.
     pub const ROBOT_INIT: &str = "robot.init";
 
+    /// Gamepad Select. Initialize to HOME, enable the policy once ready, or disable it.
+    pub const ROBOT_GAMEPAD_SELECT: &str = "robot.gamepadSelect";
+
     /// Cut power to the joints. **The robot will collapse** if nothing is holding it.
     ///
     /// Named `relax` rather than `limp` because `gain_limp` already means something else — the soft
@@ -747,6 +750,8 @@ pub mod method {
     pub const ROBOT_MOUTH: &str = "robot.mouth";
     /// Analog gamepad R2 pressure for the UNO Q accessory servos.
     pub const ROBOT_ACCESSORY_TRIGGER: &str = "robot.accessoryTrigger";
+    /// Select a fixed wing flap mode under a browser control lease.
+    pub const ROBOT_WING_FLAP: &str = "robot.wingFlap";
     /// Play one of the robot's voice-bank sounds — chirp, greet, coo... `wheee` is the
     /// held ride: `hold: true` starts it and must keep arriving (a notification per tick,
     /// like the mouth) or the ride ends; `hold: false` releases it deliberately. The two
@@ -1111,6 +1116,7 @@ pub enum Call {
     RobotEnable(EnableParams),
     /// Power the joints at the current pose, optionally ramp to HOME, or hold the seat.
     RobotInit,
+    RobotGamepadSelect,
     /// Cut power to the joints. The robot collapses if nothing holds it.
     RobotRelax,
     /// Revoke control and wait for the torque-off result.
@@ -1126,6 +1132,7 @@ pub enum Call {
     /// Mouth opening. Continuous. Send as a notification.
     RobotMouth(MouthParams),
     RobotAccessoryTrigger(AccessoryTriggerParams),
+    RobotWingFlap(WingFlapParams),
     /// Play a voice-bank sound.
     RobotSound(SoundParams),
     /// Play a named user clip once or while held.
@@ -1317,6 +1324,7 @@ impl Call {
             Call::RobotStop => method::ROBOT_STOP,
             Call::RobotEnable(_) => method::ROBOT_ENABLE,
             Call::RobotInit => method::ROBOT_INIT,
+            Call::RobotGamepadSelect => method::ROBOT_GAMEPAD_SELECT,
             Call::RobotRelax => method::ROBOT_RELAX,
             Call::RobotEmergencyRelax => method::ROBOT_EMERGENCY_RELAX,
             Call::RobotRebootMotors(_) => method::ROBOT_REBOOT_MOTORS,
@@ -1325,6 +1333,7 @@ impl Call {
             Call::RobotPose(_) => method::ROBOT_POSE,
             Call::RobotMouth(_) => method::ROBOT_MOUTH,
             Call::RobotAccessoryTrigger(_) => method::ROBOT_ACCESSORY_TRIGGER,
+            Call::RobotWingFlap(_) => method::ROBOT_WING_FLAP,
             Call::RobotSound(_) => method::ROBOT_SOUND,
             Call::RobotSoundClip(_) => method::ROBOT_SOUND_CLIP,
             Call::RobotTheremin(_) => method::ROBOT_THEREMIN,
@@ -1520,6 +1529,7 @@ impl Call {
             | Call::RobotStop
             | Call::RobotEnable(_)
             | Call::RobotInit
+            | Call::RobotGamepadSelect
             | Call::RobotRelax
             | Call::RobotEmergencyRelax
             | Call::RobotRebootMotors(_)
@@ -1528,6 +1538,7 @@ impl Call {
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotAccessoryTrigger(_)
+            | Call::RobotWingFlap(_)
             | Call::RobotSound(_)
             | Call::RobotSoundClip(_)
             | Call::RobotTheremin(_)
@@ -1649,6 +1660,7 @@ impl Call {
             Call::RobotPose(p) => encode(p),
             Call::RobotMouth(p) => encode(p),
             Call::RobotAccessoryTrigger(p) => encode(p),
+            Call::RobotWingFlap(p) => encode(p),
             Call::RobotSetMode(p) => encode(p),
             Call::RobotLoadPolicy(p) => encode(p),
             Call::RobotApplyModel(p) => encode(p),
@@ -1687,6 +1699,7 @@ impl Call {
             | Call::RobotLowVoltageStatus
             | Call::RobotLowVoltageRearm
             | Call::RobotInit
+            | Call::RobotGamepadSelect
             | Call::RobotRelax
             | Call::RobotEmergencyRelax
             | Call::RobotRest
@@ -1762,6 +1775,7 @@ impl Call {
             method::ROBOT_STOP => Call::RobotStop,
             method::ROBOT_ENABLE => Call::RobotEnable(decode(params)?),
             method::ROBOT_INIT => Call::RobotInit,
+            method::ROBOT_GAMEPAD_SELECT => Call::RobotGamepadSelect,
             method::ROBOT_RELAX => Call::RobotRelax,
             method::ROBOT_EMERGENCY_RELAX => Call::RobotEmergencyRelax,
             method::ROBOT_REBOOT_MOTORS => Call::RobotRebootMotors(decode(params)?),
@@ -1770,6 +1784,7 @@ impl Call {
             method::ROBOT_POSE => Call::RobotPose(decode(params)?),
             method::ROBOT_MOUTH => Call::RobotMouth(decode(params)?),
             method::ROBOT_ACCESSORY_TRIGGER => Call::RobotAccessoryTrigger(decode(params)?),
+            method::ROBOT_WING_FLAP => Call::RobotWingFlap(decode(params)?),
             method::ROBOT_SOUND => Call::RobotSound(decode(params)?),
             method::ROBOT_SOUND_CLIP => Call::RobotSoundClip(decode(params)?),
             method::ROBOT_THEREMIN => Call::RobotTheremin(decode(params)?),
@@ -2946,6 +2961,40 @@ pub struct MouthParams {
 pub struct AccessoryTriggerParams {
     /// Released at 0, fully pressed at 100.
     pub pressure: u8,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WingFlapMode {
+    #[default]
+    Off,
+    Slow,
+    Fast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WingFlapParams {
+    pub mode: WingFlapMode,
+    /// Travel time for one opening or closing movement. Omit for the mode default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u16>,
+}
+
+impl WingFlapParams {
+    pub const MIN_MS: u16 = 100;
+    pub const MAX_MS: u16 = 800;
+    pub const SLOW_MS: u16 = 300;
+    pub const FAST_MS: u16 = 100;
+
+    pub fn travel_time_ms(self) -> Option<u16> {
+        let default = match self.mode {
+            WingFlapMode::Off => return None,
+            WingFlapMode::Slow => Self::SLOW_MS,
+            WingFlapMode::Fast => Self::FAST_MS,
+        };
+        Some(self.duration_ms.unwrap_or(default).clamp(Self::MIN_MS, Self::MAX_MS))
+    }
 }
 
 /// Which mode to switch to, for [`Call::RobotSetMode`].
@@ -4190,6 +4239,11 @@ pub struct SafeToRestartResult {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct HealthResult {
     pub healthy: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wing_flap_enabled: bool,
+    /// Inclusive raw position limits for HX action editing, indexed by servo ID.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub action_position_limits: std::collections::BTreeMap<u8, [u16; 2]>,
     /// ID200 firmware version read by the bus owner, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imu_firmware_version: Option<String>,

@@ -17,7 +17,9 @@ fn response(sequence: u32, age_us: u32) -> Vec<u8> {
     result
 }
 
-fn exercise_read(responses: Vec<Vec<u8>>, address: u8, length: u8) -> Vec<Result<Vec<StatusFrame>>> {
+fn exercise_read(
+    responses: Vec<Vec<u8>>, address: u8, length: u8, with_timing: bool,
+) -> Vec<Result<Vec<StatusFrame>>> {
     let (mut master, mut slave) = (-1, -1);
     assert_eq!(unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(),
                                       std::ptr::null(), std::ptr::null()) }, 0);
@@ -31,12 +33,17 @@ fn exercise_read(responses: Vec<Vec<u8>>, address: u8, length: u8) -> Vec<Result
     let count = responses.len();
     let (done, wait) = std::sync::mpsc::channel();
     let worker = thread::spawn(move || {
-        for reply in responses {
+        for mut reply in responses {
             let mut request = [0; 24];
             master.read_exact(&mut request).unwrap();
             assert_eq!(request[4], UNOQ_FEEDBACK_READ);
             assert_eq!(request[5..7], [address, length]);
             assert_eq!(request[2..].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)), 0xff);
+            if with_timing {
+                let time_ns = duck_ipc_proto::clock::monotonic_ns().to_le_bytes();
+                let timing = [time_ns, time_ns].concat();
+                reply.splice(14..14, packet(UNOQ_FEEDBACK_TIMING_ID, 0, &timing).unwrap());
+            }
             master.write_all(&reply).unwrap();
         }
         wait.recv().unwrap();
@@ -47,6 +54,7 @@ fn exercise_read(responses: Vec<Vec<u8>>, address: u8, length: u8) -> Vec<Result
             sync_read_request(&IDS, address, length).unwrap(),
             &IDS, length, Instant::now() + Duration::from_millis(20),
         ));
+        assert_eq!(io.unoq_feedback_scan_start_ns.is_some(), with_timing);
     }
     done.send(()).unwrap();
     worker.join().unwrap();
@@ -54,7 +62,7 @@ fn exercise_read(responses: Vec<Vec<u8>>, address: u8, length: u8) -> Vec<Result
 }
 
 fn exercise(responses: Vec<Vec<u8>>) -> Vec<Result<Vec<StatusFrame>>> {
-    exercise_read(responses, PRESENT_POSITION, PRESENT_POSITION_LEN)
+    exercise_read(responses, PRESENT_POSITION, PRESENT_POSITION_LEN, false)
 }
 
 #[test]
@@ -65,7 +73,7 @@ fn recording_feedback_uses_cache_with_full_blocks() {
     for id in IDS {
         reply.extend(packet(id, 0, &[id; RECORD_FEEDBACK_LENGTH as usize]).unwrap());
     }
-    let result = exercise_read(vec![reply], RECORD_FEEDBACK_ADDRESS, RECORD_FEEDBACK_LENGTH);
+    let result = exercise_read(vec![reply], RECORD_FEEDBACK_ADDRESS, RECORD_FEEDBACK_LENGTH, true);
     for (frame, id) in result[0].as_ref().unwrap().iter().zip(IDS) {
         assert_eq!(frame.data, [id; RECORD_FEEDBACK_LENGTH as usize]);
     }

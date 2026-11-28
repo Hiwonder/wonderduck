@@ -152,6 +152,30 @@ fn run_bus_with_state<T>(
     (result, Arc::try_unwrap(bus).ok().unwrap().into_inner().unwrap())
 }
 
+#[test]
+fn startup_accessory_detection_confirms_either_id_without_writing() {
+    for (devices, expected) in [
+        (&[][..], None),
+        (&[(35, 35)][..], Some(35)),
+        (&[(36, 36)][..], Some(36)),
+        (&[(35, 36), (36, 36)][..], Some(36)),
+    ] {
+        let (detected, bus) = run_bus_with_state(None, None, |io, bus| {
+            {
+                let mut bus = bus.lock().unwrap();
+                for &(reply_id, register_id) in devices {
+                    let mut registers = vec![0; 71];
+                    registers[5] = register_id;
+                    bus.registers.insert(reply_id, registers);
+                }
+            }
+            io.detect_startup_accessory_servo()
+        });
+        assert_eq!(detected, expected);
+        assert!(bus.requests.iter().all(|frame| frame[4..7] == [0x02, 5, 1]));
+    }
+}
+
 fn assert_corrected(bus: &Bus, id: u8) {
     let block = &bus.registers[&id];
     assert_eq!(&block[21..24], &[15, 0, 0], "PID ID {id}");
@@ -234,10 +258,10 @@ fn timed_frames_send_goal_and_duration_together_and_restore_policy_timing() {
         let mut positions = [None; IDS.len()];
         positions[5] = Some(decode_position(5, &2691u16.to_le_bytes()).unwrap());
         positions[6] = Some(decode_position(6, &1336u16.to_le_bytes()).unwrap());
-        assert!(io.write_timed_positions(&positions, 4000).unwrap());
+        assert!(io.write_timed_positions(&positions, &[Some(2040), Some(2051)], 4000).unwrap());
         positions.fill(None);
         positions[6] = Some(decode_position(6, &1820u16.to_le_bytes()).unwrap());
-        assert!(io.write_timed_positions(&positions, 2000).unwrap());
+        assert!(io.write_timed_positions(&positions, &[None; 2], 2000).unwrap());
         io.set_torque(false).unwrap();
         let targets = JointTargets::new([0.0; IDS.len()]);
         io.write(&targets).unwrap();
@@ -245,14 +269,17 @@ fn timed_frames_send_goal_and_duration_together_and_restore_policy_timing() {
         io.write(&targets).unwrap();
     });
     let writes: Vec<_> = bus.requests.iter().filter(|frame| frame[4] == 0x83).collect();
-    assert_eq!(writes.len(), 3);
+    assert_eq!(writes.len(), 4);
     assert_eq!(&writes[0][5..writes[0].len() - 1], &[
-        41, 7, 30, 0, 0x83, 0x0a, 0xa0, 0x0f, 0, 0,
-        31, 0, 0x38, 0x05, 0xa0, 0x0f, 0, 0,
+        40, 8, 30, 1, 0, 0x83, 0x0a, 0xa0, 0x0f, 0, 0,
+        31, 1, 0, 0x38, 0x05, 0xa0, 0x0f, 0, 0,
+        35, 1, 0, 0xf8, 0x07, 0xa0, 0x0f, 0, 0,
+        36, 1, 0, 0x03, 0x08, 0xa0, 0x0f, 0, 0,
     ]);
     assert_eq!(&writes[1][5..writes[1].len() - 1], &[
         41, 7, 31, 0, 0x1c, 0x07, 0xd0, 0x07, 0, 0,
     ]);
+    assert_eq!(&writes[2][5..writes[2].len() - 1], &[40, 1, 35, 0, 36, 0]);
     assert_eq!(bus.registers[&30][44..48], [0; 4]);
     assert_eq!(bus.registers[&31][44..48], [0; 4]);
 }

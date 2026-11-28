@@ -34,7 +34,7 @@
 use std::time::{Duration, Instant};
 
 use crate::execution_timing::StageTimer;
-use crate::io::{IoError, JointTargets, RobotIo, Sensors};
+use crate::io::{AccessoryMotionInput, AccessoryPositions, IoError, JointTargets, RobotIo, Sensors};
 use crate::model::{JOINT_IDS, JOINT_LIMITS, MOUTH_CLOSED, MOUTH_INDEX, NUM_JOINTS};
 use crate::obs::Command;
 
@@ -319,8 +319,8 @@ impl<T: RobotIo> Safety<T> {
         self.io.write_limp_mouth(opening)
     }
 
-    pub fn write_accessory_trigger(&mut self, pressure: u8) -> Result<(), IoError> {
-        self.io.write_accessory_trigger(pressure)
+    pub fn write_accessory_motion(&mut self, input: AccessoryMotionInput) -> Result<(), IoError> {
+        self.io.write_accessory_motion(input)
     }
 
     /// Reboot these servos, and forget the gain cache: a rebooted servo comes back at its EEPROM
@@ -461,6 +461,7 @@ impl<T: RobotIo> Safety<T> {
     pub fn apply_timed_frame(
         &mut self,
         positions: &[Option<f64>; NUM_JOINTS],
+        accessories: &AccessoryPositions,
         duration_ms: u16,
         goal: [f64; NUM_JOINTS],
         hold: [f64; NUM_JOINTS],
@@ -471,7 +472,7 @@ impl<T: RobotIo> Safety<T> {
         ) {
             return Err(IoError::Bus("invalid timed joint frame".into()));
         }
-        if self.io.write_timed_positions(positions, duration_ms)? {
+        if self.io.write_timed_positions(positions, accessories, duration_ms)? {
             return Ok(Applied::default());
         }
         self.apply(goal, hold, gain)

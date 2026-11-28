@@ -18,6 +18,11 @@ pub const JOINT_IDS: [u8; NUM_JOINTS] = [
     10, 11, 12, 13, 14, // right leg
 ];
 
+/// Optional HX wing servos and their raw position limits in action files.
+pub const ACCESSORY_SERVO_IDS: [u8; 2] = [35, 36];
+pub const ACCESSORY_SERVO_LIMITS: [(u16, u16); ACCESSORY_SERVO_IDS.len()] =
+    [(683, 2048), (2048, 3413)];
+
 /// Joint names, from the protocol crate — the wire indexes `joints` and `targets`
 /// positionally, so that order and this one cannot be allowed to drift apart. The
 /// assertion below is what makes "cannot" true.

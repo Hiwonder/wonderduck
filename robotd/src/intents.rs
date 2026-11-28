@@ -34,6 +34,7 @@ const THEREMIN_UP: u8 = 1;
 const THEREMIN_DOWN: u8 = 2;
 const POWER_INIT: u8 = 1;
 const POWER_RELAX: u8 = 2;
+const POWER_GAMEPAD_SELECT: u8 = 3;
 const REST_IDLE: u8 = 0;
 const REST_RESTING: u8 = 1;
 const REST_RESTED: u8 = 2;
@@ -41,6 +42,7 @@ const REST_FAILED: u8 = 3;
 use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
+use duck_control::io::AccessoryMotionInput;
 use duck_control::obs::{BodyPose, Command};
 
 use crate::velocity_command::{GamepadTiming, VelocityCommandPulse};
@@ -300,7 +302,7 @@ pub struct Intents {
     pose: ArcSwap<PoseIntent>,
     /// Continuous jaw position and the most recent request to repeat its sound.
     mouth: ArcSwap<Stamped<duck_ipc_proto::MouthParams>>,
-    accessory_trigger: ArcSwapOption<Stamped<u8>>,
+    accessory_motion: ArcSwapOption<Stamped<AccessoryMotionInput>>,
     /// Whether the policy should drive. Discrete, so a plain flag rather than a slot.
     enabled: AtomicBool,
     /// A pending `robot.init` / `robot.relax`, as [`PowerRequest`].
@@ -394,6 +396,8 @@ pub enum PolicyChange {
 pub enum PowerRequest {
     /// Torque on, ramp to the home pose.
     Init,
+    /// Resolve a Select press with the control loop's current bring-up state.
+    GamepadSelect,
     /// Torque off. The robot collapses if nothing holds it.
     Relax,
 }
@@ -522,7 +526,7 @@ impl Intents {
                 value: duck_ipc_proto::MouthParams::default(),
                 at_us: 0,
             }),
-            accessory_trigger: ArcSwapOption::empty(),
+            accessory_motion: ArcSwapOption::empty(),
             enabled: AtomicBool::new(false),
             power: AtomicU8::new(POWER_NONE),
             theremin: AtomicU8::new(THEREMIN_NONE),
@@ -927,13 +931,13 @@ impl Intents {
     /// Clear the movement request while letting an existing scripted action finish.
     pub fn stop_for_maintenance(&self) {
         self.set_twist([0.0; 3]);
-        self.accessory_trigger.store(None);
+        self.accessory_motion.store(None);
         self.request_precision(duck_ipc_proto::PrecisionMoveParams::Cancel);
     }
 
     /// Zero the velocity now. Distinct from the deadman only in that it is deliberate.
     pub fn stop(&self) {
-        self.accessory_trigger.store(None);
+        self.accessory_motion.store(None);
         let at_us = self.now_us();
         self.twist.rcu(|previous| {
             let mut next = **previous;
@@ -1029,14 +1033,14 @@ impl Intents {
             && Duration::from_micros(self.now_us().saturating_sub(mouth.at_us)) < MOUTH_REPEAT_FRESH
     }
 
-    pub fn set_accessory_trigger(&self, pressure: u8) {
-        self.accessory_trigger.store(Some(Arc::new(Stamped { value: pressure, at_us: self.now_us() })));
+    pub fn set_accessory_motion(&self, input: AccessoryMotionInput) {
+        self.accessory_motion.store(Some(Arc::new(Stamped { value: input, at_us: self.now_us() })));
     }
 
-    pub fn accessory_trigger(&self) -> u8 {
-        let trigger = self.accessory_trigger.load();
-        trigger.as_ref().filter(|sample| self.now_us().saturating_sub(sample.at_us) <= 300_000)
-            .map_or(0, |sample| sample.value)
+    pub fn accessory_motion(&self) -> AccessoryMotionInput {
+        let input = self.accessory_motion.load();
+        input.as_ref().filter(|sample| self.now_us().saturating_sub(sample.at_us) <= 300_000)
+            .map_or(AccessoryMotionInput::Trigger(0), |sample| sample.value)
     }
 
     /// Queue the ground pick, which is not one of the configurable one-shots.
@@ -1296,6 +1300,16 @@ impl Intents {
         self.power.store(POWER_INIT, Ordering::Relaxed);
     }
 
+    pub fn request_gamepad_select(&self) -> bool {
+        self.power.compare_exchange(
+            POWER_NONE, POWER_GAMEPAD_SELECT, Ordering::Relaxed, Ordering::Relaxed,
+        ).is_ok()
+    }
+
+    pub fn has_power_request(&self) -> bool {
+        self.power.load(Ordering::Relaxed) != POWER_NONE
+    }
+
     /// Ask the loop to cut power to the joints.
     ///
     /// Also clears `enabled`: a robot that has been asked to go limp is not one the policy should
@@ -1391,6 +1405,7 @@ impl Intents {
     pub fn take_power_request(&self) -> Option<PowerRequest> {
         match self.power.swap(POWER_NONE, Ordering::Relaxed) {
             POWER_INIT => Some(PowerRequest::Init),
+            POWER_GAMEPAD_SELECT => Some(PowerRequest::GamepadSelect),
             POWER_RELAX => Some(PowerRequest::Relax),
             _ => None,
         }

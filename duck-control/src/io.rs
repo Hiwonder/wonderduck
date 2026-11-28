@@ -9,8 +9,11 @@
 use std::time::Instant;
 
 use crate::imu::ImuData;
-use crate::model::NUM_JOINTS;
+use crate::model::{ACCESSORY_SERVO_IDS, NUM_JOINTS};
 pub use duck_ipc_proto::{DeviceObservation, ImuObservation, ServoObservation};
+
+/// Raw targets for optional timed HX wing movements.
+pub type AccessoryPositions = [Option<u16>; ACCESSORY_SERVO_IDS.len()];
 
 /// One control observation of the robot, assembled by the backend.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -161,6 +164,9 @@ pub struct ImuSampleTiming {
     pub age_us: u64,
     /// Consecutive identical ID200 payloads; equality alone cannot establish sensor staleness.
     pub payload_unchanged_run: u64,
+    /// Earliest and latest host-clock times for the start of a cached UNO Q scan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unoq_feedback_scan_start_ns: Option<[u64; 2]>,
     /// Present only when the actual consumed data carries matching MCU timestamps.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcu: Option<crate::imu_timing::McuTiming>,
@@ -283,6 +289,12 @@ pub struct ImuStale {
     pub run: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum AccessoryMotionInput {
+    Trigger(u8),
+    WingFlap(duck_ipc_proto::WingFlapParams),
+}
+
 pub trait RobotIo {
     /// Joints and a valid IMU sample, assembled into one observation.
     fn read(&mut self) -> Result<Sensors>;
@@ -320,7 +332,12 @@ pub trait RobotIo {
     fn write(&mut self, targets: &JointTargets) -> Result<()>;
 
     /// Dispatch a timed frame to the servos. Returns false if the backend has no native timing.
-    fn write_timed_positions(&mut self, _positions: &[Option<f64>; NUM_JOINTS], _duration_ms: u16) -> Result<bool> {
+    fn write_timed_positions(
+        &mut self,
+        _positions: &[Option<f64>; NUM_JOINTS],
+        _accessories: &AccessoryPositions,
+        _duration_ms: u16,
+    ) -> Result<bool> {
         Ok(false)
     }
 
@@ -402,8 +419,8 @@ pub trait RobotIo {
         Ok(())
     }
 
-    /// Apply the optional accessory servos' gamepad pressure.
-    fn write_accessory_trigger(&mut self, _pressure: u8) -> Result<()> {
+    /// Apply the optional accessory servos' current input.
+    fn write_accessory_motion(&mut self, _input: AccessoryMotionInput) -> Result<()> {
         Ok(())
     }
 

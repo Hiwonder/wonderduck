@@ -14,7 +14,7 @@ pub struct Input {
     pub sequence: u64,
     pub acquired_t_ns: u64,
     pub inference_t_ns: u64,
-    /// Age since host acquisition, not the sensor's internal measurement time.
+    /// Host acquisition age, or the upper bound on UNO Q feedback scan age.
     pub age_us: u64,
     pub limit_us: u64,
     pub reused: bool,
@@ -29,6 +29,8 @@ pub struct Input {
     pub i2c: Option<duck_control::io::I2cReadTiming>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub software_read_age_bounds_us: Option<[u64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unoq_feedback_age_bounds_us: Option<[u64; 2]>,
     pub mcu_sample_reused: bool,
 }
 
@@ -94,6 +96,10 @@ impl Monitor {
         };
         let previous_sequence = self.previous.map(|previous| previous.sequence);
         let age_us = inference_t_ns.saturating_sub(timing.acquired_t_ns) / 1000;
+        let unoq_feedback_age_bounds_us = timing.unoq_feedback_scan_start_ns
+            .map(|[earliest_ns, latest_ns]| [latest_ns, earliest_ns]
+                .map(|timestamp| inference_t_ns.saturating_sub(timestamp) / 1000));
+        let confirmed_age_us = unoq_feedback_age_bounds_us.map_or(age_us, |bounds| bounds[0]);
         let input = Input {
             source: timing.source,
             sequence: timing.sequence,
@@ -106,13 +112,14 @@ impl Monitor {
                     previous.source == timing.source && previous.sequence == timing.sequence
                 }),
             coasted: !fresh,
-            age_exceeded: age_us > self.limit_us,
+            age_exceeded: confirmed_age_us > self.limit_us,
             payload_unchanged_run: timing.payload_unchanged_run,
             mcu: timing.mcu,
             host: timing.host,
             i2c: timing.i2c,
             software_read_age_bounds_us: timing.mcu.map(|mcu| mcu.software_age_bounds_us(inference_t_ns))
                 .or_else(|| timing.host.map(|host| host.software_age_bounds_us(inference_t_ns))),
+            unoq_feedback_age_bounds_us,
             mcu_sample_reused: timing.mcu.is_some_and(|mcu| self.previous
                 .and_then(|p| p.mcu).is_some_and(|p| p.fusion_sequence == mcu.fusion_sequence)),
         };
@@ -163,6 +170,7 @@ impl Monitor {
                         reused,
                         coasted,
                         payload_unchanged_run,
+                        unoq_feedback_age_bounds_us = ?input.unoq_feedback_age_bounds_us,
                         max_age_us,
                         "policy IMU input stale"
                     ),
@@ -197,5 +205,40 @@ impl Monitor {
         }
         self.fault = fault;
         Some(input)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unoq_reports_only_confirmed_over_age_and_retains_the_interval() {
+        let mut monitor = Monitor::new(Duration::from_millis(20));
+        let mut timing = ImuSampleTiming {
+            source: ImuTimingSource::Id200,
+            sequence: 1,
+            acquired_t_ns: 10_000_000,
+            consumed_t_ns: 30_000_000,
+            age_us: 20_000,
+            payload_unchanged_run: 0,
+            unoq_feedback_scan_start_ns: Some([10_000_000, 16_000_000]),
+            mcu: None,
+            host: None,
+            i2c: None,
+        };
+        let input = monitor.consume(Some(timing), 33_000_000, true).unwrap();
+        assert_eq!(input.unoq_feedback_age_bounds_us, Some([17_000, 23_000]));
+        assert!(!input.age_exceeded);
+        assert_eq!(input.fault(), None);
+
+        let reused = monitor.consume(Some(timing), 34_000_000, true).unwrap();
+        assert!(reused.reused);
+        assert_eq!(reused.fault(), Some(Fault::OldInput));
+
+        timing.sequence = 2;
+        let old = monitor.consume(Some(timing), 37_000_000, true).unwrap();
+        assert!(old.age_exceeded);
+        assert_eq!(old.fault(), Some(Fault::OldInput));
     }
 }

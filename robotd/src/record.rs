@@ -582,9 +582,13 @@ impl RecordSender {
         self
     }
 
+    pub(crate) fn continuous(&self) -> bool {
+        !self.person_follow_only && !self.target_follow_only
+    }
+
     /// Called once per control tick; retries a nonblocking flush after following stops.
     pub fn should_record(&self, person_follow: bool, target_follow: bool) -> bool {
-        if !self.person_follow_only && !self.target_follow_only { return true; }
+        if self.continuous() { return true; }
         let active = (self.person_follow_only && person_follow) || (self.target_follow_only && target_follow);
         if self.following.swap(active, Ordering::Relaxed) && !active {
             self.flush_pending.store(true, Ordering::Relaxed);

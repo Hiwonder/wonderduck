@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Manage Wi-Fi recovery and the phone provisioning protocol."""
 
+import argparse
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ RESET_REQUEST = b"resetwifi"
 DISCOVERY_TYPE = "WonderDuck"
 HOTSPOT_PREFIX = "WD-"
 STATION_RETRY_INTERVAL = 5
+HOTSPOT_CHANNELS = (("a", 36), ("bg", 6))
 
 
 def device_id(ethernet=Path("/sys/class/net/eth0/address"),
@@ -66,11 +68,13 @@ class StateStore:
 
 
 class Controller:
-    def __init__(self, network, store, hotspot_name, hotspot_password, clock=time.monotonic):
+    def __init__(self, network, store, hotspot_name, hotspot_password, clock=time.monotonic,
+                 *, hotspot_channels=HOTSPOT_CHANNELS):
         self.network = network
         self.store = store
         self.hotspot_name = hotspot_name
         self.hotspot_password = hotspot_password
+        self.hotspot_channels = hotspot_channels
         self.clock = clock
         self.state = store.load()
         self.actions = queue.Queue()
@@ -95,7 +99,7 @@ class Controller:
         self.recovery_hotspot = False
 
     def _hotspot(self):
-        for band, channel in (("a", 36), ("bg", 6)):
+        for band, channel in self.hotspot_channels:
             try:
                 self.network.activate_hotspot(self.hotspot_name, self.hotspot_password,
                                               band, channel)
@@ -257,9 +261,14 @@ class ResetHandler(socketserver.BaseRequestHandler):
             self.server.controller.reset()
 
 
-def start_servers(controller, identity, host="0.0.0.0"):
+def discovery_server(identity, host):
     discovery = socketserver.UDPServer((host, 9027), DiscoveryHandler)
     discovery.response = (DISCOVERY_TYPE + ":" + identity + "\n").encode("utf-8")
+    return discovery
+
+
+def start_servers(controller, identity, host="0.0.0.0"):
+    discovery = discovery_server(identity, host)
     provisioning = ThreadingTCPServer((host, 9026), ProvisionHandler)
     provisioning.controller = controller
     reset = ThreadingTCPServer((host, 9028), ResetHandler)
@@ -271,10 +280,21 @@ def start_servers(controller, identity, host="0.0.0.0"):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--discovery-only", action="store_true",
+                        help="respond to device discovery while another service manages Wi-Fi")
+    args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     identity = device_id()
+    if args.discovery_only:
+        with discovery_server(identity, "0.0.0.0") as server:
+            LOGGER.info("phone discovery endpoint started")
+            server.serve_forever()
+        return
     password = PASSWORD_PATH.read_text(encoding="utf-8").rstrip("\r\n")
-    controller = Controller(NetworkManager(), StateStore(STATE_PATH), HOTSPOT_PREFIX + identity, password)
+    channels = HOTSPOT_CHANNELS[::-1] if os.environ.get("WONDERDUCK_HOTSPOT_2GHZ_FIRST") == "1" else HOTSPOT_CHANNELS
+    controller = Controller(NetworkManager(), StateStore(STATE_PATH), HOTSPOT_PREFIX + identity,
+                            password, hotspot_channels=channels)
     start_servers(controller, identity)
     LOGGER.info("phone provisioning endpoints started")
     controller.run()

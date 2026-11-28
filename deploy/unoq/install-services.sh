@@ -52,6 +52,7 @@ install -m 0644 "$board/wonderduck-unoq-bridge.service" "$board/robotd.service" 
 install -d -m 0755 /usr/local/libexec
 install -m 0644 "$board/recover-audio.sh" /usr/local/libexec/wonderduck-unoq-audio-recover
 install -m 0644 "$board/wonderduck-unoq-audio-recover.service" /etc/systemd/system/
+"$board/install-wifi-manager.sh"
 install -d -m 0755 /etc/systemd/system/arduino-router.service.d
 install -m 0644 "$board/arduino-router-affinity.conf" /etc/systemd/system/arduino-router.service.d/70-wonderduck-affinity.conf
 
