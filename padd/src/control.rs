@@ -21,6 +21,7 @@ const START_REST_HOLD: Duration = Duration::from_secs(3);
 pub enum StartAction {
     Initialize,
     Rest,
+    Select,
     ToggleHeadDrive,
 }
 
@@ -31,6 +32,7 @@ enum StartGesture {
     AwaitRelease,
     Ready,
     Holding(Instant),
+    SelectHeld,
     Chord,
     RestRequested,
 }
@@ -45,14 +47,22 @@ pub struct StartControls {
 
 impl StartControls {
     fn update(&mut self, start: bool, select: bool, now: Instant) {
+        let select_pressed = select && !self.select;
         self.start = start;
         self.select = select;
         match self.gesture {
-            StartGesture::Ready | StartGesture::Holding(_) if start && select => {
+            StartGesture::Ready | StartGesture::Holding(_) | StartGesture::SelectHeld
+                if start && select =>
+            {
                 self.gesture = StartGesture::Chord;
                 self.pending = Some(StartAction::ToggleHeadDrive);
             }
             StartGesture::Ready if start => self.gesture = StartGesture::Holding(now),
+            StartGesture::Ready if select_pressed => self.gesture = StartGesture::SelectHeld,
+            StartGesture::SelectHeld if !select => {
+                self.gesture = StartGesture::Ready;
+                self.pending = Some(StartAction::Select);
+            }
             StartGesture::Holding(since) if !start => {
                 let elapsed = now.saturating_duration_since(since);
                 if elapsed >= START_REST_HOLD {
@@ -107,6 +117,34 @@ impl StartControls {
 mod start_controls_tests {
     use super::*;
     use gilrs::Button;
+
+    #[test]
+    fn select_fires_on_each_release_after_becoming_neutral() {
+        let now = Instant::now();
+        let held = now + START_REST_HOLD;
+        let mut keys = StartControls::default();
+        assert_eq!(keys.finish(false, true, now), (None, false));
+        assert_eq!(keys.finish(false, false, now), (None, false));
+        assert_eq!(keys.finish(false, true, now), (None, false));
+        assert_eq!(keys.finish(false, true, held), (None, false));
+        assert_eq!(keys.finish(false, false, held), (Some(StartAction::Select), false));
+        assert_eq!(keys.finish(false, false, held), (None, false));
+        keys.button(Button::Select, true, held);
+        keys.button(Button::Select, false, held);
+        assert_eq!(keys.finish(false, false, held), (Some(StartAction::Select), false));
+    }
+
+    #[test]
+    fn releasing_select_after_a_chord_does_not_fire_select() {
+        let now = Instant::now();
+        let mut keys = StartControls::default();
+        keys.finish(false, false, now);
+        keys.finish(false, true, now);
+        assert_eq!(keys.finish(true, true, now), (Some(StartAction::ToggleHeadDrive), false));
+        assert_eq!(keys.finish(false, true, now), (None, false));
+        assert_eq!(keys.finish(false, true, now), (None, false));
+        assert_eq!(keys.finish(false, false, now), (None, false));
+    }
 
     #[test]
     fn start_requests_rest_once_at_three_seconds() {

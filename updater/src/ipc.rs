@@ -798,6 +798,7 @@ impl Server {
             | Call::RobotStop
             | Call::RobotEnable(_)
             | Call::RobotInit
+            | Call::RobotGamepadSelect
             | Call::RobotRelax
             | Call::RobotEmergencyRelax
             | Call::RobotRebootMotors(_)
@@ -808,6 +809,7 @@ impl Server {
             | Call::RobotPose(_)
             | Call::RobotMouth(_)
             | Call::RobotAccessoryTrigger(_)
+            | Call::RobotWingFlap(_)
             | Call::RobotTheremin(_)
             | Call::RobotChorale(_)
             | Call::ChoraleSubscribe

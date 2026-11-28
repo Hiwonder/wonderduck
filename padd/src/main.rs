@@ -26,6 +26,7 @@
 //! Left stick      forward / back / strafe
 //! Right stick     turn left / right
 //! In head drive   left stick walks and turns, right stick adjusts HX pitch and yaw
+//! Select          initialize to HOME, then toggle the policy on later releases
 //! Start           short press initializes and enables the policy, and centers the head on HX
 //! Start, 3 s      request rest
 //! Select + Start  toggle between drive and drive + head control
@@ -403,7 +404,7 @@ fn is_active_button(button: Button) -> bool {
         button,
         Button::South | Button::East | Button::West | Button::North
             | Button::LeftTrigger | Button::RightTrigger | Button::LeftTrigger2
-            | Button::Start | Button::DPadUp | Button::DPadDown
+            | Button::Start | Button::Select | Button::DPadUp | Button::DPadDown
             | Button::DPadLeft | Button::DPadRight
     )
 }
@@ -423,6 +424,7 @@ fn pad_neutral(pad: &gilrs::Gamepad<'_>, deadzone: f64, head_drive: bool, r2: u8
         Button::RightTrigger,
         Button::LeftTrigger2,
         Button::Start,
+        Button::Select,
         Button::DPadUp,
         Button::DPadDown,
         Button::DPadLeft,
@@ -632,7 +634,7 @@ fn run_session(
         hz = args.hz,
         roller,
         "driving — sticks and D-pad move, X/B turn, Y ground pick, A sit, LB/RB kicks, \
-         L2 mouth; Start initializes and enables, hold Start for 3 s to rest, Select + Start toggles head control"
+         L2 mouth, Select homes or toggles the policy, Start initializes and enables, hold Start for 3 s to rest, Select + Start toggles head control"
     );
 
     let period = Duration::from_secs_f64(1.0 / args.hz as f64);
@@ -857,6 +859,7 @@ fn run_session(
             pad.is_pressed(Button::Select),
             tick,
         );
+        button_activity |= start_action == Some(StartAction::Select);
         let r2 = if accessory_trigger {
             let mapped = pad.button_data(Button::RightTrigger2).map(|data| data.value()).unwrap_or(0.0);
             #[cfg(target_os = "linux")]
@@ -1037,6 +1040,19 @@ fn run_session(
         let imu_head_pose = imu_head_pose.filter(|_| !mode_changed);
 
         let mut center_head = mode_changed && !head_drive;
+        if start_action == Some(StartAction::Select) {
+            match request(&mut stream, &mut next_id, &proto::Call::RobotGamepadSelect) {
+                Ok(response) => {
+                    if intent_accepted(response) {
+                        center_sticks = true;
+                    }
+                }
+                Err(error) => {
+                    tracing::error!(%error, "Select request failed");
+                    return std::process::ExitCode::FAILURE;
+                }
+            }
+        }
         if start_action == Some(StartAction::Initialize) {
             match explicit_low_voltage_rearm(&mut stream, &mut next_id, &mut gate) {
                 Ok(true) => {}, Ok(false) => continue,

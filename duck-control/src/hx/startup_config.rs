@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-use super::{ACCELERATION, HX_BUS_JOINT_IDS, HxIo, IoError, ReadFailureReason, Result, ServoRelease, drain_status_port};
+use super::{ACCESSORY_SERVO_IDS, ACCELERATION, HX_BUS_JOINT_IDS, HxIo, IoError, ReadFailureReason, Result, ServoRelease, drain_status_port};
 
+const SERVO_ID_REGISTER: u8 = 5;
 const TEMPERATURE_LIMIT: u8 = 13;
 const POSITION_PID: u8 = 21;
 const MINIMUM_START_TORQUE: u8 = 24;
@@ -39,6 +40,14 @@ pub(super) fn startup_check_result(fixed: usize, failed: Vec<String>) -> Result<
 }
 
 impl HxIo {
+    /// Confirm one optional accessory during the startup configuration pass.
+    pub fn detect_startup_accessory_servo(&mut self) -> Option<u8> {
+        ACCESSORY_SERVO_IDS.into_iter().find(|&id| {
+            self.read_register_block(id, SERVO_ID_REGISTER, 1)
+                .is_ok_and(|data| data.as_slice() == [id])
+        })
+    }
+
     /// A missing reply or unsafe voltage does not start a configuration attempt.
     /// Once the write budget is exhausted the joint can only recover by readback.
     pub fn check_released_servo_at_startup(&mut self, id: u8, minimum_voltage: f64, remaining: &mut u8) -> Result<usize> {

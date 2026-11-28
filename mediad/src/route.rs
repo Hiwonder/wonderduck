@@ -61,8 +61,9 @@ fn permits(call: &proto::Call) -> bool {
         // refusals were pointing at.
         RobotMove(_) | RobotPrecisionMove(_) | RobotHead(_) | RobotLook(_) | RobotPose(_)
         | RobotMouth(_) => true,
-        // Accessory pressure is sent by the local gamepad daemon.
-        RobotAccessoryTrigger(_) => false,
+        // Accessory pressure and Select are sent by the local gamepad daemon.
+        RobotAccessoryTrigger(_) | RobotGamepadSelect => false,
+        RobotWingFlap(_) => false,
         // This assistance is owned by the local browser's short-lived control session.
         RobotObstacleStatus | RobotSetObstacle(_) | RobotHeadTracking(_) | RobotMotionTracking(_) | RobotCoordinatedTracking(_) | RobotMaze(_) => false,
         RobotLowVoltageStatus | RobotSetLowVoltage(_) | RobotLowVoltageRearm => false,

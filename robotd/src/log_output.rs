@@ -513,7 +513,7 @@ impl BusSummary {
         };
         if let Some(late) = self.late {
             if let Some(value) = late.fields.values.get("missing_ids") {
-                failure.fields.values.insert("missing_ids", value.clone());
+                failure.fields.values.entry("missing_ids").or_insert_with(|| value.clone());
             }
         }
         failure.fields.values.insert("location", "unknown".into());
@@ -522,7 +522,7 @@ impl BusSummary {
                 failure.fields.values.insert("location", value.clone());
             }
             if let Some(value) = diagnostic.fields.values.get("host_missing_ids") {
-                failure.fields.values.insert("missing_ids", value.clone());
+                failure.fields.values.entry("missing_ids").or_insert_with(|| value.clone());
             }
         }
         failure.write_to(writer)

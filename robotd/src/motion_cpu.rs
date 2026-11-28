@@ -50,9 +50,9 @@ impl MotionCpuFloor {
         })
     }
 
-    pub(crate) fn update(&mut self, active: bool, now: Instant) {
+    pub(crate) fn update(&mut self, active: bool, low_latency: bool, now: Instant) {
         if let Some(latency) = &mut self.latency {
-            latency.update(active, now);
+            latency.update(low_latency, now);
         }
         if self.khz == 0 || self.applied == Some(active) || self.retry_at.is_some_and(|retry| now < retry) {
             return;
@@ -226,18 +226,18 @@ mod tests {
         let now = Instant::now();
         fs::write(&minimum, "614400\n").unwrap();
         let mut floor = make_floor();
-        floor.update(false, now);
+        floor.update(false, false, now);
         assert!(!saved.exists());
-        floor.update(true, now);
-        floor.update(true, now);
+        floor.update(true, true, now);
+        floor.update(true, true, now);
         assert_eq!(MotionCpuFloor::read_khz(&saved).unwrap(), 614_400);
         assert_eq!(MotionCpuFloor::read_khz(&minimum).unwrap(), 1_612_800);
-        floor.update(false, now);
+        floor.update(false, false, now);
         assert_eq!(MotionCpuFloor::read_khz(&minimum).unwrap(), 614_400);
         assert!(!saved.exists());
 
         fs::write(&minimum, "1804800").unwrap();
-        floor.update(true, now);
+        floor.update(true, true, now);
         assert!(!saved.exists());
         assert_eq!(MotionCpuFloor::read_khz(&minimum).unwrap(), 1_804_800);
         drop(floor);
@@ -245,7 +245,7 @@ mod tests {
         fs::write(&minimum, "1612800").unwrap();
         fs::write(&saved, "300000").unwrap();
         let mut recovered = make_floor();
-        recovered.update(true, now);
+        recovered.update(true, true, now);
         drop(recovered);
         assert_eq!(MotionCpuFloor::read_khz(&minimum).unwrap(), 300_000);
         assert!(!saved.exists());
@@ -253,23 +253,36 @@ mod tests {
     }
 
     #[test]
-    fn holds_cpu_latency_request_only_while_active() {
-        let device = std::env::temp_dir().join(format!("robotd-cpu-qos-{}", std::process::id()));
+    fn recording_holds_latency_request_without_raising_frequency() {
+        let dir = std::env::temp_dir().join(format!("robotd-cpu-qos-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let device = dir.join("latency");
+        let minimum = dir.join("scaling_min_freq");
         fs::write(&device, []).unwrap();
-        let mut latency = MotionCpuLatency {
-            micros: 100,
-            device: device.clone(),
-            request: None,
+        fs::write(&minimum, "300000").unwrap();
+        let mut floor = MotionCpuFloor {
+            khz: 1_612_800,
+            minimum: minimum.clone(),
+            saved: dir.join("original"),
+            applied: None,
             retry_at: None,
+            latency: Some(MotionCpuLatency {
+                micros: 100,
+                device: device.clone(),
+                request: None,
+                retry_at: None,
+            }),
         };
         let now = Instant::now();
-        latency.update(false, now);
-        assert!(latency.request.is_none());
-        latency.update(true, now);
-        assert!(latency.request.is_some());
+        floor.update(false, false, now);
+        assert!(floor.latency.as_ref().unwrap().request.is_none());
+        floor.update(false, true, now);
+        assert!(floor.latency.as_ref().unwrap().request.is_some());
         assert_eq!(fs::read(&device).unwrap(), 100i32.to_ne_bytes());
-        latency.update(false, now);
-        assert!(latency.request.is_none());
-        fs::remove_file(device).unwrap();
+        assert_eq!(MotionCpuFloor::read_khz(&minimum).unwrap(), 300_000);
+        floor.update(false, false, now);
+        assert!(floor.latency.as_ref().unwrap().request.is_none());
+        drop(floor);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

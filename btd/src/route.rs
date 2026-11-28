@@ -237,7 +237,7 @@ fn permits(call: &proto::Call) -> bool {
         // the mouth ride with it: all of these are a stream of small updates, and the argument is
         // about the stream, not about any one of them.
         RobotHumanControl(_) | RobotMove(_) | RobotPrecisionMove(_) | RobotHead(_) | RobotHeadTracking(_) | RobotMotionTracking(_) | RobotCoordinatedTracking(_) | RobotMaze(_) | RobotLook(_) | RobotPose(_) | RobotMouth(_)
-        | RobotAccessoryTrigger(_)
+        | RobotAccessoryTrigger(_) | RobotGamepadSelect | RobotWingFlap(_)
         | RobotObstacleStatus | RobotSetObstacle(_)
         | RobotLowVoltageStatus | RobotSetLowVoltage(_) | RobotLowVoltageRearm => false,
 
